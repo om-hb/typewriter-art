@@ -1,0 +1,13 @@
+# Dependencies for the Sigma SM 8200i back-end (src/erika).
+#
+# These are the versions this pipeline was developed and tested against on
+# Python 3.10. The upstream requirements.txt pins older releases; the numba
+# constraint below is the one that actually matters, because numba needs a
+# numpy it has been built against.
+numpy<1.25
+opencv-python>=4.7
+numba>=0.57
+matplotlib>=3.7
+Pillow>=10.0     # rendering the charset sheet
+pyserial>=3.5    # erika.send, talking to the ESP32
+pytest>=7.0      # test suite

@@ -266,8 +266,10 @@ def kword(
     # Save the error plot over time
     # update data
     line.set_ydata(err_over_time)
-    point.set_xdata(loop_num * len(layer_offsets) + layer_num)
-    point.set_ydata(err_over_time[loop_num * len(layer_offsets) + layer_num])
+    # matplotlib >= 3.7 requires sequences here, not scalars
+    final_iteration = loop_num * len(layer_offsets) + layer_num
+    point.set_xdata([final_iteration])
+    point.set_ydata([err_over_time[final_iteration]])
     # update y axis
     plt.ylim(0, np.max(err_over_time))
 

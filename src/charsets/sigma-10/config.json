@@ -1,0 +1,9 @@
+{
+    "charset_name": "Sigma SM 8200i (pitch 10)",
+    "image_path": "sigma.png",
+    "slicesX": 20,
+    "slicesY": 5,
+    "excludeChars": [],
+    "whiteThreshold": 0.999,
+    "blankSpace": true
+}
