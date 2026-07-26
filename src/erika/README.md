@@ -192,9 +192,35 @@ erika.pipeline calibrate  motion-code test pattern
 erika.pipeline sheet      type the charset, for scanning back in
 
 erika.send <file.etp>     upload over USB serial   (--port, --print, --watch)
+erika.send --diagnose     test the link step by step
 erika.send -c STATUS      talk to the device without uploading
+erika.send --list-ports   show the serial ports
 erika.etp <file.etp>      disassemble a print job
 ```
+
+## When the upload fails
+
+```bash
+python -m erika.send --port COM6 --diagnose
+```
+
+That checks the console, then the base64 upload path, then the stored job, and
+says which step broke. `--verbose` adds every line in both directions.
+
+Two things that have actually bitten:
+
+- **The board is still in `setup()`.** `loop()` does not run until WiFi
+  association finishes, and the uploader only waits two seconds after opening
+  the port. If the device answers nothing at all, try `--settle 10`.
+- **DTR/RTS.** pyserial asserts both when it opens a port; on boards with a
+  USB-serial bridge those lines are wired to EN and GPIO0, so leaving them
+  asserted can hold the ESP32 in reset or drop it into the download ROM, where
+  it answers nothing. `Link` parks them low before opening — if you write your
+  own tool against this protocol, do the same.
+
+Uploads are newline-framed base64 rather than raw binary, which is what makes
+them debuggable: you can watch the whole conversation in a serial terminal, and
+log output the firmware interleaves on the same port does no harm.
 
 Useful planning flags for `print` and `plan`:
 

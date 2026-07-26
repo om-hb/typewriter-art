@@ -110,6 +110,173 @@ def test_upload_chunk_size_matches_the_host_tool():
     assert defines["IMG_UPLOAD_CHUNK"] == send.CHUNK_SIZE
 
 
+@pytest.mark.skipif(not os.path.isdir(FIRMWARE_SRC), reason="firmware tree not present")
+def test_a_full_data_line_fits_the_firmware_line_buffer():
+    """A chunk must base64-encode to something the device can hold.
+
+    The device drops overlong lines. If CHUNK_SIZE ever outgrows IMG_MAX_LINE
+    every upload would fail, so pin the relationship here rather than finding
+    out on a board.
+    """
+    import base64
+
+    from erika import send
+
+    defines = _parse_cpp_defines(os.path.join(FIRMWARE_SRC, "image_receiver.h"))
+    longest = len("D ") + len(base64.b64encode(b"\x00" * send.CHUNK_SIZE))
+    assert longest < defines["IMG_MAX_LINE"], (
+        f"a full data line is {longest} chars but IMG_MAX_LINE is "
+        f"{defines['IMG_MAX_LINE']}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# upload protocol
+# ---------------------------------------------------------------------------
+
+
+class FakeDevice:
+    """The firmware's line protocol, as a Python stand-in.
+
+    Mirrors ImageReceiver::handleLine() closely enough to exercise the host's
+    framing and ACK accounting: base64 decode, running total, and the
+    UPLOAD-READY / ACK / OK replies.
+    """
+
+    def __init__(self, chunk=None):
+        from erika import send
+
+        self.chunk = chunk or send.CHUNK_SIZE
+        self.received = bytearray()
+        self.total = 0
+        self.active = False
+        self.sent_lines: list[str] = []
+
+    def line(self, text: str) -> str:
+        import base64
+
+        head, _, rest = text.partition(" ")
+        if head == "IMG":
+            sub, _, arg = rest.partition(" ")
+            if sub.upper() == "UPLOAD":
+                self.active = True
+                self.total = int(arg)
+                self.received = bytearray()
+                return f"UPLOAD-READY {self.chunk}"
+            if sub.upper() == "PING":
+                return f"PONG chunk={self.chunk}"
+            return "ERR unknown"
+        if head == "D" and self.active:
+            data = base64.b64decode(rest)
+            if len(data) > self.chunk:
+                return "ERR too much data"
+            self.received += data
+            return f"ACK {len(self.received)}"
+        if head == "Z" and self.active:
+            self.active = False
+            if len(self.received) != self.total:
+                return f"ERR short upload: {len(self.received)}/{self.total}"
+            return f"OK {len(self.received)} bytes stored and verified"
+        return "ERR not an IMG line"
+
+
+class FakeLink:
+    """Just enough of Link for upload() to run against a FakeDevice."""
+
+    def __init__(self, device: FakeDevice, noise: bool = False):
+        self.device = device
+        self.noise = noise
+        self._pending: list[str] = []
+
+    def send_line(self, text: str) -> None:
+        self.device.sent_lines.append(text)
+        if self.noise:
+            # The firmware logs to the same stream; replies must survive it.
+            self._pending.append("[BT] Client connected")
+        self._pending.append(self.device.line(text))
+
+    def await_reply(self, *prefixes, timeout=30.0) -> str:
+        wanted = prefixes or ("OK", "ERR", "ACK", "UPLOAD-READY")
+        while self._pending:
+            line = self._pending.pop(0)
+            if line.startswith("ERR"):
+                raise RuntimeError(line)
+            if any(line.startswith(p) for p in wanted):
+                return line
+        raise TimeoutError(f"no reply matching {wanted}")
+
+    def drain(self, seconds: float = 0.4) -> list[str]:
+        out, self._pending = self._pending, []
+        return out
+
+
+@pytest.mark.parametrize("noise", [False, True])
+def test_upload_delivers_the_file_byte_for_byte(tmp_path, charset, noise, capsys):
+    from erika import send
+
+    job = planner.encode(
+        planner.build_plan(
+            _write_choices(tmp_path, _random_choices(charset, 5, 9, FOUR_LAYERS, seed=2)),
+            charset,
+        )
+    )
+    path = os.path.join(tmp_path, "job.etp")
+    etp.save(path, job)
+    original = open(path, "rb").read()
+
+    device = FakeDevice()
+    send.upload(FakeLink(device, noise=noise), path, progress=False)
+
+    assert bytes(device.received) == original
+    # And the reassembled bytes are a valid job, not just the right length.
+    assert etp.unpack(bytes(device.received)).strikes == job.strikes
+
+
+def test_upload_detects_a_dropped_data_line(tmp_path, charset):
+    from erika import send
+
+    path = os.path.join(tmp_path, "job.etp")
+    etp.save(path, _tiny_job())
+
+    class Lossy(FakeDevice):
+        def line(self, text):
+            if text.startswith("D "):
+                return "ACK 1"  # claim a wrong running total
+            return super().line(text)
+
+    with pytest.raises(RuntimeError, match="data line was lost"):
+        send.upload(FakeLink(Lossy()), path, progress=False)
+
+
+def test_upload_frames_the_conversation_correctly(tmp_path, charset):
+    import base64
+
+    from erika import send
+
+    # Big enough to need several data lines.
+    job = planner.encode(
+        planner.build_plan(
+            _write_choices(tmp_path, _random_choices(charset, 8, 12, FOUR_LAYERS, seed=4)),
+            charset,
+        )
+    )
+    path = os.path.join(tmp_path, "job.etp")
+    size = etp.save(path, job)
+
+    device = FakeDevice()
+    send.upload(FakeLink(device), path, progress=False)
+
+    lines = device.sent_lines
+    assert lines[0] == f"IMG UPLOAD {size}"
+    assert lines[-1] == "Z"
+
+    data_lines = [l for l in lines[1:-1] if l.startswith("D ")]
+    assert len(data_lines) == len(lines) - 2, "unexpected traffic between the frames"
+    assert len(data_lines) > 1, "test job is too small to exercise chunking"
+    for line in data_lines:
+        assert len(base64.b64decode(line[2:])) <= device.chunk
+
+
 # ---------------------------------------------------------------------------
 # container
 # ---------------------------------------------------------------------------

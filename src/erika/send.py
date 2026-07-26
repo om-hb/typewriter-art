@@ -1,25 +1,32 @@
 """Send a .etp print job to the ESP32 over USB serial, and drive the print.
 
-    python -m erika.send results/photo.etp --port /dev/cu.usbmodem1101 --print
+    python -m erika.send results/photo.etp --port COM6 --print
 
-Speaks the chunked, acknowledged protocol implemented by
+Speaks the line-framed base64 protocol implemented by
 ``erika_ai/src/image_receiver.cpp``::
 
     ->  IMG UPLOAD 8814
-    <-  READY 512
-    ->  <512 raw bytes>
-    <-  ACK 512
+    <-  UPLOAD-READY 256
+    ->  D SVRQMQECAAA...
+    <-  ACK 256
         ...
+    ->  Z
     <-  OK 8814 bytes stored and verified
 
-Integrity is not checked by this protocol -- it is checked by the CRC in the
-job's own header, which the firmware verifies after the last chunk lands. A
-mangled transfer fails there rather than on paper.
+Everything is newline-framed text, so the payload rides the same reader as
+every other command: no modal switch into a raw binary mode that can
+desynchronise, and log output the firmware interleaves is harmless. The
+running ACK total catches a dropped line at once, and the job's own CRC-32 --
+checked by the firmware after the last line -- catches corruption.
+
+If a transfer fails, `--diagnose` walks the link one step at a time and says
+which step broke.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import os
 import sys
 import time
@@ -29,7 +36,8 @@ if __package__ in (None, ""):
 
 from erika import etp
 
-CHUNK_SIZE = 512  # must match IMG_UPLOAD_CHUNK in image_receiver.h
+#: Decoded bytes per data line. Must match IMG_UPLOAD_CHUNK in image_receiver.h.
+CHUNK_SIZE = 256
 
 
 def _require_serial():
@@ -52,7 +60,12 @@ def list_ports() -> list[str]:
 
 
 def autodetect_port() -> str:
-    ports = [p for p in list_ports() if "usb" in p.lower() or "ACM" in p]
+    def looks_like_a_board(name: str) -> bool:
+        low = name.lower()
+        # macOS /dev/cu.usbmodem*, Linux /dev/ttyUSB* and /dev/ttyACM*, Windows COMn
+        return "usb" in low or "acm" in low or low.startswith("com")
+
+    ports = [p for p in list_ports() if looks_like_a_board(p)]
     if len(ports) == 1:
         return ports[0]
     if not ports:
@@ -63,17 +76,36 @@ def autodetect_port() -> str:
     )
 
 
+#: Reply tokens the firmware uses to open a message. Anything else on the wire
+#: is log output from another subsystem and gets skipped.
+REPLY_PREFIXES = ("OK", "ERR", "ACK", "PONG", "STATE", "INFO", "UPLOAD-READY")
+
+
 class Link:
     """A line-oriented conversation with the firmware's IMG console."""
 
     def __init__(self, port: str, baud: int = 115200, timeout: float = 10.0,
-                 verbose: bool = False):
+                 verbose: bool = False, reset: bool = True, settle: float = 2.0):
         serial = _require_serial()
         self.verbose = verbose
-        self.ser = serial.Serial(port, baud, timeout=timeout)
-        # The ESP32 resets when the port opens; give it a moment, then drop
-        # whatever boot chatter is already in the buffer.
-        time.sleep(2.0)
+        self.ser = serial.Serial()
+        self.ser.port = port
+        self.ser.baudrate = baud
+        self.ser.timeout = timeout
+        self.ser.write_timeout = 10.0
+        # pyserial asserts DTR and RTS on open. On boards with a USB-serial
+        # bridge those lines are wired to EN and GPIO0, so leaving them
+        # asserted can hold the ESP32 in reset or drop it into the download
+        # ROM -- where it answers nothing. Park them low before opening.
+        self.ser.dtr = False
+        self.ser.rts = False
+        self.ser.open()
+        self.ser.dtr = False
+        self.ser.rts = False
+        if reset:
+            # Boot plus setup() -- WiFi association in particular -- takes a
+            # while, and loop() is not running until it finishes.
+            time.sleep(settle)
         self.ser.reset_input_buffer()
 
     def close(self):
@@ -81,8 +113,8 @@ class Link:
 
     def send_line(self, text: str) -> None:
         if self.verbose:
-            print(f"  -> {text}")
-        self.ser.write((text + "\n").encode())
+            print(f"  -> {text if len(text) < 90 else text[:87] + '...'}")
+        self.ser.write((text + "\n").encode("ascii"))
         self.ser.flush()
 
     def read_line(self) -> str:
@@ -94,28 +126,52 @@ class Link:
             print(f"  <- {line}")
         return line
 
-    def await_reply(self, *prefixes: str, skip_logs: bool = True) -> str:
-        """Read until a line starts with one of `prefixes`, or ERR."""
-        deadline = time.time() + 30
+    def await_reply(self, *prefixes: str, timeout: float = 30.0) -> str:
+        """Read until a line starts with one of `prefixes`, or with ERR."""
+        wanted = prefixes or REPLY_PREFIXES
+        deadline = time.time() + timeout
+        seen = []
         while time.time() < deadline:
-            line = self.read_line()
+            try:
+                line = self.read_line()
+            except TimeoutError:
+                continue
             if line.startswith("ERR"):
                 raise RuntimeError(line)
-            if any(line.startswith(p) for p in prefixes):
+            if any(line.startswith(p) for p in wanted):
                 return line
-            if not skip_logs and line:
-                print(line)
-        raise TimeoutError(f"device never replied with {prefixes}")
+            seen.append(line)
+        hint = ""
+        if seen:
+            hint = "\n  device said instead:\n    " + "\n    ".join(seen[-6:])
+        raise TimeoutError(
+            f"device never replied with {'/'.join(wanted)}{hint}\n"
+            "  If it said nothing at all, the firmware may still be in setup() "
+            "(WiFi association blocks loop()); try --settle 10.\n"
+            "  Check the link with:  python -m erika.send --port <port> --diagnose"
+        )
 
     def command(self, text: str, echo: bool = True) -> str:
-        """Send a command and return the first non-log reply line."""
+        """Send a command and return its first reply line."""
         self.send_line(text)
-        line = self.await_reply("OK", "ERR", "IDLE", "READY", "PRINTING",
-                                "PAUSED", "FINISHED", "FAILED", "grid",
-                                "no job", skip_logs=True)
+        line = self.await_reply()
         if echo:
             print(line)
         return line
+
+    def drain(self, seconds: float = 0.4) -> list[str]:
+        """Collect any trailing lines, e.g. the INFO block after an OK."""
+        old, self.ser.timeout = self.ser.timeout, seconds
+        out = []
+        try:
+            while True:
+                try:
+                    out.append(self.read_line())
+                except TimeoutError:
+                    break
+        finally:
+            self.ser.timeout = old
+        return out
 
 
 def upload(link: Link, path: str, progress: bool = True) -> None:
@@ -125,20 +181,22 @@ def upload(link: Link, path: str, progress: bool = True) -> None:
           f"{job.cols}x{job.rows} cells")
 
     link.send_line(f"IMG UPLOAD {len(data)}")
-    ready = link.await_reply("READY")
-    chunk = int(ready.split()[1]) if len(ready.split()) > 1 else CHUNK_SIZE
+    ready = link.await_reply("UPLOAD-READY")
+    parts = ready.split()
+    chunk = int(parts[1]) if len(parts) > 1 else CHUNK_SIZE
 
     sent = 0
     start = time.time()
     while sent < len(data):
         block = data[sent : sent + chunk]
-        link.ser.write(block)
-        link.ser.flush()
+        link.send_line("D " + base64.b64encode(block).decode("ascii"))
         sent += len(block)
-        ack = link.await_reply("ACK")
-        acked = int(ack.split()[1])
+        acked = int(link.await_reply("ACK").split()[1])
         if acked != sent:
-            raise RuntimeError(f"device acked {acked} bytes, we sent {sent}")
+            raise RuntimeError(
+                f"device has {acked} bytes, we have sent {sent} -- a data line "
+                "was lost. Try a lower --baud."
+            )
         if progress:
             pct = 100 * sent / len(data)
             elapsed = time.time() - start
@@ -147,18 +205,49 @@ def upload(link: Link, path: str, progress: bool = True) -> None:
     if progress:
         print()
 
+    link.send_line("Z")
     print(link.await_reply("OK"))
-    # The firmware follows OK with an INFO block; surface it if it arrives.
-    link.ser.timeout = 0.5
-    while True:
-        try:
-            extra = link.read_line()
-        except TimeoutError:
-            break
-        if not extra:
-            break
+    for extra in link.drain():
         print(f"  {extra}")
-    link.ser.timeout = 10.0
+
+
+def diagnose(link: Link) -> int:
+    """Walk the link one step at a time and report where it breaks."""
+    print("\n1. console alive?")
+    try:
+        print(f"   {link.command('IMG PING', echo=False)}")
+    except (RuntimeError, TimeoutError) as exc:
+        print(f"   FAILED: {exc}")
+        print("\n   The firmware is not answering text commands. Check that the")
+        print("   board is flashed with this firmware, that --port is right, and")
+        print("   that nothing else (a serial monitor, the PlatformIO terminal)")
+        print("   holds the port open.")
+        return 1
+
+    print("\n2. base64 upload path?")
+    probe = etp.pack(etp.Job(body=bytes([etp.OP_END]), cols=1, rows=1, strikes=0))
+    try:
+        link.send_line(f"IMG UPLOAD {len(probe)}")
+        ready = link.await_reply("UPLOAD-READY")
+        print(f"   {ready}")
+        link.send_line("D " + base64.b64encode(probe).decode("ascii"))
+        print(f"   {link.await_reply('ACK')}")
+        link.send_line("Z")
+        print(f"   {link.await_reply('OK')}")
+        for extra in link.drain():
+            print(f"   {extra}")
+    except (RuntimeError, TimeoutError) as exc:
+        print(f"   FAILED: {exc}")
+        return 1
+
+    print("\n3. stored job?")
+    print(f"   {link.command('IMG INFO', echo=False)}")
+    for extra in link.drain():
+        print(f"   {extra}")
+
+    print("\nlink is healthy. Note that step 2 replaced any stored job with a")
+    print("one-opcode probe -- upload the real one again before printing.")
+    return 0
 
 
 def watch(link: Link, poll: float = 5.0) -> int:
@@ -167,16 +256,15 @@ def watch(link: Link, poll: float = 5.0) -> int:
     try:
         while True:
             link.send_line("IMG STATUS")
-            line = link.await_reply("IDLE", "READY", "PRINTING", "PAUSED",
-                                    "FINISHED", "FAILED")
-            print(f"\r  {line}".ljust(100), end="", flush=True)
-            if line.startswith("FINISHED"):
+            state = link.await_reply("STATE").removeprefix("STATE ").strip()
+            print(f"\r  {state}".ljust(100), end="", flush=True)
+            if state.startswith("FINISHED"):
                 print("\ndone")
                 return 0
-            if line.startswith("FAILED"):
+            if state.startswith("FAILED"):
                 print("\nprint failed")
                 return 1
-            if line.startswith(("IDLE", "READY")):
+            if state.startswith(("IDLE", "READY")):
                 print("\nprinter is idle -- job not running")
                 return 1
             time.sleep(poll)
@@ -200,6 +288,11 @@ def main(argv=None) -> int:
     p.add_argument("--watch", "-w", action="store_true", help="poll progress until done")
     p.add_argument("--command", "-c", default=None,
                    help="send one IMG command instead of uploading, e.g. 'STATUS'")
+    p.add_argument("--diagnose", action="store_true",
+                   help="test the link step by step and report where it breaks")
+    p.add_argument("--settle", type=float, default=2.0,
+                   help="seconds to wait for the board to boot after opening the "
+                        "port; raise it if setup() is slow (default 2)")
     p.add_argument("--list-ports", action="store_true")
     p.add_argument("--verbose", "-v", action="store_true")
     a = p.parse_args(argv)
@@ -209,15 +302,19 @@ def main(argv=None) -> int:
             print(port)
         return 0
 
-    if not a.file and not a.command:
-        p.error("give a .etp file to upload, or --command to just talk to the device")
+    if not a.file and not a.command and not a.diagnose:
+        p.error("give a .etp file to upload, or --command / --diagnose")
 
     port = a.port or autodetect_port()
     print(f"connecting to {port} at {a.baud} baud")
-    link = Link(port, a.baud, verbose=a.verbose)
+    link = Link(port, a.baud, verbose=a.verbose, settle=a.settle)
     try:
+        if a.diagnose:
+            return diagnose(link)
         if a.command:
             link.command(f"IMG {a.command}")
+            for extra in link.drain():
+                print(f"  {extra}")
             return 0
 
         upload(link, a.file)
