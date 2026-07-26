@@ -209,6 +209,9 @@ class FakeLink:
         out, self._pending = self._pending, []
         return out
 
+    def resync(self) -> None:
+        self._pending = []
+
 
 @pytest.mark.parametrize("noise", [False, True])
 def test_upload_delivers_the_file_byte_for_byte(tmp_path, charset, noise, capsys):
@@ -232,20 +235,75 @@ def test_upload_delivers_the_file_byte_for_byte(tmp_path, charset, noise, capsys
     assert etp.unpack(bytes(device.received)).strikes == job.strikes
 
 
+class DropsNthLine(FakeDevice):
+    """A device whose receive buffer overruns on one particular data line.
+
+    This is the failure that actually happened on hardware: the stock 256-byte
+    serial buffer could not hold a whole data line, so a chunk went missing at
+    an unpredictable point in the transfer.
+    """
+
+    def __init__(self, drop_at: int, drops: int = 1, **kw):
+        super().__init__(**kw)
+        self.drop_at = drop_at
+        self.drops_left = drops
+        self.seen = 0
+
+    def line(self, text: str) -> str:
+        if text.startswith("IMG UPLOAD"):
+            self.seen = 0  # line numbering is per attempt
+        if text.startswith("D "):
+            self.seen += 1
+            if self.seen == self.drop_at and self.drops_left > 0:
+                self.drops_left -= 1
+                # Dropped on the wire: the device answers with its unchanged
+                # total, which is how the host notices.
+                return f"ACK {len(self.received)}"
+        return super().line(text)
+
+
 def test_upload_detects_a_dropped_data_line(tmp_path, charset):
     from erika import send
 
     path = os.path.join(tmp_path, "job.etp")
     etp.save(path, _tiny_job())
 
-    class Lossy(FakeDevice):
-        def line(self, text):
-            if text.startswith("D "):
-                return "ACK 1"  # claim a wrong running total
-            return super().line(text)
-
     with pytest.raises(RuntimeError, match="data line was lost"):
-        send.upload(FakeLink(Lossy()), path, progress=False)
+        send.upload(FakeLink(DropsNthLine(drop_at=1)), path, progress=False,
+                    retries=0)
+
+
+def test_upload_retries_a_transfer_that_drops_a_line(tmp_path, charset, capsys):
+    """One bad line should cost a retry, not the whole job."""
+    from erika import send
+
+    job = planner.encode(
+        planner.build_plan(
+            _write_choices(tmp_path, _random_choices(charset, 6, 10, FOUR_LAYERS, seed=8)),
+            charset,
+        )
+    )
+    path = os.path.join(tmp_path, "job.etp")
+    etp.save(path, job)
+    original = open(path, "rb").read()
+
+    device = DropsNthLine(drop_at=3, drops=1)
+    send.upload(FakeLink(device), path, progress=False, retries=2)
+
+    assert bytes(device.received) == original
+    assert "retrying" in capsys.readouterr().out
+
+
+def test_upload_gives_up_after_the_retry_budget(tmp_path):
+    from erika import send
+
+    path = os.path.join(tmp_path, "job.etp")
+    etp.save(path, _tiny_job())
+
+    # Drops the first line of every attempt.
+    device = DropsNthLine(drop_at=1, drops=99)
+    with pytest.raises(RuntimeError, match="data line was lost"):
+        send.upload(FakeLink(device), path, progress=False, retries=2)
 
 
 def test_upload_frames_the_conversation_correctly(tmp_path, charset):

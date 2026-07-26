@@ -6,9 +6,9 @@ Speaks the line-framed base64 protocol implemented by
 ``erika_ai/src/image_receiver.cpp``::
 
     ->  IMG UPLOAD 8814
-    <-  UPLOAD-READY 256
+    <-  UPLOAD-READY 128
     ->  D SVRQMQECAAA...
-    <-  ACK 256
+    <-  ACK 128
         ...
     ->  Z
     <-  OK 8814 bytes stored and verified
@@ -18,6 +18,11 @@ every other command: no modal switch into a raw binary mode that can
 desynchronise, and log output the firmware interleaves is harmless. The
 running ACK total catches a dropped line at once, and the job's own CRC-32 --
 checked by the firmware after the last line -- catches corruption.
+
+Lines are kept short enough to fit whole in the device's serial receive
+buffer, so the firmware never has to keep pace with the wire mid-line -- it
+cannot, because writing the previous chunk to flash can stall for tens of
+milliseconds.
 
 If a transfer fails, `--diagnose` walks the link one step at a time and says
 which step broke.
@@ -30,6 +35,7 @@ import base64
 import os
 import sys
 import time
+from typing import Protocol
 
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -37,7 +43,12 @@ if __package__ in (None, ""):
 from erika import etp
 
 #: Decoded bytes per data line. Must match IMG_UPLOAD_CHUNK in image_receiver.h.
-CHUNK_SIZE = 256
+#:
+#: Deliberately small: a whole data line has to fit in the device's serial
+#: receive buffer, whose stock size is 256 bytes on both HWCDC and
+#: HardwareSerial. 128 decoded bytes is 172 base64 characters, so the firmware
+#: never has to keep pace with the wire in the middle of a line.
+CHUNK_SIZE = 128
 
 
 def _require_serial():
@@ -79,6 +90,15 @@ def autodetect_port() -> str:
 #: Reply tokens the firmware uses to open a message. Anything else on the wire
 #: is log output from another subsystem and gets skipped.
 REPLY_PREFIXES = ("OK", "ERR", "ACK", "PONG", "STATE", "INFO", "UPLOAD-READY")
+
+
+class Console(Protocol):
+    """The conversation the transfer needs, so tests can stand in for a port."""
+
+    def send_line(self, text: str) -> None: ...
+    def await_reply(self, *prefixes: str, timeout: float = ...) -> str: ...
+    def drain(self, seconds: float = ...) -> list[str]: ...
+    def resync(self) -> None: ...
 
 
 class Link:
@@ -173,13 +193,40 @@ class Link:
             self.ser.timeout = old
         return out
 
+    def resync(self) -> None:
+        """Get the device to a known-quiet state before starting a transfer.
 
-def upload(link: Link, path: str, progress: bool = True) -> None:
+        A transfer that died leaves the firmware answering the data lines still
+        in flight. Those replies arrive after the port is opened, so without
+        this the next run reads a stale error as the answer to its first
+        command -- which is exactly as confusing as it sounds.
+        """
+        self.send_line("IMG CANCEL")
+        for _ in range(20):
+            if not self.drain(0.3):
+                break
+        self.ser.reset_input_buffer()
+
+
+def upload(link: Console, path: str, progress: bool = True, retries: int = 2) -> None:
+    """Upload a job, retrying the whole transfer if a line goes missing."""
     job = etp.load(path)  # parse locally first: fail fast on a bad file
     data = open(path, "rb").read()
     print(f"{os.path.basename(path)}: {len(data)} bytes, {job.strikes} strikes, "
           f"{job.cols}x{job.rows} cells")
 
+    for attempt in range(retries + 1):
+        try:
+            _upload_once(link, data, progress=progress)
+            return
+        except (RuntimeError, TimeoutError) as exc:
+            if attempt == retries:
+                raise
+            print(f"\n  attempt {attempt + 1} failed ({exc}); retrying")
+            link.resync()
+
+
+def _upload_once(link: Console, data: bytes, progress: bool = True) -> None:
     link.send_line(f"IMG UPLOAD {len(data)}")
     ready = link.await_reply("UPLOAD-READY")
     parts = ready.split()
@@ -195,7 +242,7 @@ def upload(link: Link, path: str, progress: bool = True) -> None:
         if acked != sent:
             raise RuntimeError(
                 f"device has {acked} bytes, we have sent {sent} -- a data line "
-                "was lost. Try a lower --baud."
+                "was lost or truncated"
             )
         if progress:
             pct = 100 * sent / len(data)
@@ -211,7 +258,7 @@ def upload(link: Link, path: str, progress: bool = True) -> None:
         print(f"  {extra}")
 
 
-def diagnose(link: Link) -> int:
+def diagnose(link: Console) -> int:
     """Walk the link one step at a time and report where it breaks."""
     print("\n1. console alive?")
     try:
@@ -224,33 +271,46 @@ def diagnose(link: Link) -> int:
         print("   holds the port open.")
         return 1
 
-    print("\n2. base64 upload path?")
+    print("\n2. single-line upload?")
     probe = etp.pack(etp.Job(body=bytes([etp.OP_END]), cols=1, rows=1, strikes=0))
     try:
-        link.send_line(f"IMG UPLOAD {len(probe)}")
-        ready = link.await_reply("UPLOAD-READY")
-        print(f"   {ready}")
-        link.send_line("D " + base64.b64encode(probe).decode("ascii"))
-        print(f"   {link.await_reply('ACK')}")
-        link.send_line("Z")
-        print(f"   {link.await_reply('OK')}")
-        for extra in link.drain():
-            print(f"   {extra}")
+        _upload_once(link, probe, progress=False)
     except (RuntimeError, TimeoutError) as exc:
         print(f"   FAILED: {exc}")
         return 1
 
-    print("\n3. stored job?")
+    # A single short line proves almost nothing: the interesting failure is a
+    # transfer long enough that the device has to drain the port while writing
+    # the previous chunk to flash. Push enough lines to actually provoke it.
+    print(f"\n3. multi-line upload? ({CHUNK_SIZE}-byte lines)")
+    filler = etp.Encoder()
+    for _ in range(1500):
+        filler.right(2)
+    filler.end()
+    big = etp.pack(etp.Job(body=filler.body(), cols=1, rows=1, strikes=0))
+    lines = -(-len(big) // CHUNK_SIZE)
+    print(f"   {len(big)} bytes over {lines} data lines")
+    try:
+        _upload_once(link, big, progress=False)
+    except (RuntimeError, TimeoutError) as exc:
+        print(f"   FAILED: {exc}")
+        print("\n   Short transfers work but long ones drop lines. That is the")
+        print("   receive buffer overrunning: check that setup() calls")
+        print("   Serial.setRxBufferSize() before Serial.begin(), and that the")
+        print("   board is running a current build.")
+        return 1
+
+    print("\n4. stored job?")
     print(f"   {link.command('IMG INFO', echo=False)}")
     for extra in link.drain():
         print(f"   {extra}")
 
-    print("\nlink is healthy. Note that step 2 replaced any stored job with a")
-    print("one-opcode probe -- upload the real one again before printing.")
+    print("\nlink is healthy. Note that the probes above replaced any stored job")
+    print("-- upload the real one again before printing.")
     return 0
 
 
-def watch(link: Link, poll: float = 5.0) -> int:
+def watch(link: Console, poll: float = 5.0) -> int:
     """Poll IMG STATUS until the job finishes or fails."""
     print("watching progress (Ctrl-C to stop watching; the print continues)")
     try:
@@ -290,6 +350,9 @@ def main(argv=None) -> int:
                    help="send one IMG command instead of uploading, e.g. 'STATUS'")
     p.add_argument("--diagnose", action="store_true",
                    help="test the link step by step and report where it breaks")
+    p.add_argument("--retries", type=int, default=2,
+                   help="restart the whole transfer this many times if a data "
+                        "line goes missing (default 2)")
     p.add_argument("--settle", type=float, default=2.0,
                    help="seconds to wait for the board to boot after opening the "
                         "port; raise it if setup() is slow (default 2)")
@@ -309,6 +372,9 @@ def main(argv=None) -> int:
     print(f"connecting to {port} at {a.baud} baud")
     link = Link(port, a.baud, verbose=a.verbose, settle=a.settle)
     try:
+        # Clear any backlog from a previous run before trusting a reply.
+        link.resync()
+
         if a.diagnose:
             return diagnose(link)
         if a.command:
@@ -317,7 +383,7 @@ def main(argv=None) -> int:
                 print(f"  {extra}")
             return 0
 
-        upload(link, a.file)
+        upload(link, a.file, retries=a.retries)
         if a.speed is not None:
             link.command(f"IMG SPEED {a.speed}")
         if a.do_print:

@@ -207,8 +207,24 @@ python -m erika.send --port COM6 --diagnose
 That checks the console, then the base64 upload path, then the stored job, and
 says which step broke. `--verbose` adds every line in both directions.
 
-Two things that have actually bitten:
+Things that have actually bitten:
 
+- **A data line larger than the serial receive buffer.** This one cost a while.
+  The core's stock RX buffer is 256 bytes on both `HWCDC` and `HardwareSerial`,
+  and the receiver only drains the port between `poll()` calls — so if a line
+  does not fit whole in the buffer, the firmware has to keep pace with the wire
+  while it arrives. It cannot: writing the previous chunk to SPIFFS stalls for
+  tens of milliseconds whenever a flash page needs erasing, which at 115200
+  baud is hundreds of bytes lost. The symptom is nasty, because it is
+  intermittent and position-random: short transfers always work, long ones drop
+  a line somewhere different every time. Fixed at both ends —
+  `Serial.setRxBufferSize()` in `setup()`, and a chunk size small enough
+  (128 decoded → 172 characters) that a line fits even without it.
+- **A failed transfer poisoning the next run.** The firmware kept answering the
+  data lines still in flight, and those replies arrived after the next run
+  opened the port — so it read a stale error as the answer to its first
+  command. The uploader now resyncs on connect, and the firmware explains a
+  stray data line once and then goes quiet instead of erroring per line.
 - **The board is still in `setup()`.** `loop()` does not run until WiFi
   association finishes, and the uploader only waits two seconds after opening
   the port. If the device answers nothing at all, try `--settle 10`.
@@ -220,7 +236,14 @@ Two things that have actually bitten:
 
 Uploads are newline-framed base64 rather than raw binary, which is what makes
 them debuggable: you can watch the whole conversation in a serial terminal, and
-log output the firmware interleaves on the same port does no harm.
+log output the firmware interleaves on the same port does no harm. A missing
+line is caught immediately by the running `ACK` total, and `erika.send` retries
+the transfer (`--retries`, default 2) before giving up.
+
+If you port this protocol to another board, the one invariant to preserve is
+that **a whole data line fits in the receive buffer** — `test_erika.py` pins
+`CHUNK_SIZE` against `IMG_MAX_LINE`, but the buffer size itself is a runtime
+property you have to check yourself.
 
 Useful planning flags for `print` and `plan`:
 
