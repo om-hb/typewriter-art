@@ -179,11 +179,12 @@ it, along with everything else the planner relies on:
 
 | part | what it shows | failure looks like |
 |---|---|---|
-| 1 | a ruler of bars at 2-cell pitch | — (reference for part 2) |
+| 1 | a ruler of `!` at 2-cell pitch | — (reference for part 2) |
 | 2 | the same ruler struck again half a step across, so every bar gains a twin | single bars, identical to part 1 |
 | 3 | twelve marks in one column: four whole-line gaps, then seven half-line | uneven gaps, or any sideways shift |
 | 4 | `O` overstruck with `-` | a hyphen beside the O rather than through it |
 | 5 | two `X` struck at the same column via different routes | two X side by side |
+| 6 | every typeable glyph, in charset order | any character that differs from the list the tool prints |
 
 If part 2 looks like part 1, the half-step code is wrong: find the right one and
 change `HALF_STEP_FORWARD` in [`erika_codes.py`](erika_codes.py) *and*
@@ -194,6 +195,19 @@ Part 3 is a pitch comparison, so everything in it shares a column deliberately �
 the lower gaps must measure exactly half the upper ones, which is what lets the
 planner mix `NEWLINE` for whole-line gaps with half-line steps for odd ones. A
 sideways shift there means a line feed is disturbing the carriage.
+
+Part 6 checks something the rest of the pipeline simply assumes: that the type
+wheel fitted to the machine matches the byte→glyph table in
+[`erika_codes.py`](erika_codes.py) and `erika_ai/src/erika_char_map.cpp`. It
+matters more than it looks. The optimizer picks characters by how much ink they
+lay down, so a wheel that disagrees with the table does not merely substitute
+the odd glyph — it makes every tonal decision in the picture wrong. Compare the
+printed rows against the ones the tool prints; if a character differs, fix that
+entry in both tables and rebuild the charset.
+
+Wheel layouts vary most in the punctuation and symbol range — `|`, `£`, `§`,
+`µ`, `²`, `³` are the usual suspects. That is why the rulers use `!`, which
+every wheel carries.
 
 ## Command reference
 

@@ -36,6 +36,15 @@ from erika.planner import Charset, PlanError
 #: Layer schemes in layers.json whose offsets are all multiples of 0.5.
 TYPEABLE_LAYER_SCHEMES = ("1x1", "1x2", "1x4", "2Hx1", "2Hx2", "2Vx1", "2Vx2", "4x1", "4x2")
 
+#: Glyph used for the calibration rulers. It wants to be a narrow vertical
+#: mark, so a half-step offset is obvious, and a character every type wheel
+#: certainly carries. '|' is neither -- plenty of wheels place it oddly or
+#: omit it, which makes it a poor reference for the one test that matters.
+RULER_CHAR = "!"
+
+#: Characters per line on the glyph-check rows.
+GLYPH_CHECK_WIDTH = 33
+
 
 @contextlib.contextmanager
 def in_src_dir():
@@ -66,6 +75,16 @@ def type_text(enc: etp.Encoder, text: str) -> None:
 def type_line(enc: etp.Encoder, text: str, lines_after: int = 1) -> None:
     type_text(enc, text)
     enc.newline(lines_after)
+
+
+def glyph_check_rows(width: int = GLYPH_CHECK_WIDTH) -> list[str]:
+    """Every typeable glyph, in charset order, split into printable rows.
+
+    Charset order is also the order the charset sheet is built in, so a row
+    that comes out wrong points straight at the offending index.
+    """
+    chars = [g.char for g in ec.GLYPHS]
+    return ["".join(chars[i : i + width]) for i in range(0, len(chars), width)]
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +253,7 @@ def cmd_calibrate(args) -> int:
     # 1. Full-step ruler: a reference comb at one-cell pitch.
     type_line(enc, "1 FULL STEP RULER")
     for _ in range(n):
-        enc.strike(ec.glyph_for_char("|").code)
+        enc.strike(ec.glyph_for_char(RULER_CHAR).code)
         enc.right(2)
     enc.newline(2)
 
@@ -243,12 +262,12 @@ def cmd_calibrate(args) -> int:
     #    bars and a dead one shows as the ruler unchanged.
     type_line(enc, "2 HALF STEP (EACH BAR SHOULD GAIN A TWIN BESIDE IT)")
     for _ in range(n):
-        enc.strike(ec.glyph_for_char("|").code)
+        enc.strike(ec.glyph_for_char(RULER_CHAR).code)
         enc.right(2)
     enc.carriage_return()
     enc.right(1)  # <- the half-step under test
     for _ in range(n):
-        enc.strike(ec.glyph_for_char("|").code)
+        enc.strike(ec.glyph_for_char(RULER_CHAR).code)
         enc.right(2)
     enc.newline(2)
 
@@ -288,7 +307,17 @@ def cmd_calibrate(args) -> int:
     enc.left(42)  # 40 out, plus the 2 the strike advanced
     enc.right(40)
     enc.strike(ec.glyph_for_char("X").code)
-    enc.newline(3)
+    enc.newline(2)
+
+    # 6. Every typeable glyph, in charset order. This is the only check that
+    #    the byte -> glyph table in erika_char_map.cpp matches the type wheel
+    #    actually fitted. It matters more than it looks: the optimizer chooses
+    #    characters by how much ink they lay down, so a wheel that disagrees
+    #    with the table makes every tonal decision in the picture wrong.
+    type_line(enc, "6 GLYPH CHECK (COMPARE WITH THE LIST THE TOOL PRINTS)")
+    for row in glyph_check_rows():
+        type_line(enc, row)
+    enc.newline(2)
 
     enc.carriage_return()
     enc.end()
@@ -300,7 +329,7 @@ def cmd_calibrate(args) -> int:
     size = etp.save(out, job)
     print(f"calibration job -> {out} ({size} bytes, {job.strikes} strikes)")
     print("\nWhat to check on the printed sheet:")
-    print("  1  A row of evenly spaced bars. This is the reference for part 2.")
+    print(f"  1  A row of evenly spaced '{RULER_CHAR}'. The reference for part 2.")
     print("  2  The same ruler, struck a second time half a step across, so every")
     print("     bar should have gained a twin close beside it. If part 2 looks")
     print("     like part 1 -- single bars, same spacing -- the half step did")
@@ -315,6 +344,15 @@ def cmd_calibrate(args) -> int:
     print("     shift means a line feed is nudging the carriage.")
     print("  4  A clean strike-through confirms backspace registration.")
     print("  5  Two X marks side by side mean the carriage loses steps.")
+    print("  6  Part 6 must read exactly as below. A character that comes out")
+    print("     wrong means the type wheel disagrees with erika_char_map.cpp --")
+    print("     the optimizer picks glyphs by how much ink they lay down, so a")
+    print("     wheel that disagrees makes every tone in the picture wrong.")
+    print("     Fix the offending entry in erika_ai/src/erika_char_map.cpp and")
+    print("     erika/erika_codes.py, then rebuild the charset.")
+    print()
+    for row in glyph_check_rows():
+        print(f"       {row}")
     return 0
 
 

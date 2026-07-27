@@ -598,15 +598,18 @@ def test_dead_keys_do_not_advance_the_carriage(tmp_path):
     assert etp.OP_STRIKE_NA in ops
 
 
-def _calibration_marks(tmp_path, char: str):
-    """Run the calibration job through the virtual machine, keep one glyph."""
+def _calibration_lines(tmp_path) -> dict[int, list]:
+    """Type the calibration job on the virtual machine, grouped by line."""
     from erika import pipeline
 
     out = os.path.join(tmp_path, "cal.etp")
     pipeline.main(["calibrate", "-o", out])
     machine = emulate.type_job(etp.load(out))
-    code = ec.glyph_for_char(char).code
-    return [i for i in machine.impressions if i.code == code]
+    assert machine.overruns == 0, "calibration ran the carriage off the end"
+    lines: dict[int, list] = {}
+    for imp in machine.impressions:
+        lines.setdefault(imp.y, []).append(imp)
+    return lines
 
 
 def test_calibration_half_step_test_prints_pairs_of_bars(tmp_path, capsys):
@@ -615,16 +618,23 @@ def test_calibration_half_step_test_prints_pairs_of_bars(tmp_path, capsys):
     If the two passes coincided, the sheet would look like part 1 and the
     operator would read a working machine as a broken one.
     """
-    marks = _calibration_marks(tmp_path, "|")
-    rows = sorted({m.y for m in marks})
-    assert len(rows) == 2, "expected a plain ruler and an offset one"
+    from erika.pipeline import RULER_CHAR
 
-    plain = sorted(m.x for m in marks if m.y == rows[0])
-    offset = sorted(m.x for m in marks if m.y == rows[1])
+    code = ec.glyph_for_char(RULER_CHAR).code
+    lines = _calibration_lines(tmp_path)
+    # The two ruler lines are the ones made only of the ruler glyph.
+    rulers = [
+        sorted(i.x for i in marks)
+        for _, marks in sorted(lines.items())
+        if len(marks) > 1 and {i.code for i in marks} == {code}
+    ]
+    assert len(rulers) == 2, "expected a plain ruler and an offset one"
+    plain, offset = rulers
+
     assert len(offset) == 2 * len(plain), "second pass should double the bars"
-    # Half-steps are odd x; whole steps are even. Pairs, not overstrikes.
+    # Half-steps land on odd x, whole steps on even. Pairs, not overstrikes.
     assert {x % 2 for x in offset} == {0, 1}
-    assert sorted(set(b - a for a, b in zip(offset, offset[1:]))) == [1, 3]
+    assert sorted({b - a for a, b in zip(offset, offset[1:])}) == [1, 3]
 
 
 def test_calibration_line_feed_test_stays_in_one_column(tmp_path, capsys):
@@ -634,15 +644,39 @@ def test_calibration_line_feed_test_stays_in_one_column(tmp_path, capsys):
     earlier version staggered alternate marks to stop them overlapping, which
     made a correct machine look like it was drifting sideways.
     """
-    marks = _calibration_marks(tmp_path, "_")
-    assert len({m.x for m in marks}) == 1, "marks must share one column"
+    lines = _calibration_lines(tmp_path)
+    # The ladder is the run of lines carrying a single mark each.
+    ladder = [marks[0] for _, marks in sorted(lines.items()) if len(marks) == 1]
+    assert len(ladder) >= 8, "ladder not found"
+    assert len({m.x for m in ladder}) == 1, "marks must share one column"
 
-    gaps = [b.y - a.y for a, b in zip(marks, marks[1:])]
-    whole = [g for g in gaps if g == 2]  # 2 half-lines == one whole line
+    gaps = [b.y - a.y for a, b in zip(ladder, ladder[1:])]
+    whole = [g for g in gaps if g == 2]  # two half-lines == one whole line
     half = [g for g in gaps if g == 1]
     assert len(whole) + len(half) == len(gaps), f"unexpected gaps: {gaps}"
     assert whole and half, "need both a reference group and a half-line group"
     assert gaps == whole + half, "reference group should come first"
+
+
+def test_calibration_glyph_check_types_the_whole_charset(tmp_path, capsys):
+    """Part 6 is the only check that the type wheel matches the code table.
+
+    It has to be complete and verbatim: the operator compares the paper
+    against the rows the tool prints, so a glyph missing from either side
+    would go unnoticed -- and the optimizer chooses characters by how much ink
+    they lay down, so a mismatched wheel corrupts every tone in the picture.
+    """
+    from erika.pipeline import glyph_check_rows
+
+    lines = _calibration_lines(tmp_path)
+    typed = {
+        "".join(ec.glyph_for_code(i.code).char for i in marks)
+        for _, marks in lines.items()
+    }
+    rows = glyph_check_rows()
+    for row in rows:
+        assert row in typed, f"glyph-check row not typed: {row!r}"
+    assert "".join(rows) == "".join(g.char for g in ec.GLYPHS), "charset not covered"
 
 
 def test_expand_covers_every_opcode_the_encoder_can_emit():
