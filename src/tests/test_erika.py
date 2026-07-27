@@ -451,6 +451,20 @@ def charset() -> Charset:
     return Charset.load("sigma-10", SRC)
 
 
+@pytest.mark.parametrize("name", ["sigma-10", "sigma-12"])
+def test_charset_file_is_utf8(name):
+    """A charset written in the platform's default encoding is unloadable.
+
+    The glyph names contain non-ASCII characters, and Python's default text
+    encoding is the locale's -- cp1252 on Windows. A glyphs.json generated
+    without an explicit encoding= is readable only on the machine that made
+    it, and fails on the first non-ASCII character everywhere else.
+    """
+    path = os.path.join(SRC, "charsets", name, "glyphs.json")
+    text = open(path, "rb").read().decode("utf-8")  # strict: raises if not UTF-8
+    assert any(ord(c) > 127 for c in text), "expected non-ASCII glyphs to guard"
+
+
 def _write_choices(tmp_path, layers: dict) -> str:
     path = os.path.join(tmp_path, "choices.json")
     with open(path, "w") as f:

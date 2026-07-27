@@ -300,7 +300,7 @@ def make_charset(
         "whiteThreshold": WHITE_THRESHOLD,
         "blankSpace": True,
     }
-    with open(os.path.join(charset_dir, "config.json"), "w") as f:
+    with open(os.path.join(charset_dir, "config.json"), "w", encoding="utf-8") as f:
         json.dump(config, f, indent=4)
 
     # Index 0 is the blank tile chop_charset prepends; glyph i lands at i + 1.
@@ -321,7 +321,11 @@ def make_charset(
             *[{"index": i + 1, **asdict(g)} for i, g in enumerate(glyphs)],
         ],
     }
-    with open(os.path.join(charset_dir, "glyphs.json"), "w") as f:
+    # encoding= is not optional: the glyph names carry non-ASCII characters
+    # (£ § ° ä ...) and Python's default text encoding is the locale's, which on
+    # Windows is cp1252. Without it this file is written in cp1252 while every
+    # reader opens it as UTF-8, and loading dies on the first £.
+    with open(os.path.join(charset_dir, "glyphs.json"), "w", encoding="utf-8") as f:
         json.dump(mapping, f, indent=2, ensure_ascii=False)
 
     _verify_mapping(charset_dir, base_path, expected=len(glyphs) + 1)
