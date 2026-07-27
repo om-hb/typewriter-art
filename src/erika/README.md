@@ -224,6 +224,7 @@ erika.pipeline print      photo -> optimize -> .etp     (-t, -r, -n, -l)
 erika.pipeline plan       re-plan an existing choices.json without re-optimizing
 erika.pipeline verify     diff a plan render against optimize.py's mockup
 erika.pipeline calibrate  motion-code test pattern
+erika.pipeline area       bracket the corners of the printable area (--rows, --columns)
 erika.pipeline sheet      type the charset, for scanning back in
 
 erika.send <file.etp>     upload over USB serial   (--port, --print, --watch)
@@ -296,3 +297,26 @@ At pitch 10 a cell is 2.54 × 4.23 mm, so `-r 48` on a 4:5 photo is about
 122 × 170 mm — comfortably inside A4 with margins. The carriage limit is 65
 columns; at 48 columns and four layers expect roughly 5,000 strikes and,
 at the default 100 ms per character, around 25 minutes of typing.
+
+To see that on paper rather than in millimetres, type a print-area sheet:
+
+```bash
+python -m erika.pipeline area                     # the whole reachable area
+python -m erika.send results/print_area.etp --print
+python -m erika.pipeline area --columns 48 --rows 60   # where an -r 48 print lands
+```
+
+It brackets the four corners — an `L` of `_` and `!` at each — and captions the
+sheet with its own dimensions. Load the paper exactly as you would for a photo:
+the top-left bracket lands wherever the head is when the job starts, so the
+sheet shows the area *relative to how you feed the sheet*, which is the part no
+amount of arithmetic settles.
+
+The two axes are not the same kind of limit, and the sheet is mostly there to
+show it. **Width is the machine**: the carriage reaches 65 columns at pitch 10,
+78 at pitch 12, and that is the widest `-r` the planner accepts — a right-hand
+bracket that comes out short or smeared means this machine stops earlier, and
+that column count is the real ceiling. **Height is only paper**: the platen
+keeps feeding for as long as it grips the sheet, so `--rows` (60 by default,
+254 mm) is a question about the paper, not the typewriter. Whatever number
+still prints both bottom brackets cleanly is how tall a print can be.

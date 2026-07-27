@@ -31,17 +31,18 @@ project is also driven through `uv run python`. Substitute whichever applies;
 
 ```bash
 cd src
-PY -m pytest tests -q                                   # 43 tests
+PY -m pytest tests -q                                   # 49 tests
 PY -m erika.pipeline charset --pitch 10                 # build the Sigma charset
 PY -m erika.pipeline print -t images/mwdog_crop.png -r 48
 PY -m erika.pipeline calibrate                          # machine test pattern
+PY -m erika.pipeline area                               # corners of the print area
 PY -m erika.pipeline verify                             # plan vs. optimizer mockup
 PY -m erika.etp results/photo.etp -n 30                 # disassemble a job
 PY -m erika.send results/photo.etp --port COM6 --print --watch
 PY -m erika.send --port COM6 --diagnose                 # when uploads fail
 ```
 
-Subcommands: `charset print plan verify calibrate sheet`.
+Subcommands: `charset print plan verify calibrate area sheet`.
 
 No lint, typecheck or CI configured. `.vscode/settings.json` (upstream)
 declares **black** with format-on-save, but black is not in

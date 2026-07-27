@@ -719,6 +719,62 @@ def test_calibration_glyph_check_types_the_whole_charset(tmp_path, capsys):
     assert "".join(rows) == "".join(g.char for g in ec.GLYPHS), "charset not covered"
 
 
+def _area_cells(tmp_path, *extra: str) -> set[tuple[int, int]]:
+    """Type the print-area job on the virtual machine; return the marked cells.
+
+    Cells are (row, column) in whole cells -- the sheet only ever marks whole
+    ones, so half-step coordinates would just be noise here.
+    """
+    from erika import pipeline
+
+    out = os.path.join(tmp_path, "area.etp")
+    assert pipeline.main(["area", "-o", out, *extra]) == 0
+    job = etp.load(out)
+    machine = emulate.type_job(job, max_columns=ec.MAX_COLUMNS[job.pitch])
+    assert machine.overruns == 0, "print-area sheet ran the carriage off the end"
+    assert not [op for _, op, _ in etp.iter_ops(job.body) if op == etp.OP_UP], (
+        "the sheet must not reverse the platen"
+    )
+    assert all(imp.x % 2 == imp.y % 2 == 0 for imp in machine.impressions)
+    return {(imp.y // 2, imp.x // 2) for imp in machine.impressions}
+
+
+def _assert_corners(cells: set[tuple[int, int]], columns: int, rows: int) -> None:
+    """The four corner cells are marked and nothing lies outside them."""
+    corners = {(0, 0), (0, columns - 1), (rows - 1, 0), (rows - 1, columns - 1)}
+    assert corners <= cells, f"corners not marked: {sorted(corners - cells)}"
+    assert max(c for _, c in cells) == columns - 1
+    assert max(r for r, _ in cells) == rows - 1
+
+
+@pytest.mark.parametrize("pitch", [10, 12])
+def test_print_area_brackets_reach_the_carriage_limit(tmp_path, pitch):
+    """The corners must sit on the extremes, or the sheet lies about the area.
+
+    The width is the one hard limit the machine has, and this sheet is what an
+    operator measures it against -- a bracket one column short would quietly
+    shrink every print planned from it.
+    """
+    from erika.pipeline import DEFAULT_AREA_ROWS
+
+    cells = _area_cells(tmp_path, "-p", str(pitch))
+    _assert_corners(cells, ec.MAX_COLUMNS[pitch], DEFAULT_AREA_ROWS)
+
+
+def test_print_area_marks_the_area_asked_for(tmp_path):
+    """--columns / --rows exist to preview where a given -r would land."""
+    _assert_corners(_area_cells(tmp_path, "--columns", "20", "--rows", "6"), 20, 6)
+
+
+def test_print_area_refuses_a_width_the_carriage_cannot_reach(tmp_path):
+    """Better to say so than to type a sheet that overstates the machine."""
+    from erika import pipeline
+
+    out = os.path.join(tmp_path, "area.etp")
+    assert pipeline.main(["area", "-o", out, "--columns", "999"]) == 2
+    assert not os.path.exists(out)
+
+
 def test_expand_covers_every_opcode_the_encoder_can_emit():
     enc = etp.Encoder()
     enc.right(3)

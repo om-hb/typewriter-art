@@ -14,6 +14,7 @@ Subcommands:
     plan       re-plan an existing results/choices.json without re-optimizing
     verify     render a plan and diff it against optimize.py's own mockup
     calibrate  a small .etp test pattern for checking the motion codes
+    area       mark the four corners of the printable area on a sheet
     sheet      an .etp that types the charset, for scanning back in
 """
 
@@ -45,6 +46,19 @@ RULER_CHAR = "!"
 #: Characters per line on the glyph-check rows.
 GLYPH_CHECK_WIDTH = 33
 
+#: The corner brackets typed by `area`: how many cells each arm runs, and what
+#: draws it. '_' sits on the baseline, so it reads as an edge; '!' is the narrow
+#: vertical every wheel carries (see RULER_CHAR). Together they make an L that
+#: is legible at arm's length, which is the whole point of the sheet.
+CORNER_ARM = 2
+CORNER_EDGE_CHAR = "_"
+CORNER_SIDE_CHAR = "!"
+
+#: Lines the `area` sheet marks out by default. 60 lines at Zeilenschaltung 1 is
+#: 254 mm -- an A4 sheet with roughly 20 mm spare at each end. Unlike the width
+#: this is not a machine limit, just a useful default; see cmd_area.
+DEFAULT_AREA_ROWS = 60
+
 
 @contextlib.contextmanager
 def in_src_dir():
@@ -75,6 +89,23 @@ def type_text(enc: etp.Encoder, text: str) -> None:
 def type_line(enc: etp.Encoder, text: str, lines_after: int = 1) -> None:
     type_text(enc, text)
     enc.newline(lines_after)
+
+
+def type_row(enc: etp.Encoder, marks: list[tuple[int, str]]) -> None:
+    """Type pieces of text at absolute columns on one line, left to right.
+
+    Starts from the left margin so a column means the same thing on every row.
+    Everything in GLYPHS advances the head one full step -- no dead keys here --
+    so the column after a piece of text is simply its column plus its length.
+    Marks must be given in order and must not overlap; the encoder refuses a
+    negative move, so a mistake fails here rather than on paper.
+    """
+    enc.carriage_return()
+    col = 0
+    for at, text in marks:
+        enc.right(2 * (at - col))
+        type_text(enc, text)
+        col = at + len(text)
 
 
 def glyph_check_rows(width: int = GLYPH_CHECK_WIDTH) -> list[str]:
@@ -356,6 +387,99 @@ def cmd_calibrate(args) -> int:
     return 0
 
 
+def cmd_area(args) -> int:
+    """Bracket the four corners of the area a print can occupy.
+
+    Two of the four edges are real machine limits and two are not, which is the
+    thing this sheet is for. The width is hard: the carriage reaches 65 columns
+    at pitch 10, 78 at pitch 12, and the planner refuses anything wider. The
+    height is not a limit at all -- the platen keeps feeding as long as it grips
+    the sheet -- so the vertical extent is whatever --rows asks for, and what
+    the sheet shows is whether that many lines actually fit on the paper.
+
+    The top-left bracket lands wherever the head is when the job starts, so the
+    sheet marks the area relative to how the paper is loaded, exactly as a photo
+    print would be.
+    """
+    limit = ec.MAX_COLUMNS[args.pitch]
+    columns = args.columns or limit
+    if columns > limit:
+        raise PlanError(
+            f"{columns} columns is past the carriage limit of {limit} at pitch "
+            f"{args.pitch}"
+            + (" -- pitch 12 reaches 78." if args.pitch == 10 else ".")
+        )
+    if columns < 2 * CORNER_ARM or args.rows < 2 * CORNER_ARM:
+        raise PlanError(
+            f"an area of {columns} x {args.rows} cells leaves no room for corner "
+            f"brackets {CORNER_ARM} cells on a side"
+        )
+
+    w_mm = columns * ec.PITCH_WIDTH_MM[args.pitch]
+    h_mm = args.rows * ec.LINE_HEIGHT_MM
+
+    enc = etp.Encoder()
+    edge = CORNER_EDGE_CHAR * CORNER_ARM
+    row = 0
+
+    def go_to(target: int) -> None:
+        """Feed to an absolute row. Every gap here is a whole number of lines,
+        so this always drives the detented line-feed mechanism."""
+        nonlocal row
+        enc.newline(target - row)
+        row = target
+
+    # Top edge, then the sides hanging below it.
+    type_row(enc, [(0, edge), (columns - CORNER_ARM, edge)])
+    for _ in range(CORNER_ARM - 1):
+        go_to(row + 1)
+        type_row(enc, [(0, CORNER_SIDE_CHAR), (columns - 1, CORNER_SIDE_CHAR)])
+
+    # What the sheet is a picture of, typed on the sheet -- otherwise two of
+    # them side by side are hard to tell apart. Skipped if the area is too
+    # small to hold it without touching the brackets.
+    caption = (f"{columns} X {args.rows} CELLS = {w_mm:.0f} X {h_mm:.0f} MM "
+               f"AT PITCH {args.pitch}")
+    if args.rows > 2 * CORNER_ARM and len(caption) <= columns:
+        go_to(CORNER_ARM)
+        type_row(enc, [(0, caption)])
+
+    # Bottom sides, then the bottom edge.
+    for arm in range(CORNER_ARM - 1, 0, -1):
+        go_to(args.rows - 1 - arm)
+        type_row(enc, [(0, CORNER_SIDE_CHAR), (columns - 1, CORNER_SIDE_CHAR)])
+    go_to(args.rows - 1)
+    type_row(enc, [(0, edge), (columns - CORNER_ARM, edge)])
+
+    enc.newline(2)  # roll the sheet clear of the platen, as planner.encode does
+    enc.end()
+
+    job = etp.Job(body=enc.body(), cols=columns, rows=args.rows,
+                  strikes=enc.strikes, pitch=args.pitch, home_each_row=True)
+    out = args.out if os.path.isabs(args.out) else os.path.join(SRC_DIR, args.out)
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    size = etp.save(out, job)
+    print(f"print-area job -> {out} ({size} bytes, {job.strikes} strikes)")
+    print(f"  area   {columns} x {args.rows} cells "
+          f"= {w_mm:.0f} x {h_mm:.0f} mm at pitch {args.pitch}")
+    print(f"  print  -r {columns} fills it edge to edge")
+    print("\nLoad a sheet the way you would for a photo, with the paper where you")
+    print("want the top-left of the print, then type this:")
+    print(f"  python -m erika.send {os.path.relpath(out, SRC_DIR)} --print")
+    print("\nWhat to check on the printed sheet:")
+    print("  - Four brackets, each pointing into the area a print can occupy.")
+    print(f"    The width is the machine's own limit -- {limit} columns at pitch "
+          f"{args.pitch},")
+    print("    which is the widest -r the planner will accept.")
+    print("  - A right-hand bracket that is short, smeared or missing means the")
+    print("    carriage hit its stop early: type it again with --columns lowered")
+    print("    until it comes out clean, and use that as your -r ceiling.")
+    print("  - The height is not a machine limit, only paper. If the bottom")
+    print("    brackets ran off the sheet or the platen lost its grip, lower")
+    print("    --rows; that number caps how tall a print can be on this paper.")
+    return 0
+
+
 def cmd_sheet(args) -> int:
     """Type the full charset so it can be scanned into a real charset."""
     glyphs = ec.all_glyphs(dead_keys=args.dead_keys)
@@ -463,6 +587,20 @@ def build_parser() -> argparse.ArgumentParser:
     cal.add_argument("--out", "-o", default="results/calibrate.etp")
     cal.add_argument("--pitch", "-p", type=int, default=10, choices=(10, 12))
     cal.set_defaults(func=cmd_calibrate)
+
+    ar = sub.add_parser("area", help="mark the four corners of the printable area")
+    ar.add_argument("--out", "-o", default="results/print_area.etp")
+    ar.add_argument("--pitch", "-p", type=int, default=10, choices=(10, 12))
+    ar.add_argument("--rows", type=int, default=DEFAULT_AREA_ROWS,
+                    help=f"lines to mark out; the machine has no vertical limit, "
+                         f"only the paper does (default {DEFAULT_AREA_ROWS}, "
+                         f"= {DEFAULT_AREA_ROWS * ec.LINE_HEIGHT_MM:.0f} mm)")
+    ar.add_argument("--columns", type=int, default=None,
+                    help="width to mark out; default is the carriage limit "
+                         f"({ec.MAX_COLUMNS[10]} at pitch 10, "
+                         f"{ec.MAX_COLUMNS[12]} at pitch 12). Set it to an -r "
+                         "value to see where that print would land")
+    ar.set_defaults(func=cmd_area)
 
     sh = sub.add_parser("sheet", help="type the charset, for scanning back in")
     sh.add_argument("--out", "-o", default="results/charset_sheet.etp")
