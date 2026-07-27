@@ -209,6 +209,13 @@ Wheel layouts vary most in the punctuation and symbol range — `|`, `£`, `§`,
 `µ`, `²`, `³` are the usual suspects. That is why the rulers use `!`, which
 every wheel carries.
 
+A *single* wrong glyph, with the rest of the same character correct, is a
+different fault: a corrupted byte on the wire rather than a wheel mismatch.
+That was traced to `EspSoftwareSerial` bit-banging the link with interrupts
+enabled, and the firmware now uses a hardware UART instead — see
+[Why a hardware UART](../../../erika_ai/README.md#why-a-hardware-uart). If you
+see it again, reflash before suspecting the machine.
+
 ## Command reference
 
 ```
