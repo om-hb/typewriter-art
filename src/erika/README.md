@@ -174,12 +174,26 @@ typewriter emits, and `0x73` is the only gap in the otherwise contiguous
 line). `0x73` is the obvious candidate for half-step forward, but it is an
 inference.
 
-`python -m erika.pipeline calibrate` types a five-part test pattern that checks
-it, along with everything else the planner relies on. If part 2's bars land on
-top of the reference bars instead of between them, the code is wrong — find the
-right one and change `HALF_STEP_FORWARD` in [`erika_codes.py`](erika_codes.py)
-and `ERIKA_HALF_STEP_FWD` in `erika_ai/src/erika_image.h`. The test suite will
-tell you if you only change one.
+`python -m erika.pipeline calibrate` types a five-part test pattern that settles
+it, along with everything else the planner relies on:
+
+| part | what it shows | failure looks like |
+|---|---|---|
+| 1 | a ruler of bars at 2-cell pitch | — (reference for part 2) |
+| 2 | the same ruler struck again half a step across, so every bar gains a twin | single bars, identical to part 1 |
+| 3 | twelve marks in one column: four whole-line gaps, then seven half-line | uneven gaps, or any sideways shift |
+| 4 | `O` overstruck with `-` | a hyphen beside the O rather than through it |
+| 5 | two `X` struck at the same column via different routes | two X side by side |
+
+If part 2 looks like part 1, the half-step code is wrong: find the right one and
+change `HALF_STEP_FORWARD` in [`erika_codes.py`](erika_codes.py) *and*
+`ERIKA_HALF_STEP_FWD` in `erika_ai/src/erika_image.h`. The test suite fails if
+you change only one.
+
+Part 3 is a pitch comparison, so everything in it shares a column deliberately —
+the lower gaps must measure exactly half the upper ones, which is what lets the
+planner mix `NEWLINE` for whole-line gaps with half-line steps for odd ones. A
+sideways shift there means a line feed is disturbing the carriage.
 
 ## Command reference
 

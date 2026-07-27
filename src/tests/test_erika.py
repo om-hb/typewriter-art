@@ -598,6 +598,53 @@ def test_dead_keys_do_not_advance_the_carriage(tmp_path):
     assert etp.OP_STRIKE_NA in ops
 
 
+def _calibration_marks(tmp_path, char: str):
+    """Run the calibration job through the virtual machine, keep one glyph."""
+    from erika import pipeline
+
+    out = os.path.join(tmp_path, "cal.etp")
+    pipeline.main(["calibrate", "-o", out])
+    machine = emulate.type_job(etp.load(out))
+    code = ec.glyph_for_char(char).code
+    return [i for i in machine.impressions if i.code == code]
+
+
+def test_calibration_half_step_test_prints_pairs_of_bars(tmp_path, capsys):
+    """Part 2 must strike the ruler twice, offset by exactly a half step.
+
+    If the two passes coincided, the sheet would look like part 1 and the
+    operator would read a working machine as a broken one.
+    """
+    marks = _calibration_marks(tmp_path, "|")
+    rows = sorted({m.y for m in marks})
+    assert len(rows) == 2, "expected a plain ruler and an offset one"
+
+    plain = sorted(m.x for m in marks if m.y == rows[0])
+    offset = sorted(m.x for m in marks if m.y == rows[1])
+    assert len(offset) == 2 * len(plain), "second pass should double the bars"
+    # Half-steps are odd x; whole steps are even. Pairs, not overstrikes.
+    assert {x % 2 for x in offset} == {0, 1}
+    assert sorted(set(b - a for a, b in zip(offset, offset[1:]))) == [1, 3]
+
+
+def test_calibration_line_feed_test_stays_in_one_column(tmp_path, capsys):
+    """Part 3 checks that two half-line feeds equal one whole line.
+
+    It reads as a pitch comparison only if every mark shares a column -- an
+    earlier version staggered alternate marks to stop them overlapping, which
+    made a correct machine look like it was drifting sideways.
+    """
+    marks = _calibration_marks(tmp_path, "_")
+    assert len({m.x for m in marks}) == 1, "marks must share one column"
+
+    gaps = [b.y - a.y for a, b in zip(marks, marks[1:])]
+    whole = [g for g in gaps if g == 2]  # 2 half-lines == one whole line
+    half = [g for g in gaps if g == 1]
+    assert len(whole) + len(half) == len(gaps), f"unexpected gaps: {gaps}"
+    assert whole and half, "need both a reference group and a half-line group"
+    assert gaps == whole + half, "reference group should come first"
+
+
 def test_expand_covers_every_opcode_the_encoder_can_emit():
     enc = etp.Encoder()
     enc.right(3)

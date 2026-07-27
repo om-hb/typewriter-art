@@ -238,9 +238,10 @@ def cmd_calibrate(args) -> int:
         enc.right(2)
     enc.newline(2)
 
-    # 2. Half-step comb: same bars, shifted half a cell. Each new bar must
-    #    land exactly between two bars of the ruler above.
-    type_line(enc, "2 HALF STEP OFFSET (BARS SIT BETWEEN THE ONES ABOVE)")
+    # 2. The same ruler struck twice over, the second pass shifted half a cell.
+    #    Both passes are on one line, so a working half step shows as pairs of
+    #    bars and a dead one shows as the ruler unchanged.
+    type_line(enc, "2 HALF STEP (EACH BAR SHOULD GAIN A TWIN BESIDE IT)")
     for _ in range(n):
         enc.strike(ec.glyph_for_char("|").code)
         enc.right(2)
@@ -251,13 +252,24 @@ def cmd_calibrate(args) -> int:
         enc.right(2)
     enc.newline(2)
 
-    # 3. Half-line ladder: underscores every half line down one column.
-    type_line(enc, "3 HALF LINE LADDER (EVENLY SPACED, NO DRIFT)")
-    for i in range(8):
+    # 3. Line-feed pitch. Four marks driven by the detented full-line
+    #    mechanism, then eight by the half-line key. The planner mixes the two
+    #    -- whole-line gaps go through NEWLINE, odd ones through half steps --
+    #    so what matters is that two half lines come to exactly one full line.
+    #    Everything sits in one column, so a feed that disturbs the carriage
+    #    shows up as a sideways shift.
+    type_line(enc, "3 LINE FEED PITCH (LOWER GAPS = HALF THE UPPER ONES)")
+    ladder_column = 18
+    for _ in range(4):
         enc.carriage_return()
-        enc.right(2 * (i % 2))
+        enc.right(2 * ladder_column)
         enc.strike(ec.glyph_for_char("_").code)
-        enc.down(1)
+        enc.newline(1)  # one whole line, the reference
+    for _ in range(8):
+        enc.carriage_return()
+        enc.right(2 * ladder_column)
+        enc.strike(ec.glyph_for_char("_").code)
+        enc.down(1)  # half a line, the mechanism under test
     enc.newline(2)
 
     # 4. Overstrike registration: O, back up, then a hyphen through it.
@@ -288,14 +300,21 @@ def cmd_calibrate(args) -> int:
     size = etp.save(out, job)
     print(f"calibration job -> {out} ({size} bytes, {job.strikes} strikes)")
     print("\nWhat to check on the printed sheet:")
-    print("  1/2  If the half-step bars land on top of the ruler bars instead of")
-    print("       between them, this machine uses a different half-step code.")
-    print("       Find the right one and fix HALF_STEP_FORWARD in erika/erika_codes.py")
-    print("       and ERIKA_HALF_STEP_FWD in erika_ai/src/erika_image.h.")
-    print("  3    Uneven gaps mean the platen slips; prefer --no-home planning off")
-    print("       and expect banding.")
-    print("  4    A clean strike-through confirms backspace registration.")
-    print("  5    Two X marks side by side mean the carriage loses steps.")
+    print("  1  A row of evenly spaced bars. This is the reference for part 2.")
+    print("  2  The same ruler, struck a second time half a step across, so every")
+    print("     bar should have gained a twin close beside it. If part 2 looks")
+    print("     like part 1 -- single bars, same spacing -- the half step did")
+    print("     nothing and this machine uses a code other than 0x73. Find the")
+    print("     right one, then change HALF_STEP_FORWARD in erika/erika_codes.py")
+    print("     and ERIKA_HALF_STEP_FWD in erika_ai/src/erika_image.h. The test")
+    print("     suite fails if you change only one of them.")
+    print("  3  Twelve marks in ONE column: four gaps of a whole line, then seven")
+    print("     of half a line. The lower gaps must be exactly half the upper")
+    print("     ones -- that is what lets the planner mix the two. Uneven gaps")
+    print("     mean the platen slips, which prints as banding. Any sideways")
+    print("     shift means a line feed is nudging the carriage.")
+    print("  4  A clean strike-through confirms backspace registration.")
+    print("  5  Two X marks side by side mean the carriage loses steps.")
     return 0
 
 
