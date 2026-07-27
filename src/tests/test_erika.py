@@ -22,8 +22,34 @@ from erika import etp, planner, preview
 from erika.planner import Charset, PlanError
 
 SRC = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-FIRMWARE_SRC = os.path.normpath(
-    os.path.join(SRC, "..", "..", "erika_ai", "src")
+
+
+def _find_firmware_src() -> str | None:
+    """Locate erika_ai/src, which lives in a separate repository.
+
+    Four tests below are the only guard against the Erika codes, the .etp
+    opcodes and the upload chunk size drifting apart between their Python and
+    C++ copies. They need the firmware checked out, and the conventional
+    layout is as a sibling of this repository -- but that is a convention, not
+    a guarantee: checkout names and locations differ between machines.
+
+    So the path is overridable, and conftest.py shouts if it cannot be found.
+    A silently skipped drift guard is worse than none, because the suite still
+    goes green.
+    """
+    override = os.environ.get("ERIKA_FIRMWARE_SRC")
+    if override:
+        return override if os.path.isdir(override) else None
+    workspace = os.path.dirname(os.path.dirname(SRC))
+    guess = os.path.normpath(os.path.join(workspace, "erika_ai", "src"))
+    return guess if os.path.isdir(guess) else None
+
+
+FIRMWARE_SRC = _find_firmware_src()
+NO_FIRMWARE = FIRMWARE_SRC is None
+NO_FIRMWARE_REASON = (
+    "erika_ai/src not found -- the Python/C++ drift guards did NOT run. "
+    "Check out erika_ai beside this repository, or set ERIKA_FIRMWARE_SRC."
 )
 
 
@@ -61,7 +87,7 @@ def _parse_cpp_defines(path: str) -> dict[str, int]:
     return out
 
 
-@pytest.mark.skipif(not os.path.isdir(FIRMWARE_SRC), reason="firmware tree not present")
+@pytest.mark.skipif(NO_FIRMWARE, reason=NO_FIRMWARE_REASON)
 def test_firmware_motion_codes_match_python():
     """The two code tables are written out by hand in both languages.
 
@@ -85,7 +111,7 @@ def test_firmware_motion_codes_match_python():
         assert defines.get(name) == value, f"{name} differs from erika_codes.py"
 
 
-@pytest.mark.skipif(not os.path.isdir(FIRMWARE_SRC), reason="firmware tree not present")
+@pytest.mark.skipif(NO_FIRMWARE, reason=NO_FIRMWARE_REASON)
 def test_firmware_opcodes_match_python():
     defines = _parse_cpp_defines(os.path.join(FIRMWARE_SRC, "erika_image.h"))
     expected = {
@@ -102,7 +128,7 @@ def test_firmware_opcodes_match_python():
         assert defines.get(name) == value, f"{name} differs from etp.py"
 
 
-@pytest.mark.skipif(not os.path.isdir(FIRMWARE_SRC), reason="firmware tree not present")
+@pytest.mark.skipif(NO_FIRMWARE, reason=NO_FIRMWARE_REASON)
 def test_upload_chunk_size_matches_the_host_tool():
     from erika import send
 
@@ -110,7 +136,7 @@ def test_upload_chunk_size_matches_the_host_tool():
     assert defines["IMG_UPLOAD_CHUNK"] == send.CHUNK_SIZE
 
 
-@pytest.mark.skipif(not os.path.isdir(FIRMWARE_SRC), reason="firmware tree not present")
+@pytest.mark.skipif(NO_FIRMWARE, reason=NO_FIRMWARE_REASON)
 def test_a_full_data_line_fits_the_firmware_line_buffer():
     """A chunk must base64-encode to something the device can hold.
 
