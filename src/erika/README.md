@@ -120,7 +120,7 @@ CRC-32 over the body, then one-byte opcodes with at most one operand.
 
 ```
 $ python -m erika.etp results/photo.etp -n 8
-; ETP1  grid 49x41  strikes 5104  pitch 10  home_each_row True
+; ETP1  grid 49x41  strikes 3875  pitch 10  home_each_row True
 ;  offset  col   row  opcode
        0    0.0   0.0  CR
        2    0.0   1.5  DOWN      3
@@ -295,10 +295,49 @@ Useful planning flags for `print` and `plan`:
 
 At pitch 10 a cell is 2.54 × 4.23 mm, so `-r 48` on a 4:5 photo is about
 122 × 170 mm — comfortably inside A4 with margins. The carriage limit is 65
-columns; at 48 columns and four layers expect roughly 5,000 strikes and,
-at the default 100 ms per character, around 25 minutes of typing.
+columns; at 48 columns and four layers expect roughly 3,900 strikes and,
+at the default 10 head operations per second, around 17 minutes of typing.
 
-That estimate is an upper bound. `--ops-per-second` assumes every head
+### A whole A4 sheet
+
+Three numbers give the size of the job, but only two of them are geometry — the
+third is the picture.
+
+A4 is 210 × 297 mm, or 82 × 70 cells at pitch 10. The carriage never reaches 82,
+so the width is the machine's limit rather than the sheet's, and the height wants
+a margin the platen can keep gripping:
+
+```
+columns   min(65, 210 / 2.54)   =  65      165 mm, 22 mm spare each side
+rows      254 / 4.23            =  60      254 mm, 21 mm spare top and bottom
+layers    -l 4x1                =   4
+slots     65 x 60 x 4           =  15,600  one cell of one layer
+```
+
+So 15,600 — but that is the number of *opportunities* to strike, not strikes.
+The optimizer leaves a cell blank wherever the picture is white and the planner
+drops those (`if index:` in `load_choices`), so the characters actually typed
+are `slots × ink fraction`. On the sample photo at `-l 4x1` that fraction is
+48%, which puts a full sheet at roughly **7,500 characters**. A dark, busy
+photograph climbs toward 15,600; a portrait on a white background can halve it
+again. Nothing has to be estimated once the job exists, because `print` reports
+both halves of the product — a full sheet would read:
+
+```
+  grid         65 x 60 cells, 4 layers (15600 slots, 7522 inked)
+```
+
+Typing time needs both numbers, not just the strikes: the carriage is charged
+for every half-step it crosses, blank cells included, so head operations come to
+roughly slots plus strikes — about 20,000, or ~33 min at the default 10/s, and
+appreciably less in practice (see below). Halving the layers to `-l 2Hx1` halves
+all of it, at the cost of tonal range.
+
+Feeding the sheet right to its edges buys 70 rows instead of 60 — 18,200 slots,
+around 8,800 characters — but the last lines are typed on paper the platen has
+nearly let go of, which is exactly what the `area` sheet below is for.
+
+That 17-minute estimate is an upper bound. `--ops-per-second` assumes every head
 operation costs the full character delay, but the firmware paces each byte by
 what the machine actually has to do — a repeated glyph needs no wheel rotation
 and a carriage step prints nothing, so both are quicker. On a real job that is
@@ -327,3 +366,35 @@ that column count is the real ceiling. **Height is only paper**: the platen
 keeps feeding for as long as it grips the sheet, so `--rows` (60 by default,
 254 mm) is a question about the paper, not the typewriter. Whatever number
 still prints both bottom brackets cleanly is how tall a print can be.
+
+### What a 124 m ribbon holds
+
+The ribbon advances a fixed step on every strike, so its yield is a division —
+and the step is a property of the ribbon, not of the picture:
+
+```
+124 m / 2.54 mm   ≈  48,800 characters    film, one pitch step   (pitch 10)
+124 m / 2.12 mm   ≈  58,600 characters    film, one pitch step   (pitch 12)
+```
+
+Single-strike film is the pessimistic case and the one to plan against: each
+strike has to land on ribbon nobody has used, so the feed is a whole character
+width. Call it **~48,800 characters, or about 6 full A4 sheets** — roughly 12 of
+the `-r 48` photo above.
+
+Two things make that go faster than it reads:
+
+- **Layers multiply it.** Ribbon is spent per strike, not per cell. The 7,500
+  characters of a full `-l 4x1` sheet are 7,500 ribbon steps, four of them
+  stacked on most cells.
+- **A dead key still costs ribbon.** `STRIKE_NA` suppresses the *carriage*, not
+  the ribbon feed, so an overstruck accent consumes as much as a letter.
+
+Both figures are arithmetic on an assumed advance step, which is exactly the
+kind of assumption this pipeline otherwise refuses to make — measure it instead.
+Every job prints its own strike count, so keep a running total across jobs and
+note where a fresh ribbon dies; 124 m divided by that total is this machine's
+real figure. Until then plan on six sheets, and know the recovery path before
+you need it: note the pass number from `IMG STATUS`, change the ribbon, and
+resume with `IMG PRINT pass N`, which replays the paper feeds with the strikes
+suppressed (see [Typewriter art](../../../erika_ai/README.md#typewriter-art)).
