@@ -298,6 +298,13 @@ At pitch 10 a cell is 2.54 × 4.23 mm, so `-r 48` on a 4:5 photo is about
 columns; at 48 columns and four layers expect roughly 5,000 strikes and,
 at the default 100 ms per character, around 25 minutes of typing.
 
+That estimate is an upper bound. `--ops-per-second` assumes every head
+operation costs the full character delay, but the firmware paces each byte by
+what the machine actually has to do — a repeated glyph needs no wheel rotation
+and a carriage step prints nothing, so both are quicker. On a real job that is
+about a third off the figure above. See
+[Pacing](../../../erika_ai/README.md#pacing).
+
 To see that on paper rather than in millimetres, type a print-area sheet:
 
 ```bash

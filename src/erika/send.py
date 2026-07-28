@@ -344,7 +344,10 @@ def main(argv=None) -> int:
     p.add_argument("--from-pass", type=int, default=0,
                    help="resume at a carriage-return pass (paper feeds are replayed)")
     p.add_argument("--speed", type=int, default=None,
-                   help="ms between characters on the typewriter (default 100)")
+                   help="overall typing speed: ms before a glyph the wheel has "
+                        "to turn to (default 100). The firmware scales its "
+                        "shorter delays -- a repeated glyph, a carriage step -- "
+                        "from this one number")
     p.add_argument("--watch", "-w", action="store_true", help="poll progress until done")
     p.add_argument("--command", "-c", default=None,
                    help="send one IMG command instead of uploading, e.g. 'STATUS'")
