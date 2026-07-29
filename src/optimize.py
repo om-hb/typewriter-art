@@ -133,6 +133,10 @@ def kword(
 
     startTime = time.perf_counter_ns()
     n_comparisons = 0
+    # FORK FIX: bare paper, for the single-layer case in the loop below. Allocated
+    # once because the loop runs num_loops * len(layer_offsets) times, and only when
+    # it is needed, because it is the size of the whole target.
+    blank_bg = np.ones_like(mockup) if len(layer_offsets) == 1 else None
     # Layer optimization passes
     shuffled_layer_offsets = [
         (layer_num, layer_offset)
@@ -146,9 +150,17 @@ def kword(
             # Composite all other layers
             # bg = np.prod(np.delete(layers, layer_num, axis=0), axis=0)
             # The above code doesn't get optimized by numba. Rewrite more explicitly
-            bg = layers[(layer_num + 1) % len(layer_offsets)]
-            for i in range(2, len(layer_offsets)):
-                bg = bg * layers[(layer_num + i) % len(layer_offsets)]
+            if blank_bg is not None:
+                # FORK FIX: with one layer there are no *other* layers to composite,
+                # and the modular index below wraps back round to this one -- so every
+                # candidate glyph was scored as if it were struck twice, and the
+                # mockup that came out could not be reproduced by any plan that
+                # strikes each cell once. Bare paper is the correct background.
+                bg = blank_bg
+            else:
+                bg = layers[(layer_num + 1) % len(layer_offsets)]
+                for i in range(2, len(layer_offsets)):
+                    bg = bg * layers[(layer_num + i) % len(layer_offsets)]
 
             choices[layer_num], mockup, comparisons, err = layer_optimization_pass(
                 bg,

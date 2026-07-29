@@ -841,6 +841,85 @@ def test_resume_by_pass_replays_paper_feeds_only(tmp_path, charset):
 
 
 # ---------------------------------------------------------------------------
+# the optimizer's per-layer background (fork fix in optimize.py)
+# ---------------------------------------------------------------------------
+
+
+def _record_backgrounds(layers_name: str, monkeypatch) -> list[np.ndarray]:
+    """Run ``kword`` with its inner loop stubbed, keeping every background it built.
+
+    Stubbed because the real pass is numba-jitted and compiling it costs the better
+    part of ten seconds, which nothing here needs. Replacing the name inside
+    ``optimize`` is what takes effect -- it binds it at import, so patching ``utils``
+    would not.
+
+    ``init_mode="random"`` is load-bearing: from a blank start every layer is bare
+    paper, and a background that wrongly included the layer being optimized would be
+    indistinguishable from a correct one.
+    """
+    import optimize  # noqa: PLC0415
+
+    seen: list[np.ndarray] = []
+
+    def stub(bg, mockup, target, chars, choices, layer_offset, **kwargs):
+        seen.append(np.array(bg, copy=True))
+        # A comparison count of zero would be a fair description of a stub, but
+        # ``kword``'s timing report divides by it; and a zero error makes matplotlib
+        # complain about identical y limits. Both are in the cosmetic tail, and both
+        # are cheaper to satisfy than to work around.
+        return choices, mockup, 1, 1.0
+
+    monkeypatch.setattr(optimize, "layer_optimization_pass", stub)
+    monkeypatch.chdir(SRC)
+    np.random.seed(0)
+    optimize.kword(
+        charset="sigma-10",
+        target=os.path.join("images", "mwdog_crop.png"),
+        layers=layers_name,
+        row_length=6,
+        num_loops=1,
+        init_mode="random",
+        display=0,
+        out_file=os.path.join("results", "_background_test.png"),
+        nowait=True,
+    )
+    return seen
+
+
+def test_a_single_layer_is_optimized_against_bare_paper(monkeypatch):
+    """The fix that makes 1x1 verifiable, guarded at its cause.
+
+    Upstream composites "the other layers" as
+    ``layers[(layer_num + 1) % len(layer_offsets)]``, which for one layer wraps back
+    round to that same layer. Every candidate glyph was therefore scored as if it
+    were struck twice, and the mockup that came out could not be reproduced by any
+    plan that strikes a cell once -- so ``erika.pipeline print`` reported a mismatch
+    on every single-layer job, and the preview was the only thing worth trusting.
+
+    A plan strikes once. The background for the only layer is bare paper.
+    """
+    backgrounds = _record_backgrounds("1x1", monkeypatch)
+    assert len(backgrounds) == 1
+    assert np.all(backgrounds[0] == 1.0)
+
+
+def test_each_layer_is_optimized_against_the_others_and_not_itself(monkeypatch):
+    """And the multi-layer path still composites, which is the regression to fear.
+
+    Four layers must give four *different* backgrounds -- each one missing a
+    different layer. Making them all bare paper, or all the product of everything,
+    would both leave the suite green without this.
+    """
+    backgrounds = _record_backgrounds("4x1", monkeypatch)
+    assert len(backgrounds) == 4
+    assert len({bg.tobytes() for bg in backgrounds}) == 4
+    # Each composites real ink: with a random start the other three are full of
+    # glyphs, so bare paper here would mean they had been ignored.
+    for background in backgrounds:
+        assert background.min() < 1.0
+
+
+# ---------------------------------------------------------------------------
 # the carriage limit's off-by-one
 # ---------------------------------------------------------------------------
 

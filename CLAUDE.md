@@ -31,7 +31,7 @@ project is also driven through `uv run python`. Substitute whichever applies;
 
 ```bash
 cd src
-PY -m pytest tests -q                                   # 49 tests
+PY -m pytest tests -q                                   # 52 tests
 PY -m erika.pipeline charset --pitch 10                 # build the Sigma charset
 PY -m erika.pipeline print -t images/mwdog_crop.png -r 48
 PY -m erika.pipeline calibrate                          # machine test pattern
@@ -125,9 +125,17 @@ ignore it, those four tests are the only protection the tables have.
 ## Conventions
 
 - **`optimize.py` and `utils.py` are upstream.** Change them only for genuine
-  incompatibilities, minimally, with a comment saying why. One such fix exists
-  (matplotlib ≥ 3.7 rejects scalars in `set_xdata`). Everything of ours lives
-  in `src/erika/` and `src/tests/`, which keeps the fork rebaseable.
+  incompatibilities or defects, minimally, marked `FORK FIX` with a comment
+  saying why, and with a test in `src/tests/` — a rebase is what undoes these,
+  and the test is what notices. Everything else of ours lives in `src/erika/`
+  and `src/tests/`, which keeps the fork rebaseable. Two fixes exist:
+  - matplotlib ≥ 3.7 rejects scalars in `set_xdata`
+  - a single layer was composited against *itself*. `bg` for "the other layers"
+    is `layers[(layer_num + 1) % len(layer_offsets)]`, which with one layer
+    wraps back round to it — so every candidate glyph was scored as if struck
+    twice, and the mockup could not be reproduced by any plan that strikes a
+    cell once. `erika.pipeline print` reported a mismatch on every `1x1` job.
+    A lone layer now gets bare paper, and `1x1` verifies like the rest.
 - Comments explain *why*, not *what*. Much of `src/erika/` documents decisions
   that are not recoverable from the code — preserve that when editing.
 - Code, comments and documentation in English.
