@@ -179,10 +179,17 @@ def build_plan(
 
     used_cols = max((s.x for s in strikes), default=0) // 2 + 1
     if used_cols > charset.max_columns:
+        # The -r to suggest is one *less* than the carriage's column count, not
+        # equal to it: resizeTarget pads the target by half a cell on every side,
+        # so a print of n characters per row occupies n + 1 columns of cells. The
+        # message used to suggest max_columns, which is precisely the value that
+        # has just failed -- following the advice failed again.
         raise PlanError(
             f"image is {used_cols} columns wide but the carriage only reaches "
             f"{charset.max_columns} at pitch {charset.pitch}. Re-run optimize.py "
-            f"with -r {charset.max_columns} or lower"
+            f"with -r {charset.max_columns - 1} or lower (a print takes one more "
+            f"column than its characters per row -- half a cell of margin at each "
+            f"side)"
             + (", or switch to pitch 12." if charset.pitch == 10 else ".")
         )
 

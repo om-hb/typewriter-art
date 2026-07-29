@@ -838,3 +838,48 @@ def test_resume_by_pass_replays_paper_feeds_only(tmp_path, charset):
     # ...but the paper sits exactly where the resumed row expects it.
     rows = sorted({s.y for s in plan.strikes})
     assert machine.y == rows[skip_to - 1]
+
+
+# ---------------------------------------------------------------------------
+# the carriage limit's off-by-one
+# ---------------------------------------------------------------------------
+
+
+def test_too_wide_error_suggests_a_row_length_that_actually_fits():
+    """The advice in the refusal has to work when followed.
+
+    ``resizeTarget`` pads the target by half a cell on every side, so a print of
+    *n* characters per row occupies *n + 1* columns of cells. The message used to
+    suggest ``-r <max_columns>``, which is exactly the value that had just been
+    refused -- following it failed again with the same error.
+    """
+    charset = Charset.load("sigma-10", SRC)
+    results = os.path.join(SRC, "results")
+    os.makedirs(results, exist_ok=True)
+
+    def choices_with(columns: int) -> str:
+        path = os.path.join(results, f"_width_{columns}_choices.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"layer0_0_0": [[1] * columns]}, f)
+        return path
+
+    # One column past the carriage's reach.
+    path = choices_with(charset.max_columns + 1)
+    try:
+        with pytest.raises(PlanError) as raised:
+            planner.build_plan(path, charset)
+    finally:
+        os.remove(path)
+
+    suggested = int(re.search(r"-r (\d+)", str(raised.value)).group(1))
+    # Usable means strictly below the column count, not equal to it.
+    assert suggested < charset.max_columns
+    assert suggested == charset.max_columns - 1
+
+    # And taking the advice works: accepted, and reaching the last column.
+    path = choices_with(suggested)
+    try:
+        plan = planner.build_plan(path, charset)
+    finally:
+        os.remove(path)
+    assert max(s.x for s in plan.strikes) // 2 + 1 == suggested
