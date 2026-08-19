@@ -674,13 +674,23 @@ python -m erika.pipeline codes
 python -m erika.send results/control_codes.etp --print
 ```
 
-Nine sections, each with a reference typed beside it in codes already known to
+Ten sections, each with a reference typed beside it in codes already known to
 work, because "did it move a twelfth of an inch" is not answerable by looking
 at one mark. In order: the bell (which says whether a command with an operand
 is understood at all, without marking the paper), carriage steps and platen
 steps at `0xA5`/`0xA6`, the forbidden feed counts, Doppeldruck at `0xA9`,
-backward print at `0x8E`, the correction ribbon at `0x8C`, and 15 characters
-per inch at `0x89`. The command prints what to look for on each.
+backward print at `0x8E`, the correction ribbon at `0x8C`, 15 characters per
+inch at `0x89`, and — separately — whether the *type* fits that step. The
+command prints what to look for on each.
+
+Those last two are one question in two halves, and the split matters. Section 9
+types a comb with the narrowest glyph on the wheel, which makes it a clean read
+on the escapement and blind to the type: a thin mark's spacing can shrink
+without the glyphs touching. Section 10 uses a wide one. If the wheel is cut for
+pitch 10, a cell at 15 is two thirds of the character standing in it, so
+neighbours overlap by about a third — which would make pitch 15 a different
+charset rather than a wider one, and not something `make_charset` can model
+today.
 
 The two that would change the most: `0xA5` and `0xA6` move in absolute
 1/120" and 1/240" steps rather than in fractions of whatever the slide

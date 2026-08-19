@@ -2679,3 +2679,56 @@ def test_the_firmware_defaults_to_using_the_step_commands():
     assert re.search(r"DirectSteps _directSteps = StepsAuto;", text)
     assert re.search(r"bool _completionReport = false;", text)
     assert re.search(r"bool _prepare = false;", text)
+
+
+def test_the_probe_sheet_asks_whether_the_type_fits_the_pitch(tmp_path):
+    """Section 9 confirms the escapement and is structurally blind to the wheel.
+
+    Its comb is typed with RULER_CHAR, which is chosen for being a narrow
+    vertical mark -- and a narrow mark is exactly the one whose spacing can
+    shrink without the glyphs touching. Section 10 is the one that can tell,
+    and it can only tell if it uses a wide glyph and gives the reader something
+    to compare: the same groups at the working pitch, and the wide glyph spaced
+    out so an isolated one is visible next to a packed one.
+    """
+    from erika.pipeline import RULER_CHAR
+
+    job = _codes_sheet(tmp_path)
+    machine = emulate.type_job(job)
+    wide = ec.glyph_for_char("M").code
+
+    rows = {}
+    for imp in machine.impressions:
+        if imp.code == wide:
+            rows.setdefault(imp.y, []).append(imp.x)
+    # Evenly spaced runs only: section 8's correction row also has fifteen M on
+    # it, in two groups with a gap, which is not a run of anything.
+    runs = {
+        y: sorted(xs)
+        for y, xs in rows.items()
+        if len(xs) == 15 and len({b - a for a, b in zip(sorted(xs), sorted(xs)[1:])}) == 1
+    }
+    assert len(runs) == 3, "expected a reference row, a pitch-15 row and a spaced one"
+
+    packed = [xs for xs in runs.values() if {b - a for a, b in zip(xs, xs[1:])} == {2}]
+    spaced = [xs for xs in runs.values() if {b - a for a, b in zip(xs, xs[1:])} == {4}]
+    assert len(packed) == 2, "two rows must be packed, or there is nothing to compare"
+    assert len(spaced) == 1, "one row must be spaced, or overlap cannot be told apart"
+
+    # The thin glyph is the control and has to be on the sheet beside the wide one.
+    assert RULER_CHAR != "M"
+    thin = ec.glyph_for_char(RULER_CHAR).code
+    thin_rows = {i.y for i in machine.impressions if i.code == thin}
+    assert thin_rows & set(runs), "the control never shares a row with the wide glyph"
+
+
+def test_the_pitch_is_restored_after_every_section_that_changes_it(tmp_path):
+    """Two sections change the pitch now, and a pitch that sticks rescales
+    everything after it -- including the other section's own reference row."""
+    job = _codes_sheet(tmp_path)
+    raw = [operand for _, op, operand in etp.iter_ops(job.body) if op == etp.OP_RAW]
+    switches = [b for b in raw if b in (0x87, 0x88, 0x89)]
+    assert switches.count(0x89) == 2
+    # Strictly alternating, so nothing is left at 15.
+    assert switches[0::2] == [0x89, 0x89]
+    assert switches[1::2] == [0x87, 0x87]

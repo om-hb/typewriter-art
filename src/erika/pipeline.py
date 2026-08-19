@@ -973,7 +973,9 @@ def cmd_codes(args) -> int:
     enc.raw(0x8B)
     enc.newline(2)
 
-    # 9. Pitch, last, because a pitch that sticks rescales everything after it.
+    # 9. Pitch. Second to last, because a pitch that sticks rescales everything
+    #    after it -- and section 10 being after it is what checks the restore,
+    #    which nothing did while this was the final section.
     pitch15 = 0x89
     restore = 0x87 if args.pitch == 10 else 0x88
     type_line(enc, "9 PITCH 15 0x89 (LOWER COMB SHOULD BE NARROWER)")
@@ -988,10 +990,57 @@ def cmd_codes(args) -> int:
     enc.raw(restore)
     enc.newline(2)
 
+    # 10. Whether the *type* fits the pitch, which section 9 cannot say.
+    #
+    #     Section 9's comb is typed with RULER_CHAR, and RULER_CHAR was chosen
+    #     for being a narrow vertical mark -- which makes it exactly the one
+    #     character whose spacing can shrink without the glyphs colliding. It
+    #     confirms the escapement and is blind to the wheel.
+    #
+    #     The slugs on a daisy wheel are a fixed physical size. If the wheel is
+    #     cut for pitch 10, a cell at pitch 15 is two thirds as wide as the
+    #     character standing in it, so neighbours overlap by about a third. That
+    #     is ruinous for text and might be useful for a picture -- more ink per
+    #     unit area, on a machine that cannot reach black -- but either way it is
+    #     a different charset, not a wider one, and nothing should be built on
+    #     pitch 15 before the paper has said which.
+    #
+    #     Three rows: the same groups at the working pitch and at 15, and then
+    #     the wide glyph spaced out so that each one has a whole cell to itself.
+    #     Between them they separate "the type is narrower at this pitch" from
+    #     "the type is the same and now collides".
+    wide, thin = "M", RULER_CHAR
+    run = 15
+    type_line(enc, "10 TYPE AT PITCH 15 (DOES THE WHEEL FIT THE STEP?)")
+
+    def group(char: str, count: int, gap: int = 0) -> None:
+        for _ in range(count):
+            enc.strike(ec.glyph_for_char(char).code)
+            if gap:
+                enc.right(2 * gap)
+
+    enc.carriage_return()
+    group(wide, run)
+    enc.right(2 * 3)
+    group(thin, run)
+    enc.newline(1)
+
+    enc.raw(pitch15)
+    enc.carriage_return()
+    group(wide, run)
+    enc.right(2 * 3)
+    group(thin, run)
+    enc.newline(1)
+
+    enc.carriage_return()
+    group(wide, run, gap=1)  # one clear cell between each
+    enc.raw(restore)
+    enc.newline(2)
+
     enc.carriage_return()
     enc.end()
 
-    job = etp.Job(body=enc.body(), cols=n + 2, rows=34, strikes=enc.strikes,
+    job = etp.Job(body=enc.body(), cols=2 * run + 3, rows=40, strikes=enc.strikes,
                   pitch=args.pitch, home_each_row=True)
     out = args.out if os.path.isabs(args.out) else os.path.join(SRC_DIR, args.out)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
@@ -1061,10 +1110,41 @@ def cmd_codes(args) -> int:
     print("  9  Two combs of fifteen bars. If the lower is about two-thirds the")
     print("     width of the upper, this machine takes 15 characters per inch --")
     print("     which the slide switch does not offer, and which is about 97")
-    print("     columns of carriage instead of 65. Same width means 0x89 did")
-    print("     nothing. If everything *after* this sheet comes out narrow, the")
-    print(f"     restore (0x{restore:02X}) did not take: set the pitch switch by")
-    print("     hand, or send 0x95 to reset the machine.")
+    print("     escapement positions instead of 65. Same width means 0x89 did")
+    print("     nothing. What this cannot tell you is whether the *type* fits")
+    print("     that step, which is what part 10 is for -- the bar is a narrow")
+    print("     mark on purpose, and a narrow mark is exactly the one whose")
+    print("     spacing can shrink without the glyphs touching.")
+    print(f"  10 Three rows. The first is {run} {wide} then {run} {thin} at")
+    print(f"     pitch {args.pitch}, and it is the reference: look at how much")
+    print(f"     clear paper stands between neighbouring {wide}. The second row")
+    print("     is the same two groups at pitch 15. The third is at pitch 15 as")
+    print(f"     well, with a whole empty cell between each {wide}.")
+    print()
+    print("     The wheel's slugs are a fixed physical size. If the wheel is cut")
+    print(f"     for pitch {args.pitch}, the step at 15 is two thirds of the one")
+    print(f"     the {wide} was drawn for, so neighbours must overlap by about a")
+    print("     third. Four things the rows can say:")
+    print()
+    print(f"     - Row 2's {wide} merge into a band and row 3's are clean and")
+    print("       separate. The escapement shrank and the type did not. Pitch 15")
+    print("       is then not 97 columns of the same picture but a different")
+    print("       charset -- one whose glyphs bleed into their neighbours' cells,")
+    print("       which make_charset cannot model today. Still possibly worth")
+    print("       having: overlap is ink, and this machine cannot reach black.")
+    print()
+    print("     - Row 2 looks like row 1, only narrower. The wheel really is")
+    print("       narrower at this pitch, and pitch 15 is a clean half again as")
+    print("       much horizontal resolution -- rebuild the charset at the new")
+    print("       cell and nothing else has to change.")
+    print()
+    print(f"     - Row 2's {thin} merge as well. Something other than the type is")
+    print("       wrong: the thin mark is the control here and should survive")
+    print("       any pitch the machine offers.")
+    print()
+    print(f"     - Row 1 is already narrow. The restore (0x{restore:02X}) at the end of")
+    print("       part 9 did not take and everything here is at pitch 15. Set the")
+    print("       pitch switch by hand, or send 0x95 to reset the machine.")
     print()
     print("0x96, the completion report, is not on this sheet: it changes when")
     print("RTS is released rather than what is typed, so it is answered by the")
