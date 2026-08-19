@@ -60,6 +60,26 @@ class Charset:
     codes: list[int]
     advances: list[bool]
     chars: list[str]
+    #: Strike force per index, or None for an index that needs no force command.
+    #: A charset built before strike force existed has None throughout, and then
+    #: nothing in the plan mentions force at all -- which is what keeps every
+    #: charset already on disk printing exactly as it did.
+    forces: list[int | None] = field(default_factory=list)
+    #: The distinct forces, in the order the charset lays them out (hardest
+    #: first, as make_charset writes them). This is the order a row is typed in,
+    #: so it decides which pass goes on the paper first.
+    force_order: list[int] = field(default_factory=list)
+
+    @property
+    def has_forces(self) -> bool:
+        return any(f is not None for f in self.forces)
+
+    def force_rank(self, index: int) -> int:
+        """Where index's force comes in the typing order."""
+        force = self.forces[index] if index < len(self.forces) else None
+        if force is None:
+            return 0
+        return self.force_order.index(force)
 
     @classmethod
     def load(cls, charset: str, base_path: str | None = None) -> "Charset":
@@ -80,6 +100,16 @@ class Charset:
         for i, g in enumerate(glyphs):
             if g["index"] != i:
                 raise PlanError(f"{path}: glyph list is not densely indexed at {i}")
+        forces = [g.get("force") for g in glyphs]
+        order = data.get("forces") or []
+        missing = {f for f in forces if f is not None} - set(order)
+        if missing:
+            raise PlanError(
+                f"{path}: glyphs use force(s) {sorted(missing)} that the file's own "
+                "'forces' list does not name. That list is the typing order, so a "
+                "force missing from it has no place in the plan -- rebuild the "
+                "charset."
+            )
         return cls(
             name=data["charset_name"],
             pitch=data["pitch"],
@@ -89,6 +119,8 @@ class Charset:
             codes=[g["code"] for g in glyphs],
             advances=[g["advances"] for g in glyphs],
             chars=[g["char"] for g in glyphs],
+            forces=forces,
+            force_order=list(order),
         )
 
     def __len__(self) -> int:
@@ -165,6 +197,7 @@ def build_plan(
     charset: Charset,
     home_each_row: bool = True,
     boustrophedon: bool = True,
+    group_by_force: bool = True,
 ) -> Plan:
     strikes, cols, rows, offsets = load_choices(choices_path)
 
@@ -195,7 +228,21 @@ def build_plan(
 
     # Sort by paper position first so the platen only ever feeds forward:
     # reversing the feed introduces backlash that shows up as banding.
-    strikes.sort(key=lambda s: (s.y, s.x))
+    #
+    # With strike force in play there is a second decision inside each line: type
+    # it force by force, or in one sweep switching force as often as the picture
+    # asks. Grouping is the default, for the reason the paper gives in 5.7.2 --
+    # "arrange the typing instructions so that the typist will first type all
+    # 'hard' characters, then fill in the 'soft' characters" -- which for a
+    # machine is not about fatigue but about how often the mechanism has to
+    # change state: a switch costs a full character delay, and interleaved they
+    # can outnumber the strikes. What it costs is one carriage sweep per force
+    # per line, so any error the carriage accumulates across a line lands
+    # differently in each group; group_by_force=False buys that back.
+    if group_by_force and charset.has_forces:
+        strikes.sort(key=lambda s: (s.y, charset.force_rank(s.index), s.x))
+    else:
+        strikes.sort(key=lambda s: (s.y, s.x))
 
     if boustrophedon and not home_each_row:
         strikes = _serpentine(strikes)
@@ -226,6 +273,10 @@ def encode(
     cs = plan.charset
     x = y = 0
     prev_y: int | None = None
+    # None until the first force is asserted. A charset without forces never
+    # asserts one, so its job is byte-identical to what it was before strike
+    # force existed -- which is what makes this safe to leave switched on.
+    force: int | None = None
 
     for s in plan.strikes:
         if s.y != prev_y:
@@ -251,12 +302,26 @@ def encode(
             y = s.y
             prev_y = s.y
 
+        want = cs.forces[s.index] if s.index < len(cs.forces) else None
+        if want is not None and want != force:
+            enc.set_force(want)
+            force = want
+
         enc.horizontal(s.x - x)
         x = s.x
         advances = cs.advances[s.index]
         enc.strike(cs.codes[s.index], advances)
         if advances:
             x += 2
+
+    # Hand the machine back the way it was found. Strike force is state that
+    # outlives the job -- leave it soft and the next thing typed on this
+    # typewriter, by this firmware's chatbot or by hand, comes out faint for no
+    # visible reason. The hardest force the charset uses is the closest thing to
+    # "normal" we can name; see erika_codes.FULL_STRIKE_FORCE for why there is
+    # no better answer yet.
+    if force is not None and force != cs.force_order[0]:
+        enc.set_force(cs.force_order[0])
 
     # Roll the paper clear of the platen so the sheet can be read/removed.
     # NEWLINE already returns the carriage, so no separate CR is needed.
@@ -276,6 +341,7 @@ def encode(
 def summarize(plan: Plan, job: etp.Job, ops_per_second: float = 10.0) -> str:
     cs = plan.charset
     mech_ops = 0
+    force_changes = 0
     for _, op, operand in etp.iter_ops(job.body):
         if op in (etp.OP_RIGHT, etp.OP_LEFT, etp.OP_DOWN, etp.OP_UP,
                   etp.OP_MICRO_DOWN, etp.OP_MICRO_UP):
@@ -284,12 +350,24 @@ def summarize(plan: Plan, job: etp.Job, ops_per_second: float = 10.0) -> str:
             mech_ops += 1
         elif op == etp.OP_NEWLINE:
             mech_ops += operand
+        elif op == etp.OP_SET_FORCE:
+            # Two bytes, and the machine has to settle the hammer setting
+            # between them -- so it costs about what a strike does.
+            mech_ops += 2
+            force_changes += 1
 
     w_mm = plan.width_cells * ec.PITCH_WIDTH_MM[cs.pitch]
     h_mm = plan.height_cells * ec.LINE_HEIGHT_MM
     seconds = mech_ops / ops_per_second
     cells = plan.cols * plan.rows
     layers = len(plan.layer_offsets)
+    force_line = []
+    if cs.has_forces:
+        force_line = [
+            f"  strike force {len(cs.force_order)} levels "
+            f"({', '.join(f'0x{f:02X}' for f in cs.force_order)}), "
+            f"{force_changes} changes"
+        ]
     return "\n".join(
         [
             f"  charset      {cs.name}",
@@ -298,6 +376,7 @@ def summarize(plan: Plan, job: etp.Job, ops_per_second: float = 10.0) -> str:
             f"  on paper     {plan.width_cells:.1f} x {plan.height_cells:.1f} cells "
             f"= {w_mm:.0f} x {h_mm:.0f} mm",
             f"  job size     {etp.HEADER_SIZE + len(job.body)} bytes",
+            *force_line,
             f"  mechanics    {mech_ops} head operations, "
             f"~{seconds / 60:.0f} min at {ops_per_second:g}/s",
             f"  paper feed   {'carriage return every pass' if plan.home_each_row else 'serpentine, no return'}",

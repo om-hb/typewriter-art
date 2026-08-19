@@ -16,6 +16,7 @@ Subcommands:
     calibrate  a small .etp test pattern for checking the motion codes
     area       mark the four corners of the printable area on a sheet
     sheet      an .etp that types the charset, for scanning back in
+    forces     sweep the strike-force command, to find what this machine takes
 """
 
 from __future__ import annotations
@@ -124,8 +125,18 @@ def glyph_check_rows(width: int = GLYPH_CHECK_WIDTH) -> list[str]:
 
 
 def cmd_charset(args) -> int:
-    from erika.make_charset import make_charset
+    from erika.make_charset import make_charset, parse_densities, parse_forces
 
+    try:
+        return _build_charset(args, make_charset, parse_forces, parse_densities)
+    except ValueError as exc:
+        # Same reasoning as run_optimizer's: the builder is a library and is
+        # right to raise ValueError; a mistyped --forces should not print a
+        # traceback at someone.
+        raise PlanError(str(exc)) from exc
+
+
+def _build_charset(args, make_charset, parse_forces, parse_densities) -> int:
     make_charset(
         name=args.name,
         pitch=args.pitch,
@@ -135,8 +146,127 @@ def cmd_charset(args) -> int:
         dead_keys=args.dead_keys,
         scan=args.from_scan,
         base_path=SRC_DIR,
+        ink=args.ink,
+        spread=args.spread,
+        forces=parse_forces(args.forces),
+        force_densities=parse_densities(args.force_density),
     )
     return 0
+
+
+#: Where a target converted by `--grey` is written, relative to src/. Derived
+#: and disposable, so results/ -- and a fixed name, so a run does not leave a
+#: trail of them behind.
+GREY_TARGET = "results/target-grey.png"
+
+
+def preprocess_target(args) -> str:
+    """Apply `--grey` to the target and return the path to hand the optimizer.
+
+    ``kword`` opens its target with ``cv2.IMREAD_GRAYSCALE``, which is Rec. 601
+    luma with no way to ask for anything else. So another conversion has to be a
+    file on disk, written here and pointed at.
+
+    Worth doing at all because of what the paper's section 5.3 says and leaves
+    alone: with the picture reduced to some fifty printable greys, whatever the
+    colour conversion merges is merged for good. ``erika.stress`` has the
+    argument in full.
+    """
+    if args.grey == "luma":
+        return args.target
+
+    from erika import stress
+
+    if args.grey not in stress.METHODS:
+        raise PlanError(
+            f"unknown --grey '{args.grey}'. Pick one of: {', '.join(stress.METHODS)}"
+        )
+
+    source = args.target if os.path.isabs(args.target) else os.path.join(SRC_DIR, args.target)
+    if os.path.isdir(source):
+        raise PlanError(
+            f"--grey {args.grey} needs a single image; {args.target} is a directory. "
+            "Convert the frames first, or run with --grey luma."
+        )
+
+    destination = os.path.join(SRC_DIR, GREY_TARGET)
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    print(f"converting {args.target} to grey by {args.grey} ...")
+    stress.convert_file(
+        source,
+        destination,
+        args.grey,
+        radius=args.stress_radius,
+        samples=args.stress_samples,
+        iterations=args.stress_iterations,
+        seed=args.stress_seed,
+        enhance_shadows=args.stress_shadows,
+    )
+    return GREY_TARGET
+
+
+def align_target(args, target: str) -> str:
+    """Run the crop search, if asked, and return the target to optimize.
+
+    After ``--grey`` rather than before, for the reason erika-studio gives for
+    doing its conversion once: STRESS is spatial and stochastic, so converting
+    each of 64 candidates would compare 64 different pictures. Aligning the
+    converted picture compares one.
+    """
+    if not args.align:
+        return target
+
+    # Imported here so its defaults live in one place -- the module that has the
+    # measurements behind them -- without the parser having to import it.
+    from erika import align
+
+    steps = args.align_steps or align.DEFAULT_STEPS
+    loops = args.align_loops or align.DEFAULT_LOOPS
+    if loops < 1:
+        raise PlanError(f"--align-loops must be at least 1, got {loops}")
+
+    if os.path.isdir(os.path.join(SRC_DIR, target)):
+        raise PlanError(
+            f"--align needs a single image; {target} is a directory. The crop is "
+            "chosen for one picture and would be wrong for the rest."
+        )
+
+    total = steps ** 3
+    print(f"aligning to the character grid: {total} "
+          f"crop{'' if total == 1 else 's'} x {loops} greedy "
+          f"cycle{'' if loops == 1 else 's'} ...")
+
+    # One line, rewritten in place: a 64-line wall of scores says nothing the
+    # winner does not, but a search this slow should not look like a hang. Only
+    # on a terminal, though -- a carriage return is not cursor movement in a
+    # captured log, it is 64 lines of half-overwritten text.
+    live = sys.stdout.isatty()
+
+    def progress(done, count, crop, score):
+        if live:
+            print(f"\r  {done}/{count}  {crop}  {score:.3f}   ", end="", flush=True)
+
+    try:
+        result, path = align.apply_to_file(
+            target, args.charset, args.row_length, args.layers,
+            steps=steps, loops=loops,
+            asymmetry=args.asymmetry, base_path=SRC_DIR, progress=progress,
+        )
+    except ValueError as exc:
+        raise PlanError(str(exc)) from exc
+    if live:
+        print("\r" + " " * 60 + "\r", end="")
+
+    if result.crop.is_identity:
+        print(f"  the picture is already best aligned as it stands "
+              f"({result.seconds:.0f}s, {result.candidates} "
+              f"crop{'' if result.candidates == 1 else 's'})")
+        return target
+    print(f"  {result.crop}, scoring {result.score:.3f} against "
+          f"{result.identity_score:.3f} unaligned (+{result.gain:.3f}) "
+          f"in {result.seconds:.0f}s")
+    print(f"  cropped target -> {path}")
+    return path
 
 
 def run_optimizer(args) -> str:
@@ -149,16 +279,37 @@ def run_optimizer(args) -> str:
             f"Pick one of: {', '.join(TYPEABLE_LAYER_SCHEMES)}"
         )
 
+    target = preprocess_target(args)
+    target = align_target(args, target)
+
     choices_path = os.path.join(SRC_DIR, "results", "choices.json")
     if os.path.exists(choices_path):
         os.remove(choices_path)
 
-    print(f"optimizing {args.target} at {args.row_length} columns, "
+    if args.match_blur > 0:
+        # Imported here, not in the parser: softmatch is a numba module, and
+        # `--match-block`'s default lives in it precisely so that `calibrate
+        # --help` does not pay two seconds to find out what it is.
+        from erika import softmatch
+
+        block = args.match_block or softmatch.DEFAULT_BLOCK
+        charset = Charset.load(args.charset, SRC_DIR)
+        try:
+            softmatch.validate(args.match_blur, block, (charset.cell_h, charset.cell_w))
+        except ValueError as exc:
+            # A library raising ValueError is right; a CLI printing a traceback
+            # over a mistyped flag is not.
+            raise PlanError(str(exc)) from exc
+        softmatch.install(args.match_blur, block)
+        print(f"scoring on {block}x{block} block tone at weight "
+              f"{args.match_blur} as well as per pixel")
+
+    print(f"optimizing {target} at {args.row_length} columns, "
           f"{args.layers} layers, {args.num_loops} loops ...")
     try:
         optimize.kword(
             charset=args.charset,
-            target=args.target,
+            target=target,
             layers=args.layers,
             row_length=args.row_length,
             num_loops=args.num_loops,
@@ -483,31 +634,176 @@ def cmd_area(args) -> int:
 def cmd_sheet(args) -> int:
     """Type the full charset so it can be scanned into a real charset."""
     glyphs = ec.all_glyphs(dead_keys=args.dead_keys)
+    forces = _parse_forces_arg(args.forces)
     cols = args.sheet_cols
     enc = etp.Encoder()
-    for i, glyph in enumerate(glyphs):
-        if i and i % cols == 0:
-            enc.newline(1)
-        enc.strike(glyph.code, glyph.advances)
-        if not glyph.advances:
-            enc.right(2)
+
+    # Contiguous, force block after force block, with no line break where one
+    # block ends -- because make_charset lays the tiles out the same way, and it
+    # has to: a blank tile between two glyphs would be dropped by chop_charset
+    # and shift every index after it. See build_sheet.
+    i = 0
+    for force in forces or [None]:
+        if force is not None:
+            enc.set_force(force)
+        for glyph in glyphs:
+            if i and i % cols == 0:
+                enc.newline(1)
+            enc.strike(glyph.code, glyph.advances)
+            if not glyph.advances:
+                enc.right(2)
+            i += 1
+    if forces:
+        enc.set_force(forces[0])  # leave the machine as it was found
     enc.newline(3)
     enc.carriage_return()
     enc.end()
 
-    rows = (len(glyphs) + cols - 1) // cols
+    tiles = len(glyphs) * max(1, len(forces))
+    rows = (tiles + cols - 1) // cols
     job = etp.Job(body=enc.body(), cols=cols, rows=rows, strikes=enc.strikes,
                   pitch=args.pitch, home_each_row=True)
     out = args.out if os.path.isabs(args.out) else os.path.join(SRC_DIR, args.out)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     size = etp.save(out, job)
-    print(f"charset sheet -> {out} ({size} bytes, {len(glyphs)} glyphs, "
+    forces_note = (f" at {len(forces)} strike forces "
+                   f"({', '.join(f'0x{f:02X}' for f in forces)})" if forces else "")
+    print(f"charset sheet -> {out} ({size} bytes, {len(glyphs)} glyphs{forces_note}, "
           f"{cols} per line)")
     print("\nType it, scan the block of glyphs square-on cropped to the outermost")
     print("ink, then build a charset from the real type:")
     print(f"  python -m erika.pipeline charset --pitch {args.pitch} "
-          f"--name sigma-scanned --from-scan /path/to/scan.png")
+          f"--name sigma-scanned --from-scan /path/to/scan.png"
+          + (f" --forces {args.forces}" if forces else ""))
+    if forces:
+        print("\nThe --forces there must match, and in the same order: the scan is")
+        print("sliced to a grid, and the grid is what says which tile is which.")
     return 0
+
+
+def cmd_forces(args) -> int:
+    """Sweep the strike-force command, so the machine can say what it accepts.
+
+    The manual gives the code and says the next character is the strength. It
+    does not say which strengths exist, nor whether "character" means a small
+    integer or the ASCII digit for one -- and that cannot be settled from a
+    desk. So this types every candidate and lets the paper answer.
+
+    Two properties make the sheet readable whatever the machine does:
+
+    - The first row is typed before the command is ever sent, so it shows the
+      force the machine powers up with. Every row after states its own force,
+      which means it does not matter whether a setting persists.
+    - Every candidate value is outside 0x71..0x82. On a machine that does not
+      implement the command the value byte arrives as an ordinary character, and
+      a character in that range is a *motion* -- it would shift the rest of the
+      line and make the sheet unreadable exactly where it needs reading. Outside
+      it, the worst case is a visible stray character, which is itself the
+      answer: the command did nothing.
+    """
+    blocks = _force_probe_blocks(args)
+    run = args.run
+    glyph = ec.glyph_for_char(args.char)
+    if glyph is None:
+        raise PlanError(f"the Sigma has no key for {args.char!r}")
+
+    enc = etp.Encoder()
+    type_line(enc, "STRIKE FORCE PROBE")
+    enc.newline(1)
+
+    def sample(label: str) -> None:
+        type_row(enc, [(0, label)])
+        enc.right(2 * (len(label) + 1))
+        for _ in range(run):
+            enc.strike(glyph.code, glyph.advances)
+        enc.newline(1)
+
+    # Before any force command: what the machine does on its own.
+    sample("AS FOUND ")
+
+    for name, values in blocks.items():
+        enc.newline(1)
+        type_line(enc, f"{name.upper()}:")
+        for value in values:
+            enc.set_force(value)
+            sample(f"{value:>3} 0x{value:02X}")
+
+    enc.newline(2)
+    enc.carriage_return()
+    enc.end()
+
+    rows = 4 + sum(len(v) + 2 for v in blocks.values())
+    job = etp.Job(body=enc.body(), cols=40, rows=rows, strikes=enc.strikes,
+                  pitch=args.pitch, home_each_row=True)
+    out = args.out if os.path.isabs(args.out) else os.path.join(SRC_DIR, args.out)
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    size = etp.save(out, job)
+
+    print(f"strike-force probe -> {out} ({size} bytes, {job.strikes} strikes)")
+    for name, values in blocks.items():
+        print(f"  {name:<6} 0x{values[0]:02X}..0x{values[-1]:02X} "
+              f"({len(values)} values)")
+    print("\nWhy this sheet exists: a charset with more than one strike force is")
+    print("the single largest quality factor in the paper this pipeline")
+    print("implements (section 5.5), and nothing in the code knows yet whether")
+    print("this machine can do it or how to ask.")
+    print("\nWhat to check on the printed sheet:")
+    print("  - Compare each row of glyphs with the 'AS FOUND' row at the top.")
+    print("    Rows that print LIGHTER or DARKER are forces the machine accepted.")
+    print("  - A row that also shows a stray character before the glyphs is a")
+    print("    value the machine did not take as a force: it typed it instead.")
+    print("    Those rows are answers too -- they rule the value out.")
+    print("  - If no row differs from 'AS FOUND' anywhere on the sheet, then this")
+    print(f"    machine either does not honour 0x{ec.SET_STRIKE_FORCE:02X} or wants "
+          "the force spelled")
+    print("    some other way. Try another range with --from/--to.")
+    print("\nThen, with the values that worked, hardest first:")
+    print("  python -m erika.pipeline sheet --forces 0,3,6      # type it")
+    print("  python -m erika.pipeline charset --forces 0,3,6 \\")
+    print("      --name sigma-forces --from-scan /path/to/scan.png")
+    print("\nOne piece of advice from the paper that does NOT transfer: its")
+    print("figure 20 found medium plus light beat dark plus medium, because its")
+    print("typewriter could already reach black. This one cannot, so keep the")
+    print("hardest strike and add lighter ones below it.")
+    return 0
+
+
+def _parse_forces_arg(text: str | None) -> list[int]:
+    from erika.make_charset import parse_forces
+
+    forces = list(parse_forces(text))
+    bad = [f for f in forces if not ec.is_usable_force(f)]
+    if bad:
+        raise PlanError(
+            f"strike force(s) {', '.join(f'0x{f:02X}' for f in bad)} are motion "
+            "codes -- a machine that ignores the force command would type them "
+            "and move the head. Pick values outside 0x71..0x82."
+        )
+    if len(set(forces)) != len(forces):
+        raise PlanError(f"duplicate strike force in {text!r}")
+    return forces
+
+
+def _force_probe_blocks(args) -> dict[str, list[int]]:
+    """What the probe sweeps: either an explicit range, or both hypotheses."""
+    if args.first is not None or args.last is not None:
+        first = args.first if args.first is not None else 0
+        last = args.last if args.last is not None else first
+        if last < first:
+            raise PlanError(f"--from 0x{first:02X} is above --to 0x{last:02X}")
+        values = [v for v in range(first, last + 1) if ec.is_usable_force(v)]
+        skipped = (last - first + 1) - len(values)
+        if not values:
+            raise PlanError(
+                f"every value in 0x{first:02X}..0x{last:02X} is a motion code"
+            )
+        if skipped:
+            print(f"note: skipping {skipped} motion code(s) in the requested range")
+        return {"custom": values}
+    return {
+        name: [v for v in range(lo, hi + 1) if ec.is_usable_force(v)]
+        for name, (lo, hi) in ec.FORCE_PROBE_BLOCKS.items()
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +812,59 @@ def cmd_sheet(args) -> int:
 def _add_charset_arg(p, default="sigma-10"):
     p.add_argument("--charset", "-c", default=default,
                    help=f"charset folder under src/charsets (default {default})")
+
+
+def _add_ink_args(p):
+    """The ink model and strike forces, from make_charset's own parser.
+
+    Imported rather than restated: unlike the --grey defaults, which are spelled
+    twice on purpose because importing the converter would drag numba into every
+    `--help`, make_charset costs nothing to import here.
+    """
+    from erika.make_charset import add_ink_args
+
+    add_ink_args(p)
+
+
+def _add_grey_args(p):
+    """How the photograph is turned into black and white before optimizing.
+
+    Defaults to `luma`, which is what the optimizer would have done on its own,
+    so a run without these flags is the run it always was.
+    """
+    p.add_argument("--grey", "-g", default="luma", choices=GREY_METHODS,
+                   help="colour to grey conversion: luma (Rec. 601, the default), "
+                        "average (flat RGB mean), c2g (STRESS decolorization -- keeps "
+                        "differences a formula merges), stress (STRESS local "
+                        "enhancement, then luma). See erika/stress.py")
+    p.add_argument("--stress-radius", type=float, default=stress_defaults("radius"),
+                   help="spray radius as a fraction of the longest side (default 1.0)")
+    p.add_argument("--stress-samples", type=int, default=stress_defaults("samples"),
+                   help="sample points per iteration (default 5)")
+    p.add_argument("--stress-iterations", type=int, default=stress_defaults("iterations"),
+                   help="iterations per pixel; more is less noisy and slower (default 20)")
+    p.add_argument("--stress-seed", type=int, default=stress_defaults("seed"),
+                   help="fixes the spray, so a conversion can be repeated")
+    p.add_argument("--stress-shadows", action="store_true",
+                   help="--grey stress only: normalise against the lower envelope too, "
+                        "which opens up the shadows at the cost of looking synthetic")
+
+
+#: The conversions `--grey` accepts and the STRESS defaults, spelled here rather
+#: than imported from `erika.stress`.
+#:
+#: Deliberate, and the one duplication in this package that is not a mistake:
+#: building the parser is what every subcommand and every `--help` does, and
+#: what erika-studio does to read these values back out for its own form -- and
+#: importing `erika.stress` for it would drag numba, two seconds of import, into
+#: a `calibrate` run that never touches a photograph. `test_stress.py` compares
+#: both halves against the converter's own.
+GREY_METHODS = ("luma", "average", "c2g", "stress")
+_STRESS_DEFAULTS = {"radius": 1.0, "samples": 5, "iterations": 20, "seed": 1}
+
+
+def stress_defaults(name: str):
+    return _STRESS_DEFAULTS[name]
 
 
 def _add_plan_args(p):
@@ -552,6 +901,7 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--bleed", "-b", type=float, default=0.2)
     c.add_argument("--dead-keys", action="store_true")
     c.add_argument("--from-scan", default=None)
+    _add_ink_args(c)
     c.set_defaults(func=cmd_charset)
 
     r = sub.add_parser("print", help="image -> optimize -> .etp")
@@ -568,6 +918,29 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--search", "-s", default="simAnneal")
     r.add_argument("--init_temp", "-temp", type=float, default=0.001)
     r.add_argument("--shuffle", "-sh", type=bool, default=True)
+    r.add_argument("--match-blur", type=float, default=0.0,
+                   help="0..1: how much of the score comes from local average "
+                        "tone rather than per-pixel error (default 0, off). "
+                        "Lets the optimizer halftone, which is where the "
+                        "highlights on this machine come from -- at the cost of "
+                        "pixel-level accuracy. See erika/softmatch.py")
+    r.add_argument("--match-block", type=int, default=None,
+                   help="block side in cell pixels for --match-blur "
+                        "(default 8; must divide the cell)")
+    r.add_argument("--align", action="store_true",
+                   help="search for the crop that best lines the picture up with "
+                        "the character grid before optimizing (the paper's "
+                        "section 3.4). Buys shape matching, not tone, and costs a "
+                        "visible fraction of a run -- see erika/align.py")
+    r.add_argument("--align-steps", type=int, default=None,
+                   help="subdivisions per axis for --align (default 4, the "
+                        "paper's quarters, which is 64 crops). Below 3 buys "
+                        "little: a half-cell shift is one the layer scheme "
+                        "already provides")
+    r.add_argument("--align-loops", type=int, default=None,
+                   help="greedy cycles per candidate crop (default 2). One is the "
+                        "paper's and is too noisy here to rank crops reliably")
+    _add_grey_args(r)
     _add_plan_args(r)
     r.set_defaults(func=cmd_print)
 
@@ -607,7 +980,26 @@ def build_parser() -> argparse.ArgumentParser:
     sh.add_argument("--pitch", "-p", type=int, default=10, choices=(10, 12))
     sh.add_argument("--sheet-cols", type=int, default=20)
     sh.add_argument("--dead-keys", action="store_true")
+    sh.add_argument("--forces", default=None,
+                    help="type the whole set once per strike force, hardest first "
+                         "(e.g. 0,3,6). Pass the same list to `charset "
+                         "--from-scan` -- the grid is what identifies the tiles")
     sh.set_defaults(func=cmd_sheet)
+
+    fo = sub.add_parser("forces", help="sweep the strike-force command on paper")
+    fo.add_argument("--out", "-o", default="results/strike_forces.etp")
+    fo.add_argument("--pitch", "-p", type=int, default=10, choices=(10, 12))
+    fo.add_argument("--from", dest="first", type=lambda v: int(v, 0), default=None,
+                    help="first value to try (accepts 0x..); default sweeps both "
+                         "of the ranges in erika_codes.FORCE_PROBE_BLOCKS")
+    fo.add_argument("--to", dest="last", type=lambda v: int(v, 0), default=None,
+                    help="last value to try")
+    fo.add_argument("--char", default="M",
+                    help="glyph to sample with; wants to be a dense one so a "
+                         "change in force is obvious (default M)")
+    fo.add_argument("--run", type=int, default=20,
+                    help="glyphs per row (default 20)")
+    fo.set_defaults(func=cmd_forces)
 
     return p
 

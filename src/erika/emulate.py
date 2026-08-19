@@ -58,6 +58,10 @@ def expand(body: bytes) -> list[int]:
             out += [ec.NEWLINE] * operand
         elif op in (etp.OP_STRIKE, etp.OP_STRIKE_NA):
             out.append(operand)
+        elif op == etp.OP_SET_FORCE:
+            # Two bytes: the command, then the force. The firmware sends them
+            # as a pending byte plus a tail byte, in this order.
+            out += [ec.SET_STRIKE_FORCE, operand]
         elif op == etp.OP_DELAY:
             pass  # timing only; nothing reaches the paper
         else:
@@ -72,6 +76,7 @@ class Impression:
     y: int  #: half-lines below where the paper started
     x: int  #: half-steps right of the left margin
     code: int  #: the key that struck
+    force: int | None = None  #: the strike force in effect, if one was set
 
 
 @dataclass
@@ -88,8 +93,25 @@ class Typewriter:
     #: Set when the carriage is driven past the machine's physical limit.
     overruns: int = 0
     max_columns: int = 65
+    #: The strike force in effect. None until a job sets one.
+    force: int | None = None
+    #: True between ERIKA_SET_STRIKE_FORCE and the byte that names the force.
+    _awaiting_force: bool = False
 
     def feed(self, code: int) -> None:
+        # The force command swallows the byte after it, whatever that byte is.
+        # Modelled here rather than in expand() because it is the *machine* that
+        # behaves this way, and it is the reason a force must never be a motion
+        # code: on a machine that lacks the command, this branch does not exist
+        # and the byte lands as a character.
+        if self._awaiting_force:
+            self.force = code
+            self._awaiting_force = False
+            return
+        if code == ec.SET_STRIKE_FORCE:
+            self._awaiting_force = True
+            return
+
         if code == ec.SPACE:
             self._move(2)
         elif code == ec.BACKSPACE:
@@ -115,7 +137,7 @@ class Typewriter:
             glyph = ec.glyph_for_code(code)
             if glyph is None:
                 raise EmulationError(f"struck unknown key 0x{code:02X}")
-            self.impressions.append(Impression(self.y, self.x, code))
+            self.impressions.append(Impression(self.y, self.x, code, self.force))
             if glyph.advances:
                 self._move(2)
 
@@ -142,19 +164,31 @@ def impressions_to_strikes(machine: Typewriter, charset) -> list:
     Fails loudly on a code the charset does not contain -- that would mean
     the plan is telling the machine to type something the optimizer never
     chose.
+
+    The key is (code, force), not the code alone. With strike force in play the
+    same key appears at several indices carrying different amounts of ink, and
+    keying on the code would recover the first of them for every strike -- which
+    would make the render agree with the plan by throwing away the very thing
+    the force was for.
     """
     from erika.planner import Strike
 
-    by_code: dict[int, int] = {}
+    forces = charset.forces or [None] * len(charset.codes)
+    by_key: dict[tuple[int, int | None], int] = {}
     for index, code in enumerate(charset.codes):
-        by_code.setdefault(code, index)
+        by_key.setdefault((code, forces[index]), index)
 
     strikes = []
     for imp in machine.impressions:
-        if imp.code not in by_code:
+        # A charset with no force of its own is indifferent to what the machine
+        # is set to, so fall back to the code alone rather than refusing.
+        key = (imp.code, imp.force if charset.has_forces else None)
+        index = by_key.get(key)
+        if index is None:
             raise EmulationError(
-                f"key 0x{imp.code:02X} ({ec.describe_code(imp.code)}) is not in "
-                f"charset '{charset.name}'"
+                f"key 0x{imp.code:02X} ({ec.describe_code(imp.code)})"
+                + (f" at force 0x{imp.force:02X}" if key[1] is not None else "")
+                + f" is not in charset '{charset.name}'"
             )
-        strikes.append(Strike(imp.y, imp.x, by_code[imp.code]))
+        strikes.append(Strike(imp.y, imp.x, index))
     return strikes

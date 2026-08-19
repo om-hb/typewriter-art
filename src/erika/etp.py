@@ -23,6 +23,12 @@ Layout::
 Opcodes are one byte, most followed by one operand byte. Operands are
 unsigned; the encoder splits longer runs across repeated opcodes.
 
+The version in the header is what protects a job from the wrong firmware, and
+the firmware refuses an opcode it does not know -- so an opcode added here is
+safe to add without a version bump: an older device fails loudly on the first
+one it meets rather than typing something else. That is why ``OP_SET_FORCE``
+did not become version 2.
+
 Keep this in sync with ``erika_ai/src/erika_image.h``.
 """
 
@@ -53,17 +59,18 @@ OP_DELAY = 0x08  # n            wait n * 10 ms
 OP_MICRO_DOWN = 0x09  # n            n micro line steps down
 OP_MICRO_UP = 0x0A  # n            n micro line steps up
 OP_NEWLINE = 0x0B  # n            carriage return + n full line feeds
+OP_SET_FORCE = 0x0C  # n            strike force (Anschlagstärke) for what follows
 
 _HAS_OPERAND = {
     OP_RIGHT, OP_LEFT, OP_DOWN, OP_UP, OP_STRIKE, OP_STRIKE_NA,
-    OP_DELAY, OP_MICRO_DOWN, OP_MICRO_UP, OP_NEWLINE,
+    OP_DELAY, OP_MICRO_DOWN, OP_MICRO_UP, OP_NEWLINE, OP_SET_FORCE,
 }
 
 OPCODE_NAMES = {
     OP_END: "END", OP_RIGHT: "RIGHT", OP_LEFT: "LEFT", OP_DOWN: "DOWN",
     OP_UP: "UP", OP_CR: "CR", OP_STRIKE: "STRIKE", OP_STRIKE_NA: "STRIKE_NA",
     OP_DELAY: "DELAY", OP_MICRO_DOWN: "MICRO_DOWN", OP_MICRO_UP: "MICRO_UP",
-    OP_NEWLINE: "NEWLINE",
+    OP_NEWLINE: "NEWLINE", OP_SET_FORCE: "SET_FORCE",
 }
 
 MAX_OPERAND = 0xFF
@@ -174,6 +181,26 @@ class Encoder:
         self._emit(OP_STRIKE if advances else OP_STRIKE_NA, code)
         self.strikes += 1
 
+    def set_force(self, force: int) -> None:
+        """Set the strike force (Anschlagstärke) for every strike that follows.
+
+        One opcode here, two bytes on the wire. A machine that does not honour
+        the command types the force byte as a character instead, so a value
+        that is really a motion code would move the head without the plan
+        knowing -- the same failure `strike()` refuses above, and the reason
+        the probe sheet only sweeps values outside that range.
+        """
+        from erika import erika_codes as ec
+
+        if not ec.is_usable_force(force):
+            raise EtpError(
+                f"strike force 0x{force:02X} ({ec.describe_code(force)}) is a "
+                "motion code. If this machine ignores the force command the byte "
+                "arrives as a character, and that one would move the head -- pick "
+                "a force outside 0x71..0x82"
+            )
+        self._emit(OP_SET_FORCE, force)
+
     def delay_ms(self, ms: int) -> None:
         self._repeat(OP_DELAY, round(ms / 10))
 
@@ -258,6 +285,7 @@ def disassemble(job: Job, limit: int | None = None) -> str:
         ";  offset  col   row  opcode",
     ]
     x = y = 0  # half-steps from left margin, half-lines from the datum
+    force: int | None = None
     n = 0
     for off, op, operand in iter_ops(job.body):
         if op == OP_RIGHT:
@@ -274,12 +302,20 @@ def disassemble(job: Job, limit: int | None = None) -> str:
             x, y = 0, y + 2 * operand
         elif op == OP_STRIKE:
             x += 2
+        elif op == OP_SET_FORCE:
+            force = operand
 
         text = OPCODE_NAMES[op]
         if op in (OP_STRIKE, OP_STRIKE_NA):
             g = ec.glyph_for_code(operand)
             label = repr(g.char) if g else f"0x{operand:02X}"
+            # The force in force is what this strike lands with, and a picture
+            # that types at several is unreadable without it.
+            if force is not None:
+                label = f"{label} @f{force}"
             text = f"{text:<9} {label}"
+        elif op == OP_SET_FORCE:
+            text = f"{text:<9} 0x{operand:02X}"
         elif operand is not None:
             text = f"{text:<9} {operand}"
         lines.append(f"  {off:6d}  {x / 2:5.1f} {y / 2:5.1f}  {text}")

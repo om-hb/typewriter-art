@@ -36,6 +36,41 @@ TAB = 0x79  # Tabulator
 MICRO_LINE_FORWARD = 0x81  # Mikrozeilenschaltung vorwärts
 MICRO_LINE_BACK = 0x82  # Mikrozeilenschaltung rückwärts
 
+# --------------------------------------------------------------------------
+# Strike force (Anschlagstärke)
+# --------------------------------------------------------------------------
+# A two-byte command: this code, then one byte naming the force. It is the
+# only way this machine can lay down less than a full measure of ink, and the
+# paper's section 5.5 calls a charset with varying strike force "the largest
+# factor in obtaining a good tonal range in the midtones and highlights" --
+# so it is the single most valuable code in this table.
+#
+# It is also the least confirmed. The manual gives the code and says the next
+# character is the strength; it does not say what strengths exist or how they
+# are spelled. Both readings of "Zeichen" are plausible -- a small integer, or
+# the ASCII digit for it -- and neither can be settled from here.
+#
+#     python -m erika.pipeline forces
+#
+# types a sheet that sweeps both, and its printout says what to do with the
+# answer. Until that has been on paper, treat every number below as a guess.
+SET_STRIKE_FORCE = 0xA3  # Anschlagstärke - next byte is the force
+
+#: Values `pipeline forces` sweeps, as {label: (first, last)}. Both blocks
+#: deliberately avoid 0x71..0x82: if this machine does not honour
+#: SET_STRIKE_FORCE, the force byte arrives as an ordinary character, and a
+#: character in that range is a *motion* -- which would shift everything after
+#: it and make the sheet unreadable exactly where it needs to be read.
+FORCE_PROBE_BLOCKS = {
+    "raw": (0x00, 0x09),
+    "ascii": (0x30, 0x39),
+}
+
+#: The force a job asks for when it wants everything the machine has. Nothing
+#: verifies this yet; see FORCE_PROBE_BLOCKS.
+FULL_STRIKE_FORCE = 0x00
+
+
 #: Codes that must never appear as a glyph strike.
 CONTROL_CODES = frozenset(
     {
@@ -52,6 +87,17 @@ CONTROL_CODES = frozenset(
         MICRO_LINE_BACK,
     }
 )
+
+
+def is_usable_force(value: int) -> bool:
+    """Can `value` be sent as a force byte without risking a stray motion?
+
+    A machine that ignores SET_STRIKE_FORCE types the force byte instead, so a
+    value that collides with a motion code moves the head without the plan
+    knowing -- the same hazard `Encoder.strike` refuses a motion code for.
+    """
+    return 0 <= value <= 0xFF and value not in CONTROL_CODES
+
 
 # --------------------------------------------------------------------------
 # Physical geometry

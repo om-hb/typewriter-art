@@ -9,707 +9,811 @@
   "max_columns": 65,
   "font": "/System/Library/Fonts/Supplemental/Courier New.ttf",
   "bleed": 0.2,
+  "ink": 0.1,
+  "spread": 0.6,
   "dead_keys": false,
+  "forces": [],
+  "force_densities": [],
   "glyphs": [
     {
       "index": 0,
       "char": " ",
       "code": 113,
       "advances": true,
-      "name": "space"
+      "name": "space",
+      "force": null
     },
     {
       "index": 1,
       "char": "!",
       "code": 66,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 2,
       "char": "\"",
       "code": 67,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 3,
       "char": "#",
       "code": 65,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 4,
       "char": "$",
       "code": 72,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 5,
       "char": "%",
       "code": 4,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 6,
       "char": "&",
       "code": 2,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 7,
       "char": "'",
       "code": 23,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 8,
       "char": "(",
       "code": 29,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 9,
       "char": ")",
       "code": 31,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 10,
       "char": "*",
       "code": 27,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 11,
       "char": "+",
       "code": 37,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 12,
       "char": ",",
       "code": 100,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 13,
       "char": "-",
       "code": 98,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 14,
       "char": "_",
       "code": 1,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 15,
       "char": ".",
       "code": 99,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 16,
       "char": "/",
       "code": 64,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 17,
       "char": "0",
       "code": 13,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 18,
       "char": "1",
       "code": 17,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 19,
       "char": "2",
       "code": 16,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 20,
       "char": "3",
       "code": 15,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 21,
       "char": "4",
       "code": 14,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 22,
       "char": "5",
       "code": 12,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 23,
       "char": "6",
       "code": 11,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 24,
       "char": "7",
       "code": 10,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 25,
       "char": "8",
       "code": 9,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 26,
       "char": "9",
       "code": 8,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 27,
       "char": ":",
       "code": 19,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 28,
       "char": ";",
       "code": 59,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 29,
       "char": "=",
       "code": 46,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 30,
       "char": "?",
       "code": 53,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 31,
       "char": "A",
       "code": 48,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 32,
       "char": "B",
       "code": 24,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 33,
       "char": "C",
       "code": 32,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 34,
       "char": "D",
       "code": 20,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 35,
       "char": "E",
       "code": 52,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 36,
       "char": "F",
       "code": 62,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 37,
       "char": "G",
       "code": 28,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 38,
       "char": "H",
       "code": 18,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 39,
       "char": "I",
       "code": 33,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 40,
       "char": "J",
       "code": 50,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 41,
       "char": "K",
       "code": 36,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 42,
       "char": "L",
       "code": 44,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 43,
       "char": "M",
       "code": 22,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 44,
       "char": "N",
       "code": 42,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 45,
       "char": "O",
       "code": 30,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 46,
       "char": "P",
       "code": 47,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 47,
       "char": "Q",
       "code": 26,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 48,
       "char": "R",
       "code": 54,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 49,
       "char": "S",
       "code": 51,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 50,
       "char": "T",
       "code": 55,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 51,
       "char": "U",
       "code": 40,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 52,
       "char": "V",
       "code": 34,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 53,
       "char": "W",
       "code": 45,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 54,
       "char": "X",
       "code": 38,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 55,
       "char": "Y",
       "code": 49,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 56,
       "char": "Z",
       "code": 56,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 57,
       "char": "a",
       "code": 97,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 58,
       "char": "b",
       "code": 78,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 59,
       "char": "c",
       "code": 87,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 60,
       "char": "d",
       "code": 83,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 61,
       "char": "e",
       "code": 90,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 62,
       "char": "f",
       "code": 73,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 63,
       "char": "g",
       "code": 96,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 64,
       "char": "h",
       "code": 85,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 65,
       "char": "i",
       "code": 5,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 66,
       "char": "j",
       "code": 75,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 67,
       "char": "k",
       "code": 80,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 68,
       "char": "l",
       "code": 77,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 69,
       "char": "m",
       "code": 74,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 70,
       "char": "n",
       "code": 92,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 71,
       "char": "o",
       "code": 94,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 72,
       "char": "p",
       "code": 91,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 73,
       "char": "q",
       "code": 82,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 74,
       "char": "r",
       "code": 89,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 75,
       "char": "s",
       "code": 88,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 76,
       "char": "t",
       "code": 86,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 77,
       "char": "u",
       "code": 93,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 78,
       "char": "v",
       "code": 79,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 79,
       "char": "w",
       "code": 76,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 80,
       "char": "x",
       "code": 95,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 81,
       "char": "y",
       "code": 81,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 82,
       "char": "z",
       "code": 84,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 83,
       "char": "|",
       "code": 39,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 84,
       "char": "£",
       "code": 6,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 85,
       "char": "§",
       "code": 61,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 86,
       "char": "°",
       "code": 57,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 87,
       "char": "²",
       "code": 21,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 88,
       "char": "³",
       "code": 35,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 89,
       "char": "µ",
       "code": 7,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 90,
       "char": "Ä",
       "code": 63,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 91,
       "char": "Ö",
       "code": 60,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 92,
       "char": "Ü",
       "code": 58,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 93,
       "char": "ß",
       "code": 71,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 94,
       "char": "ä",
       "code": 101,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 95,
       "char": "ç",
       "code": 69,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 96,
       "char": "è",
       "code": 70,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 97,
       "char": "é",
       "code": 68,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 98,
       "char": "ö",
       "code": 102,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     },
     {
       "index": 99,
       "char": "ü",
       "code": 103,
       "advances": true,
-      "name": ""
+      "name": "",
+      "force": null
     }
   ]
 }

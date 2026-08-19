@@ -32,6 +32,11 @@ cd src
 ../.venv/bin/python -m erika.pipeline calibrate
 ../.venv/bin/python -m erika.send results/calibrate.etp --print
 
+# 2b. Worth doing once, and it is the largest quality factor there is:
+#     find out which strike forces this machine accepts  (see Strike force)
+../.venv/bin/python -m erika.pipeline forces
+../.venv/bin/python -m erika.send results/strike_forces.etp --print
+
 # 3. Convert a photo
 ../.venv/bin/python -m erika.pipeline print -t images/mwdog_crop.png -r 48
 
@@ -129,7 +134,21 @@ $ python -m erika.etp results/photo.etp -n 8
 ```
 
 The two position columns are a running model of where the head is, so a plan
-can be checked without a typewriter.
+can be checked without a typewriter. A strike also carries the force in effect
+(`STRIKE 'b' @f3`) when the job sets one, because a picture typed at several is
+unreadable without it.
+
+Adding an opcode is **three** edits on the firmware side, not two: the enum, the
+`needsOperand` expression in `fetchNext()`, and a `case`. Miss the middle one and
+the interpreter reads one byte too few for the rest of the job — every later
+opcode taken from an operand and every operand from an opcode — with each byte
+still individually legal and the CRC still passing, because the file is intact.
+Two tests in `src/tests/test_erika.py` compare that list and the set of handled
+cases against `etp.py`; they are the only thing that would notice.
+
+The header carries a version the firmware rejects on mismatch, but a *new* opcode
+does not need a version bump: unknown opcodes already fail the job loudly, so
+older firmware meeting a newer job stops rather than typing something else.
 
 ## Verification
 
@@ -220,12 +239,13 @@ see it again, reflash before suspecting the machine.
 
 ```
 erika.pipeline charset    build the Sigma charset (--pitch, --font, --from-scan)
-erika.pipeline print      photo -> optimize -> .etp     (-t, -r, -n, -l)
+erika.pipeline print      photo -> optimize -> .etp   (-t, -r, -n, -l, -g, --align)
 erika.pipeline plan       re-plan an existing choices.json without re-optimizing
 erika.pipeline verify     diff a plan render against optimize.py's mockup
 erika.pipeline calibrate  motion-code test pattern
 erika.pipeline area       bracket the corners of the printable area (--rows, --columns)
-erika.pipeline sheet      type the charset, for scanning back in
+erika.pipeline sheet      type the charset, for scanning back in (--forces)
+erika.pipeline forces     sweep the strike-force command to see what it takes
 
 erika.send <file.etp>     upload over USB serial   (--port, --print, --watch)
 erika.send --diagnose     test the link step by step
@@ -233,6 +253,224 @@ erika.send -c STATUS      talk to the device without uploading
 erika.send --list-ports   show the serial ports
 erika.etp <file.etp>      disassemble a print job
 ```
+
+## Strike force
+
+The paper this pipeline implements says plainly which choice matters most, in
+section 5.5: "using a character set that contains variation in strike force is
+the largest factor in obtaining a good tonal range in the midtones and
+highlights". Its typewriter got that from a human hand pressing harder or
+softer, and section 5.7.2 spends a page on how badly that goes -- closing with
+"ultimately, an automated typewriter would provide better consistency in strike
+force", which is this.
+
+This machine has a command for it: `A3H`, *Anschlagstärke*, followed by one byte
+naming the force. It is carried end to end now -- `SET_STRIKE_FORCE` in
+`erika_codes.py`, `OP_SET_FORCE` in the `.etp` stream, `ETP_SET_FORCE` in the
+firmware, a `force` per glyph in `glyphs.json`. **What no part of it knows is
+which forces this machine accepts.** The manual gives the code and says the next
+character is the strength; it does not say what strengths exist, nor whether
+"character" means a small integer or the ASCII digit for one.
+
+So the first step is a sheet, not a setting:
+
+```bash
+python -m erika.pipeline forces
+python -m erika.send results/strike_forces.etp --port /dev/cu.usbmodem1101 --print
+```
+
+It types a reference row *before* it sends any force command, then one row per
+candidate value across both readings. Rows that come out lighter or darker than
+the reference are forces the machine took; a row with a stray character in front
+of the glyphs is a value it typed instead, which rules that value out. Every
+candidate is outside `0x71..0x82` on purpose -- on a machine that ignores the
+command the force byte arrives as an ordinary character, and a character in that
+range is a *motion*, which would shift the rest of the line and ruin the sheet
+exactly where it has to be read.
+
+With the answer, hardest first:
+
+```bash
+python -m erika.pipeline sheet --forces 0,3,6        # type the set at each
+python -m erika.pipeline charset --forces 0,3,6 \
+    --name sigma-forces --from-scan /path/to/scan.png
+```
+
+The `--forces` lists must match and be in the same order: the scan is sliced to a
+grid, and the grid is the only thing that says which tile is which.
+
+One piece of the paper's advice does **not** transfer. Its figure 20 found that
+medium plus light beat dark plus medium, because its Smith-Corona could already
+reach black and needed help in the highlights. This machine cannot reach black,
+so the hardest strike has to stay: dropping it and keeping two lighter forces
+measured clearly worse. Add lighter forces *below* full, do not shift the range
+down.
+
+A line is typed force by force, hardest first, which is section 5.7.2's own
+suggestion. Here the reason is mechanical rather than human: a force change costs
+a full character delay, and interleaved they can outnumber the strikes -- a
+9,000-strike picture at three forces needs about 200 changes grouped and
+thousands ungrouped. The cost is one carriage sweep per force per line, so
+whatever error the carriage accumulates lands differently in each group;
+`build_plan(group_by_force=False)` trades back the other way.
+
+Every job also restores the hardest force before it ends. Force is state that
+outlives the print: left soft, the next thing typed on this machine -- by hand or
+by the firmware's chatbot -- comes out faint for no visible reason.
+
+## How much ink a mark carries
+
+The other half of section 5.5, and the part that was quietly wrong for longer.
+Glyphs are rendered from an outline font, so their ink was *pure black with hard
+edges*. No ribbon produces that, and it is not a cosmetic approximation: the
+optimizer scores candidates per **pixel**, so a stroke at grey 0 laid through a
+mid-grey cell costs more squared error than leaving the cell empty. The optimizer
+therefore declines to mark it. Measured at 40 columns on `mwdog_crop.png`, half
+of every cell in a default run came out blank while the picture as a whole was 39
+grey levels too light -- pale and blotchy at the same time, which is the
+signature.
+
+`--ink` (the grey the densest ink reaches, default 0.10) and `--spread` (point
+spread in cell pixels, default 0.6) make the model *possible*. They do not make
+it accurate; `--from-scan` does. The paper is explicit that the non-black ink is
+a feature and not a defect: "even the darkest typewriter characters are less than
+fully black, which yields a greater tonal range when characters are allowed to
+overlap".
+
+Which way to err is not symmetric, so it is worth stating. A charset modelled
+lighter than the machine makes the optimizer ask for more ink than the paper
+needs, and the print comes out dark -- visible, and correctable by asking for
+less. Modelled darker, it refuses to mark the midtones, and what is lost is
+detail that nothing downstream can put back. Hence defaults that lean light.
+
+## Letting it halftone: `--match-blur`
+
+Per-pixel error forbids dithering, and for a mechanical reason worth spelling
+out: a sparse mark that is right *on average* is wrong at every pixel it covers
+and every pixel it leaves bare. So the optimizer will not halftone, and the
+highlights go to bare paper.
+
+The paper proposes the fix in section 6 -- "the algorithm could be made to
+discourage reliance on precise character placement for tone matching, including
+by adding blur or reducing resolution during selection". `softmatch.py` is that:
+
+```bash
+python -m erika.pipeline print -t photo.jpg -r 40 -l 4x2 --match-blur 0.8
+```
+
+Loss becomes `(1-w) x per-pixel error + w x error over block means`, so `w` of 0
+changes nothing and 1 scores local tone alone. The charset is **not** softened
+and the mockup stays a faithful composite of the glyphs, which is what keeps the
+verification step meaningful -- the plan is still diffed against a picture of
+exactly what the machine will type.
+
+Off by default, because the trade is real: at 40 columns with `4x2`, per-pixel
+RMSE moves 73 to 82 while the same error measured over half a cell -- roughly
+what an eye does with a typed sheet at arm's length -- moves 34 to 15. Which of
+those you want depends on whether the result is to be looked at or zoomed into.
+
+
+## Lining the picture up: `--align`
+
+Characters can only land on a fixed grid, so where the picture sits against that
+grid decides how well an edge in the photograph can be matched by an edge in the
+type. Section 3.4 of the paper searches for the best placement: 64 crops, shifting
+by `a`,`b` of a character cell and scaling by `(c + n)/n`, each scored with a quick
+greedy approximation and ranked by `SSIM x 4 + PSNR`.
+
+```bash
+python -m erika.pipeline print -t photo.jpg -r 20 --align
+```
+
+`align.py` is that search as a pre-pass. It picks a crop, writes
+`results/target-aligned.png`, and hands the path on -- nothing downstream knows it
+happened. It runs *after* `--grey`, because STRESS is spatial and stochastic and
+converting each of 64 candidates would be comparing 64 different pictures.
+
+**It uses two greedy cycles per candidate, not the paper's one.** That is not a
+refinement, it is what makes the search mean anything. A single cycle's score
+carries enough run-to-run noise to swamp the differences it is meant to measure:
+at 40 columns the noise range across seeds is 0.20 against a spread of 0.32 across
+all 64 candidates, and the search disagrees with itself -- three runs of it pick
+two different crops, on scores a thousandth apart. A second cycle re-evaluates
+every cell against a settled background and drops the noise range to 0.06, which
+is where three runs agree. The noise is not removable from Python: candidate order
+comes from numba's per-thread RNG, and greedy selection is order-dependent
+whenever two glyphs tie.
+
+Off by default, because the honest numbers are modest and the cost is not.
+Measured on `mwdog_crop.png` with the charset as it ships:
+
+| | SSIM | RMSE | search |
+|---|---|---|---|
+| 20 columns, `4x1` | 0.388 -> 0.402 | 65.2 -> 64.0 | 12 s |
+| 20 columns, `4x2` | 0.407 -> 0.419 | 52.4 -> 51.4 | 24 s |
+| 40 columns, `4x1` | 0.372 -> 0.378 | 66.5 -> 65.9 | 42 s |
+| 40 columns, `4x2` | 0.384 -> 0.389 | 52.9 -> 52.4 | 85 s |
+
+Nothing regresses, and the gain is larger at 20 columns than at 40 -- which is the
+one part of section 5.3.1's "one of the dominant factors" claim that carries over
+to this machine. The paper's dramatic examples are a checkerboard and a 20-column
+portrait, where alignment is the only thing left to get wrong. Here it is not:
+alignment buys *shape* matching, and what binds on this machine is ink.
+
+The search costs up to four times the optimizer run it precedes, and scales with
+the charset -- a set carrying three strike forces costs about three times the
+figures above. `--align-steps` trades accuracy for time, but not below 3: `4x1`
+already places layers at 0 and 0.5 of a cell, so a half-cell shift is close to a
+relabelling rather than a better fit. The effective period in each axis is half a
+cell, the paper's quarters sample it twice over, and `--align-steps 2` probes
+little but the scale and the border.
+
+
+## Black and white first
+
+The optimizer reads a greyscale image, and how a colour photograph became one is
+not a detail. `cv2.IMREAD_GRAYSCALE` -- what it does when left alone -- is Rec.
+601 luma: one weighted sum, applied identically everywhere. Two areas that
+differ in hue but not in brightness therefore become **one flat tone**, and with
+about fifty printable greys in a cell, a flat tone is a region with no characters
+in it at all. Nothing further down can undo that; by the time the optimizer sees
+the picture there is nothing left to tell the two apart.
+
+The paper raises this in section 5.3 -- "the black and white conversion method
+has a substantial effect on the result (Figure 12)" -- and declares it out of
+scope. `stress.py` is where it is not.
+
+```bash
+python -m erika.pipeline print -t photo.jpg -r 48 --grey c2g
+```
+
+| `--grey` | what it does |
+|---|---|
+| `luma` | Rec. 601, the default, and what happens with no flag at all |
+| `average` | the flat mean of the channels; Figure 12's left panel |
+| `c2g` | STRESS colour to grey: every pixel measured against its own surroundings |
+| `stress` | STRESS local enhancement -- a retinex-like white balance -- then luma |
+
+Both spatial conversions come from one framework (Kolås, Farup and Rizzi, 2011;
+reference [12] of the paper) and are ports of GEGL's `gegl:c2g` and
+`gegl:stress`. Around each pixel they throw a random spray of sample points,
+take the local minimum and maximum, and report where the pixel sits between
+them. `c2g` turns that into the grey directly, which is what keeps a colour
+difference a formula would merge; `stress` uses it to rescale each channel,
+which corrects a cast and opens up an unevenly lit picture.
+
+Three flags tune the spray. `--stress-radius` is a *fraction of the longest
+side*, not a pixel count, so a photograph converts the same way whatever
+resolution it arrives at. `--stress-iterations` trades time against sampling
+noise: the default of 20 is where that noise falls below the machine's own tonal
+steps once the optimizer has averaged a cell -- per pixel it is still nine grey
+levels, per cell it is under one. `--stress-seed` fixes the spray, so a
+conversion is repeatable in a way an optimizer run is not.
+
+The converted target is written to `results/target-grey.png` and the optimizer is
+pointed at it, since `kword` has no way to be asked for another conversion.
+
+One thing to watch for on paper: `c2g` raises local contrast *everywhere*,
+including where the photograph had none. A plain wall has its own faint texture
+pulled up with everything else, and that prints as characters where there might
+have been paper.
 
 ## When the upload fails
 

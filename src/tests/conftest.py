@@ -21,7 +21,7 @@ def pytest_terminal_summary(terminalreporter):
     """Warn loudly when the Python/C++ code tables went unchecked.
 
     The Erika codes, the .etp opcodes and the upload chunk size each exist
-    twice -- once in Python here, once in C++ in erika_ai. Four tests compare
+    twice -- once in Python here, once in C++ in erika_ai. Six tests compare
     them, and they only run with the firmware checked out. Without it the suite
     still reports all-green, which is exactly the impression not to give.
 
@@ -35,7 +35,8 @@ def pytest_terminal_summary(terminalreporter):
     terminalreporter.write_sep("!", "drift guards did not run", red=True)
     terminalreporter.write_line(
         "erika_ai/src was not found, so the Python and C++ copies of the Erika\n"
-        "codes, the .etp opcodes and the upload chunk size were NOT compared.\n"
+        "codes, the .etp opcodes, the upload chunk size and which opcodes carry\n"
+        "an operand were NOT compared.\n"
         "Check out erika_ai beside this repository, or point ERIKA_FIRMWARE_SRC\n"
         "at its src directory."
     )
