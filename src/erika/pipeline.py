@@ -343,7 +343,8 @@ def plan_and_encode(args, choices_path: str) -> tuple[planner.Plan, etp.Job]:
         home_each_row=not args.no_home,
         boustrophedon=not args.no_serpentine,
     )
-    job = planner.encode(plan, settle_ms=args.settle_ms, cr_delay_ms=args.cr_delay_ms)
+    job = planner.encode(plan, settle_ms=args.settle_ms, cr_delay_ms=args.cr_delay_ms,
+                         no_advance=args.no_advance)
     return plan, job
 
 
@@ -1160,6 +1161,11 @@ def _add_plan_args(p):
                    help="pause after each carriage return, in ms")
     p.add_argument("--jitter", type=float, default=0.05,
                    help="registration error for the shaky preview, in cells (default 0.05)")
+    p.add_argument("--no-advance", action="store_true",
+                   help="type a stack of glyphs in one cell with Doppeldruck "
+                        "(0xA9) instead of a backspace between each pair, so the "
+                        "escapement never moves. UNCONFIRMED on this machine -- "
+                        "type `erika.pipeline codes` and read part 6 first")
     p.add_argument("--no-preview", action="store_true")
     p.add_argument("--ops-per-second", type=float, default=10.0,
                    help="head operations per second, for the time estimate")

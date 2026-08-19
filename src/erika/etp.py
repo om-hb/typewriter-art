@@ -61,6 +61,7 @@ OP_MICRO_UP = 0x0A  # n            n micro line steps up
 OP_NEWLINE = 0x0B  # n            carriage return + n full line feeds
 OP_SET_FORCE = 0x0C  # n            strike force (Anschlagstärke) for what follows
 OP_RAW = 0x0D  # byte         send this byte to the machine, untouched
+OP_NO_ADVANCE = 0x0E  # -     the next strike prints where the head stands
 
 _HAS_OPERAND = {
     OP_RIGHT, OP_LEFT, OP_DOWN, OP_UP, OP_STRIKE, OP_STRIKE_NA,
@@ -73,6 +74,7 @@ OPCODE_NAMES = {
     OP_UP: "UP", OP_CR: "CR", OP_STRIKE: "STRIKE", OP_STRIKE_NA: "STRIKE_NA",
     OP_DELAY: "DELAY", OP_MICRO_DOWN: "MICRO_DOWN", OP_MICRO_UP: "MICRO_UP",
     OP_NEWLINE: "NEWLINE", OP_SET_FORCE: "SET_FORCE", OP_RAW: "RAW",
+    OP_NO_ADVANCE: "NO_ADVANCE",
 }
 
 MAX_OPERAND = 0xFF
@@ -242,6 +244,28 @@ class Encoder:
                 + f" -- pick a force of 0x{ec.MAX_FORCE:02X} or below"
             )
         self._emit(OP_SET_FORCE, force)
+
+    def no_advance(self) -> None:
+        """The next strike prints where the head stands (Doppeldruck, 0xA9).
+
+        How a stack of characters in one cell is typed. The alternative, and
+        what the planner did before this existed, is to strike and then
+        backspace -- which spends the escapement's repeatability on every
+        stacked character, and a picture is mostly stacked characters. The
+        calibration sheet has a section for backspace registration precisely
+        because it is a thing that can go wrong.
+
+        The byte count is the same either way: for k glyphs in a cell it is
+        2k-1 wire bytes with backspaces and 2k-1 with this. The difference is
+        entirely in where the marks land.
+
+        Deliberately not OP_STRIKE_NA, which means "this key does not advance"
+        and is true of the four dead keys mechanically. This one is a property
+        of the *next* strike rather than of the key, which is what the machine's
+        own code is, and conflating them would need the firmware to carry a
+        fourth hand-mirrored table of which codes are dead keys.
+        """
+        self._emit(OP_NO_ADVANCE)
 
     # -- probing -----------------------------------------------------------
     def raw(self, byte: int) -> None:
@@ -415,7 +439,8 @@ def disassemble(job: Job, limit: int | None = None) -> str:
         {
             b
             for b in raw
-            if b not in ec.OPERAND_CODES and b != 0xA9 and b in ec.CONTROL_CODE_NAMES
+            if b not in ec.OPERAND_CODES and b != ec.NO_ADVANCE
+            and b in ec.CONTROL_CODE_NAMES
         }
     )
     lines = [
@@ -475,8 +500,10 @@ def disassemble(job: Job, limit: int | None = None) -> str:
                 pending_raw = None
             elif operand in ec.OPERAND_CODES:
                 pending_raw = operand
-            elif operand == 0xA9:
+            elif operand == ec.NO_ADVANCE:
                 no_advance = True
+        elif op == OP_NO_ADVANCE:
+            no_advance = True
 
         text = OPCODE_NAMES[op]
         if op == OP_RAW:

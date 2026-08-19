@@ -267,8 +267,18 @@ def encode(
     plan: Plan,
     settle_ms: int = 0,
     cr_delay_ms: int = 0,
+    no_advance: bool = False,
 ) -> etp.Job:
-    """Emit the opcode stream for a plan, tracking the head as we go."""
+    """Emit the opcode stream for a plan, tracking the head as we go.
+
+    `no_advance` types a stack of glyphs in one cell with Doppeldruck (0xA9)
+    instead of with a backspace between each pair. Same number of bytes; the
+    difference is that the escapement never moves, so the marks land on top of
+    each other rather than as close as the escapement's repeatability allows.
+    A picture is mostly stacked characters, so that is not a small difference --
+    but the code has not been on paper on this machine, which is what
+    `erika.pipeline codes` part 6 is for, so it is off by default.
+    """
     enc = etp.Encoder()
     cs = plan.charset
     x = y = 0
@@ -278,7 +288,20 @@ def encode(
     # force existed -- which is what makes this safe to leave switched on.
     force: int | None = None
 
-    for s in plan.strikes:
+    strikes = plan.strikes
+    for i, s in enumerate(strikes):
+        # A stack is glyphs at the same place, one after another. They are only
+        # adjacent in the list when nothing separates them -- with strike force
+        # in play a stack can be split across force groups, and then these are
+        # two ordinary strikes with a carriage sweep between them, which is what
+        # the backspace path is still there for.
+        stacked = (
+            no_advance
+            and i + 1 < len(strikes)
+            and strikes[i + 1].y == s.y
+            and strikes[i + 1].x == s.x
+            and cs.advances[s.index]
+        )
         if s.y != prev_y:
             dy = s.y - y
             if dy < 0:  # build_plan sorts by y, so this cannot happen
@@ -309,8 +332,10 @@ def encode(
 
         enc.horizontal(s.x - x)
         x = s.x
-        advances = cs.advances[s.index]
-        enc.strike(cs.codes[s.index], advances)
+        advances = cs.advances[s.index] and not stacked
+        if stacked:
+            enc.no_advance()
+        enc.strike(cs.codes[s.index], cs.advances[s.index])
         if advances:
             x += 2
 
@@ -361,6 +386,8 @@ def summarize(plan: Plan, job: etp.Job, ops_per_second: float = 10.0) -> str:
     seconds = mech_ops / ops_per_second
     cells = plan.cols * plan.rows
     layers = len(plan.layer_offsets)
+    stacks = sum(1 for _, op, _ in etp.iter_ops(job.body)
+                 if op == etp.OP_NO_ADVANCE)
     force_line = []
     if cs.has_forces:
         force_line = [
@@ -380,5 +407,7 @@ def summarize(plan: Plan, job: etp.Job, ops_per_second: float = 10.0) -> str:
             f"  mechanics    {mech_ops} head operations, "
             f"~{seconds / 60:.0f} min at {ops_per_second:g}/s",
             f"  paper feed   {'carriage return every pass' if plan.home_each_row else 'serpentine, no return'}",
+            *([f"  overstrike   {stacks} glyphs typed without advancing (0xA9), "
+               "so no backspace between a stack"] if stacks else []),
         ]
     )

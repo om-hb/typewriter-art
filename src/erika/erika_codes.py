@@ -121,12 +121,17 @@ OPERAND_CODES = frozenset(
     }
 )
 
+#: Doppeldruck: the character after this one prints without advancing the
+#: carriage. The way a stack of glyphs in one cell is typed without spending the
+#: escapement's repeatability on a backspace between each pair.
+NO_ADVANCE = 0xA9
+
 #: 0xA9 (Doppeldruck) does not eat the next byte, it *changes* it: the character
 #: after it prints without advancing the carriage. So a stray 0xA9 does not
 #: desynchronise the stream, it silently drops one advance -- which shifts
 #: everything after it on the line. Named here because it is the one code above
 #: the motion block that is neither inert nor stream-breaking.
-MODIFIER_CODES = frozenset({0xA9})
+MODIFIER_CODES = frozenset({NO_ADVANCE})
 
 # --------------------------------------------------------------------------
 # What the wheel can be told to type

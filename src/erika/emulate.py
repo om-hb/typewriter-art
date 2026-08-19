@@ -127,6 +127,8 @@ def expand(body: bytes, direct_steps: str = STEPS_OFF, pitch: int = 10) -> list[
             out += [ec.SET_STRIKE_FORCE, operand]
         elif op == etp.OP_RAW:
             out.append(operand)
+        elif op == etp.OP_NO_ADVANCE:
+            out.append(ec.NO_ADVANCE)
         elif op == etp.OP_DELAY:
             pass  # timing only; nothing reaches the paper
         else:
@@ -223,7 +225,7 @@ class Typewriter:
         if code in ec.OPERAND_CODES:
             self._awaiting_operand = code
             return
-        if code == 0xA9:  # Doppeldruck: print the next character where we stand
+        if code == ec.NO_ADVANCE:  # Doppeldruck: print where the head stands
             self._no_advance = True
             return
         if code in ec.CONTROL_CODE_NAMES and code not in ec.CONTROL_CODES:

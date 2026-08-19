@@ -2296,3 +2296,95 @@ def test_the_postamble_runs_on_every_exit_from_a_job():
         )
     # finish() is reached only after the postamble has drained through tick().
     assert re.search(r"_bodyEnded = true;\s*\n\s*if \(nextPostambleByte\(\)\)", text)
+
+
+# ---------------------------------------------------------------------------
+# overstriking without a backspace (planner --no-advance)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("home_each_row", [True, False])
+def test_no_advance_puts_every_strike_exactly_where_the_backspace_did(
+    tmp_path, charset, home_each_row
+):
+    """The whole claim. Typing a stack with Doppeldruck rather than a backspace
+    is supposed to change how the marks get there and not where they are -- so
+    the same plan, encoded both ways, has to come off the virtual machine
+    identically."""
+    plan = planner.build_plan(
+        _write_choices(tmp_path, _random_choices(charset, 6, 10, FOUR_LAYERS, seed=7)),
+        charset,
+        home_each_row=home_each_row,
+    )
+    backspaced = emulate.type_job(planner.encode(plan))
+    stacked = emulate.type_job(planner.encode(plan, no_advance=True))
+
+    assert stacked.impressions == backspaced.impressions
+    assert stacked.overruns == backspaced.overruns == 0
+
+
+def test_no_advance_replaces_the_backspaces_rather_than_adding_to_them(tmp_path,
+                                                                      charset):
+    """What has to be true is that the backspaces are gone: leaving them in *and*
+    suppressing the advance would walk left across the row.
+
+    On the wire it is the same number of bytes -- one 0xA9 where there was one
+    BACKSPACE -- so this is a different mechanism rather than a saving. In the
+    file it *is* a saving, because a backspace is an OP_LEFT and its operand
+    while NO_ADVANCE carries none, and a job has to fit in SPIFFS.
+    """
+    plan = planner.build_plan(
+        # One layer scheme where every layer sits at the same offset, so every
+        # inked cell is a stack of up to four.
+        _write_choices(tmp_path, _random_choices(charset, 5, 8,
+                                                 [(0, 0)] * 4, seed=11)),
+        charset,
+    )
+    plain = planner.encode(plan)
+    stacked = planner.encode(plan, no_advance=True)
+
+    def count(job, want):
+        return sum(1 for _, op, _ in etp.iter_ops(job.body) if op == want)
+
+    assert count(stacked, etp.OP_NO_ADVANCE) > 0
+    assert count(stacked, etp.OP_LEFT) < count(plain, etp.OP_LEFT)
+    assert len(stacked.body) < len(plain.body)
+    # ...and the same number of bytes actually reach the typewriter.
+    assert len(emulate.expand(stacked.body)) == len(emulate.expand(plain.body))
+
+
+def test_a_dead_key_is_not_given_a_no_advance_it_does_not_need(tmp_path, charset):
+    """It already does not advance. Prefixing it would suppress the advance of
+    whatever came next instead, which is a different cell."""
+    dead = [i for i, adv in enumerate(charset.advances) if not adv]
+    if not dead:
+        pytest.skip("this charset has no dead keys")
+    grid = [[dead[0], dead[0]]]
+    path = _write_choices(tmp_path, {"layer0_0_0": grid, "layer1_0_0": grid})
+    job = planner.encode(planner.build_plan(path, charset), no_advance=True)
+    assert not [1 for _, op, _ in etp.iter_ops(job.body) if op == etp.OP_NO_ADVANCE]
+
+
+def test_the_last_glyph_of_a_stack_still_advances(tmp_path, charset):
+    """Or the next cell is typed on top of this one."""
+    enc = etp.Encoder()
+    enc.no_advance()
+    enc.strike(ec.glyph_for_char("-").code)
+    enc.strike(ec.glyph_for_char("O").code)
+    enc.strike(ec.glyph_for_char("X").code)
+    machine = emulate.Typewriter().run(emulate.expand(enc.body()))
+    assert [i.x for i in machine.impressions] == [0, 0, 2]
+
+
+def test_the_plan_summary_says_when_it_used_doppeldruck(tmp_path, charset):
+    """It is off by default and unconfirmed, so a sheet that came out wrong
+    should be able to say whether it was on."""
+    plan = planner.build_plan(
+        _write_choices(tmp_path, _random_choices(charset, 4, 6,
+                                                 [(0, 0)] * 3, seed=13)),
+        charset,
+    )
+    job = planner.encode(plan, no_advance=True)
+    assert "without advancing" in planner.summarize(plan, job)
+    plain = planner.encode(plan)
+    assert "without advancing" not in planner.summarize(plan, plain)
