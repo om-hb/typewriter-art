@@ -1256,6 +1256,114 @@ def test_the_probe_sheet_only_asks_for_forces_that_cannot_move_the_head(tmp_path
     assert machine.overruns == 0
 
 
+def _probe_forces(tmp_path, name, *extra):
+    """The forces one probe sheet actually asks the machine for, in order."""
+    from erika import pipeline
+
+    out = os.path.join(tmp_path, name)
+    assert pipeline.main(["forces", "-o", out, "--run", "3", *extra]) == 0
+    job = etp.load(out)
+    return [operand for _, op, operand in etp.iter_ops(job.body)
+            if op == etp.OP_SET_FORCE], job
+
+
+def test_a_coarse_probe_strides_the_values_at_the_step_it_was_given(tmp_path):
+    """What --step is for: the whole byte is more than two hundred rows and ten
+    sheets of paper, and a coarse pass first is what makes a wide sweep readable."""
+    fine, _ = _probe_forces(tmp_path, "fine.etp", "--from", "0x00", "--to", "0x40")
+    coarse, _ = _probe_forces(tmp_path, "coarse.etp",
+                              "--from", "0x00", "--to", "0x40", "--step", "8")
+
+    assert coarse == list(range(0x00, 0x41, 8))
+    assert len(coarse) < len(fine) / 4
+    # Evenly spaced, which is what makes a change in the ink obvious down the sheet.
+    assert {b - a for a, b in zip(coarse, coarse[1:])} == {8}
+
+
+def test_a_step_strides_the_values_and_drops_motion_codes_afterwards(tmp_path):
+    """The order matters and only one of the two readings is a step.
+
+    Striding the value space and dropping the motion codes after leaves a gap where
+    the sweep lands on a code that would move the head. Dropping them *first* would
+    renumber what is left and hand back values at uneven spacing -- N usable forces,
+    but not every Nth candidate, which is unreadable as a sweep and the opposite of
+    what a coarse pass is for.
+    """
+    forces, _ = _probe_forces(tmp_path, "over.etp",
+                              "--from", "0x70", "--to", "0x84", "--step", "2")
+
+    # 0x70..0x84 by twos is 0x70,0x72,...,0x84; the motion codes among them go.
+    asked = range(0x70, 0x85, 2)
+    assert forces == [v for v in asked if ec.is_usable_force(v)]
+    # The gap is real -- something was dropped -- and every value still sits on the
+    # stride from the first one.
+    assert len(forces) < len(list(asked))
+    assert all((v - 0x70) % 2 == 0 for v in forces)
+
+
+def test_a_coarse_probe_is_still_safe_and_still_has_its_reference_row(tmp_path):
+    """The two properties the sheet is built around have to survive a step."""
+    from erika import emulate
+
+    forces, job = _probe_forces(tmp_path, "coarse.etp", "--step", "3")
+    assert forces
+    assert all(ec.is_usable_force(v) for v in forces)
+
+    machine = emulate.type_job(job)
+    assert machine.overruns == 0
+    first_force_row = next(i.y for i in machine.impressions if i.force is not None)
+    assert [i for i in machine.impressions
+            if i.y < first_force_row and i.force is None]
+
+
+def test_the_whole_byte_fits_one_sheet_at_a_coarse_enough_step(tmp_path):
+    """The case the flag exists for, stated as a number of lines of typing."""
+    from erika.pipeline import DEFAULT_AREA_ROWS
+
+    _, fine = _probe_forces(tmp_path, "fine.etp", "--from", "0x00", "--to", "0xFF")
+    _, coarse = _probe_forces(tmp_path, "coarse.etp",
+                              "--from", "0x00", "--to", "0xFF", "--step", "16")
+
+    assert fine.rows > 4 * DEFAULT_AREA_ROWS  # several sheets of paper
+    assert coarse.rows <= DEFAULT_AREA_ROWS  # one
+
+
+def test_a_step_is_a_stride_so_it_cannot_be_zero_or_negative(tmp_path):
+    from erika import pipeline
+
+    out = os.path.join(tmp_path, "forces.etp")
+    for bad in ("0", "-3"):
+        assert pipeline.main(["forces", "-o", out, "--step", bad]) == 2
+
+
+def test_a_step_that_lands_only_on_motion_codes_is_refused(tmp_path):
+    """Rather than writing a sheet with a heading and no rows under it."""
+    from erika import pipeline
+
+    out = os.path.join(tmp_path, "forces.etp")
+    assert pipeline.main(
+        ["forces", "-o", out, "--from", "0x72", "--to", "0x74"]
+    ) == 2
+
+
+def test_the_probe_says_how_it_swept(tmp_path, capsys):
+    """The sheet's rows label their own values, but the run has to say the stride
+    too -- a coarse pass brackets a neighbourhood rather than naming a value, and
+    the advice for reading it back is different because of that."""
+    from erika import pipeline
+
+    out = os.path.join(tmp_path, "forces.etp")
+    pipeline.main(["forces", "-o", out, "--run", "3", "--step", "4"])
+    said = capsys.readouterr().out
+    assert "in steps of 4" in said
+    assert "--step 1" in said  # what to do about a row that differs
+
+    pipeline.main(["forces", "-o", out, "--run", "3"])
+    plain = capsys.readouterr().out
+    assert "in steps of" not in plain
+    assert "coarse pass" not in plain
+
+
 def test_the_probe_samples_the_machine_before_it_sets_any_force(tmp_path):
     """The reference row. Without it there is nothing on the sheet to compare
     the swept rows against, and a machine that ignores the command looks the

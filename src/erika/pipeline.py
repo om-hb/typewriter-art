@@ -739,10 +739,11 @@ def cmd_forces(args) -> int:
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     size = etp.save(out, job)
 
+    stride = "" if args.step == 1 else f", in steps of {args.step}"
     print(f"strike-force probe -> {out} ({size} bytes, {job.strikes} strikes)")
     for name, values in blocks.items():
         print(f"  {name:<6} 0x{values[0]:02X}..0x{values[-1]:02X} "
-              f"({len(values)} values)")
+              f"({len(values)} values{stride})")
     print("\nWhy this sheet exists: a charset with more than one strike force is")
     print("the single largest quality factor in the paper this pipeline")
     print("implements (section 5.5), and nothing in the code knows yet whether")
@@ -753,10 +754,15 @@ def cmd_forces(args) -> int:
     print("  - A row that also shows a stray character before the glyphs is a")
     print("    value the machine did not take as a force: it typed it instead.")
     print("    Those rows are answers too -- they rule the value out.")
+    if args.step != 1:
+        print(f"  - This was a coarse pass, every {args.step}th value. A row that")
+        print("    differs brackets a neighbourhood rather than naming a value:")
+        print("    sweep it again with --step 1 to find where it starts and stops.")
     print("  - If no row differs from 'AS FOUND' anywhere on the sheet, then this")
     print(f"    machine either does not honour 0x{ec.SET_STRIKE_FORCE:02X} or wants "
           "the force spelled")
-    print("    some other way. Try another range with --from/--to.")
+    print("    some other way. Try another range with --from/--to, and --step to")
+    print("    keep a wide one down to a sheet of paper.")
     print("\nThen, with the values that worked, hardest first:")
     print("  python -m erika.pipeline sheet --forces 0,3,6      # type it")
     print("  python -m erika.pipeline charset --forces 0,3,6 \\")
@@ -785,25 +791,54 @@ def _parse_forces_arg(text: str | None) -> list[int]:
 
 
 def _force_probe_blocks(args) -> dict[str, list[int]]:
-    """What the probe sweeps: either an explicit range, or both hypotheses."""
+    """What the probe sweeps: either an explicit range, or both hypotheses.
+
+    ``--step`` strides the *value space* and the motion codes are dropped after,
+    not before. That is the order that makes a coarse pass mean what it says: every
+    Nth candidate byte, at even intervals, with a gap where the sweep happens to
+    land on a code that would move the head. Filtering first would renumber the
+    values and hand back N usable ones at uneven spacing, which is unreadable as a
+    sweep and is the opposite of what a step is for.
+
+    A stride from ``first``, and deliberately not "and also the last": rows at even
+    intervals are what makes a change in the ink obvious down the sheet, and every
+    row labels the value it was typed at, so nothing about the coverage is a guess.
+    """
+    step = args.step
+    if step < 1:
+        raise PlanError(f"--step {step} makes no sense; it is a stride, so 1 or more")
+
     if args.first is not None or args.last is not None:
         first = args.first if args.first is not None else 0
         last = args.last if args.last is not None else first
         if last < first:
             raise PlanError(f"--from 0x{first:02X} is above --to 0x{last:02X}")
-        values = [v for v in range(first, last + 1) if ec.is_usable_force(v)]
-        skipped = (last - first + 1) - len(values)
+        asked = range(first, last + 1, step)
+        values = [v for v in asked if ec.is_usable_force(v)]
+        skipped = len(asked) - len(values)
         if not values:
             raise PlanError(
-                f"every value in 0x{first:02X}..0x{last:02X} is a motion code"
+                f"every value a sweep of 0x{first:02X}..0x{last:02X} in steps of "
+                f"{step} lands on is a motion code"
             )
         if skipped:
             print(f"note: skipping {skipped} motion code(s) in the requested range")
         return {"custom": values}
-    return {
-        name: [v for v in range(lo, hi + 1) if ec.is_usable_force(v)]
+
+    blocks = {
+        name: [v for v in range(lo, hi + 1, step) if ec.is_usable_force(v)]
         for name, (lo, hi) in ec.FORCE_PROBE_BLOCKS.items()
     }
+    # A block whose every stepped-to value is a motion code contributes nothing but
+    # a heading. None of the blocks in erika_codes can do that -- the stride always
+    # includes the first value and both begin on a usable one -- but a block added
+    # later could, and a heading with no rows under it reads as a failed sweep.
+    kept = {name: values for name, values in blocks.items() if values}
+    if not kept:
+        raise PlanError(
+            f"a sweep in steps of {step} lands on no usable force in any probe block"
+        )
+    return kept
 
 
 # ---------------------------------------------------------------------------
@@ -999,6 +1034,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "change in force is obvious (default M)")
     fo.add_argument("--run", type=int, default=20,
                     help="glyphs per row (default 20)")
+    fo.add_argument("--step", type=lambda v: int(v, 0), default=1,
+                    help="sweep every Nth value rather than every one (default 1, "
+                         "accepts 0x..). What makes a wide --from/--to readable: "
+                         "the whole byte is 245 usable values, 251 lines and four "
+                         "sheets of paper, and at --step 16 it is sixteen lines and "
+                         "one. Find the neighbourhood coarsely, then sweep it")
     fo.set_defaults(func=cmd_forces)
 
     return p

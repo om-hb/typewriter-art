@@ -246,6 +246,7 @@ erika.pipeline calibrate  motion-code test pattern
 erika.pipeline area       bracket the corners of the printable area (--rows, --columns)
 erika.pipeline sheet      type the charset, for scanning back in (--forces)
 erika.pipeline forces     sweep the strike-force command to see what it takes
+                          (--from/--to/--step to widen it and keep it to a sheet)
 
 erika.send <file.etp>     upload over USB serial   (--port, --print, --watch)
 erika.send --diagnose     test the link step by step
@@ -280,7 +281,15 @@ python -m erika.send results/strike_forces.etp --port /dev/cu.usbmodem1101 --pri
 ```
 
 It types a reference row *before* it sends any force command, then one row per
-candidate value across both readings. Rows that come out lighter or darker than
+candidate value across both readings.
+
+If neither reading shows anything, widen it -- but coarsely. `--from 0 --to 0xFF`
+is 245 rows and several sheets of paper; `--step 16` makes the same span sixteen
+rows and one. The stride is over the values rather than over the rows kept, so the
+rows stay evenly spaced with a gap wherever it lands on a motion code, and every
+row is labelled with the value it was typed at. A coarse pass brackets a
+neighbourhood rather than naming a value: sweep the neighbourhood again at
+`--step 1` to find where it starts and stops. Rows that come out lighter or darker than
 the reference are forces the machine took; a row with a stray character in front
 of the glyphs is a value it typed instead, which rules that value out. Every
 candidate is outside `0x71..0x82` on purpose -- on a machine that ignores the

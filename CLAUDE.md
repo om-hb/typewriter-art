@@ -137,9 +137,18 @@ small integer or the ASCII digit for one.
 
 ```bash
 PY -m erika.pipeline forces                 # sweeps both readings, on paper
+PY -m erika.pipeline forces --from 0 --to 0xFF --step 16   # or the whole byte, coarsely
 PY -m erika.pipeline sheet --forces 0,3,6   # then type the set at each
 PY -m erika.pipeline charset --forces 0,3,6 --from-scan scan.png
 ```
+
+`--step` is what makes a wide sweep answerable: every value from `0x00` to `0xFF`
+is 245 rows and several sheets of paper, and at `--step 16` it is sixteen rows and
+one. It strides the *value space* and drops the motion codes afterwards, so the
+rows stay evenly spaced with a gap where the stride lands on one -- filtering first
+would hand back N usable values at uneven intervals, which is unreadable as a
+sweep. A coarse pass brackets a neighbourhood rather than naming a value, and the
+printout says so when the step is not 1.
 
 Read `forces`' own printout before spending a sheet. Two things about it are
 load-bearing: the first row is typed *before* any force command, so there is a
