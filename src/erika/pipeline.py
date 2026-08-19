@@ -310,9 +310,8 @@ def run_optimizer(args) -> str:
         hint = ""
         if not args.fine and args.layers in with_fine:
             hint = (
-                f" It is typeable with --fine, which places strikes with the "
-                f"machine's own motor steps -- but that needs 0xA5 and 0xA6, so "
-                f"type `erika.pipeline codes` first."
+                " It is typeable with the machine's own motor steps, which is "
+                "the default -- drop --keystrokes-only."
             )
         elif args.layers in typeable_layer_schemes(15, fine=True):
             hint = (
@@ -1218,18 +1217,23 @@ def _add_plan_args(p):
                    help="pause after each carriage return, in ms")
     p.add_argument("--jitter", type=float, default=0.05,
                    help="registration error for the shaky preview, in cells (default 0.05)")
-    p.add_argument("--fine", action="store_true",
-                   help="place strikes with the machine's own motor steps "
-                        "(1/120 inch across, 1/240 down) where a layer offset "
-                        "falls between the half-cell grid points -- which is what "
-                        "makes the quarter-cell schemes (16x1) and daisy_full "
-                        "typeable. UNCONFIRMED: needs 0xA5 and 0xA6, so type "
-                        "`erika.pipeline codes` first")
-    p.add_argument("--no-advance", action="store_true",
-                   help="type a stack of glyphs in one cell with Doppeldruck "
-                        "(0xA9) instead of a backspace between each pair, so the "
-                        "escapement never moves. UNCONFIRMED on this machine -- "
-                        "type `erika.pipeline codes` and read part 6 first")
+    # Both of these are on. They name the mechanism to *stop* using, because the
+    # control-code sheet came back positive on 0xA5, 0xA6 and 0xA9 and there is
+    # no longer a reason to ask for them by name -- only a reason to be able to
+    # go back to the keystrokes when a sheet comes out wrong and the question is
+    # which mechanism did it.
+    p.add_argument("--keystrokes-only", dest="fine", action="store_false",
+                   help="refuse a layer offset the keyboard cannot reach, rather "
+                        "than placing it with the machine's own motor steps "
+                        "(1/120 inch across, 1/240 down). Those steps are what "
+                        "make 16x1 and daisy_full typeable, so this rules them "
+                        "out; it is here for isolating a fault to a mechanism")
+    p.add_argument("--backspace-overstrike", dest="no_advance",
+                   action="store_false",
+                   help="type a stack of glyphs in one cell by striking and "
+                        "backspacing, as before 0xA9 was confirmed, instead of "
+                        "with Doppeldruck. Spends the escapement's repeatability "
+                        "on every stacked character; here for the same reason")
     p.add_argument("--no-preview", action="store_true")
     p.add_argument("--ops-per-second", type=float, default=10.0,
                    help="head operations per second, for the time estimate")
@@ -1263,10 +1267,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="characters per row; sets the printed size (default 40)")
     r.add_argument("--num_loops", "-n", type=int, default=15)
     r.add_argument("--layers", "-l", default="4x1",
-                   help=f"layer scheme; typeable by keystroke are "
-                        f"{', '.join(TYPEABLE_LAYER_SCHEMES)}. --fine adds the "
-                        f"finer ones the motor steps can reach, which depends on "
-                        f"the charset's pitch")
+                   help=f"layer scheme. Typeable by keystroke alone are "
+                        f"{', '.join(TYPEABLE_LAYER_SCHEMES)}; the motor steps "
+                        f"reach finer ones, which depends on the charset's pitch "
+                        f"(--keystrokes-only rules those out)")
     r.add_argument("--init_mode", "-i", default="random")
     r.add_argument("--asymmetry", "-a", type=float, default=0.1)
     r.add_argument("--search", "-s", default="simAnneal")

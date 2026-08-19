@@ -118,14 +118,14 @@ finest motions the *keyboard* has; and an image wider than the carriage (65
 columns at pitch 10, 78 at pitch 12) is rejected with the `-r` value that would
 fit.
 
-`--fine` lifts the first of those. The carriage moves in 1/120" motor steps and
-the platen in 1/240", far finer than any key, so an offset is typeable if it
-lands on a whole step — which makes `16x1` realisable at pitch 10 (a quarter of
-a cell is three carriage steps) and `daisy_full` realisable at pitch 15 (an
-eighth of a cell is one step, a fifth of a line is eight). Not at pitch 12,
-where a quarter of a cell is two and a half steps and half a motor step does not
-exist; the error says so rather than blaming the scheme. It needs `0xA5` and
-`0xA6`, which are unconfirmed here — see **The codes the pipeline does not use**.
+The motor steps lift the first of those, and they are the default. The carriage
+moves in 1/120" steps and the platen in 1/240", far finer than any key, so an
+offset is typeable if it lands on a whole step — which makes `16x1` realisable at
+pitch 10 (a quarter of a cell is three carriage steps) and `daisy_full`
+realisable at pitch 15 (an eighth of a cell is one step, a fifth of a line is
+eight). Not at pitch 12, where a quarter of a cell is two and a half steps and
+half a motor step does not exist; the error says so rather than blaming the
+scheme. `--keystrokes-only` puts the old restriction back.
 
 ## The `.etp` print job
 
@@ -545,9 +545,9 @@ Useful planning flags for `print` and `plan`:
 | flag | effect |
 |---|---|
 | `-r 48` | characters per row; sets the printed size |
-| `-l 4x1` | layer scheme; `1x1`…`4x2` are typeable by keystroke, finer ones need `--fine` |
-| `--fine` | place strikes with the machine's own motor steps, for offsets between the half-cell grid points (`16x1`, `daisy_full`) |
-| `--no-advance` | stack a cell's glyphs with Doppeldruck instead of a backspace between each pair |
+| `-l 4x1` | layer scheme; `1x1`…`4x2` by keystroke, finer ones by motor step (pitch-dependent) |
+| `--keystrokes-only` | refuse an offset the keyboard cannot reach, instead of placing it with motor steps |
+| `--backspace-overstrike` | stack a cell's glyphs with a backspace between each pair, instead of Doppeldruck |
 | `--no-home` | serpentine sweep instead of returning each pass — faster, less accurate |
 | `--settle-ms 200` | pause after each paper feed, if the platen needs to settle |
 | `--jitter 0.1` | registration error used for the shaky preview |
@@ -696,6 +696,19 @@ the rest of this package is built around. A code that survives the sheet
 should stop being raw and become an opcode that `planner`, `etp.disassemble`
 and `emulate` all understand.
 
-`0x96`, the completion report, is not on the sheet. It changes when RTS is
-released rather than what is typed, so the firmware's pacing answers it and
-ink cannot.
+**The sheet has been printed and every code on it works** — see
+`docs/control-codes.md` at the workspace root for what each section said. So
+`0xA5`, `0xA6` and `0xA9` are no longer opt-in: the firmware defaults to
+`IMG STEPS AUTO`, and the planner places fine offsets and stacks glyphs with
+Doppeldruck unless told otherwise. The flags above name the *old* mechanism, and
+exist for the case where a sheet comes out wrong and the question is which one
+did it.
+
+Two things stayed off. `IMG ACK` (`0x96`) is not on the sheet at all: it changes
+when RTS is released rather than what is typed, so only a timed run can answer
+it. `IMG PREPARE` sends codes the sheet does not exercise either.
+
+One result the sheet gave that is not a yes or a no: a motor-step feed
+immediately after the detented line feed comes out a step or two short, taking
+up the detent. `planner.encode` answers that by never changing mechanism part
+way through a move — a move is all keystrokes or all motor steps.

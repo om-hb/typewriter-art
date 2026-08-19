@@ -688,10 +688,16 @@ def _write_choices(tmp_path, layers: dict) -> str:
     return path
 
 
-def test_quarter_cell_offsets_are_rejected(tmp_path, charset):
+def test_quarter_cell_offsets_are_rejected_when_only_keystrokes_are_allowed(
+    tmp_path, charset
+):
+    """They are typeable by default now -- the machine's motor steps reach them.
+    What is still refused is a quarter-cell offset when the plan has been told to
+    stay on the keyboard."""
     path = _write_choices(tmp_path, {"layer0_0.25_0": [[1, 2]]})
-    with pytest.raises(PlanError, match="not typeable"):
-        planner.build_plan(path, charset)
+    with pytest.raises(PlanError, match="not typeable by keystroke"):
+        planner.build_plan(path, charset, fine=False)
+    assert planner.build_plan(path, charset).strikes  # and accepted by default
 
 
 def test_image_wider_than_the_carriage_is_rejected(tmp_path, charset):
@@ -2340,8 +2346,8 @@ def test_no_advance_replaces_the_backspaces_rather_than_adding_to_them(tmp_path,
                                                  [(0, 0)] * 4, seed=11)),
         charset,
     )
-    plain = planner.encode(plan)
-    stacked = planner.encode(plan, no_advance=True)
+    plain = planner.encode(plan, no_advance=False)
+    stacked = planner.encode(plan)
 
     def count(job, want):
         return sum(1 for _, op, _ in etp.iter_ops(job.body) if op == want)
@@ -2384,9 +2390,9 @@ def test_the_plan_summary_says_when_it_used_doppeldruck(tmp_path, charset):
                                                  [(0, 0)] * 3, seed=13)),
         charset,
     )
-    job = planner.encode(plan, no_advance=True)
+    job = planner.encode(plan)
     assert "without advancing" in planner.summarize(plan, job)
-    plain = planner.encode(plan)
+    plain = planner.encode(plan, no_advance=False)
     assert "without advancing" not in planner.summarize(plan, plain)
 
 
@@ -2397,15 +2403,13 @@ def test_the_plan_summary_says_when_it_used_doppeldruck(tmp_path, charset):
 QUARTER_LAYERS = [(0, 0), (0, 0.25), (0.25, 0), (0.25, 0.25)]
 
 
-def test_quarter_cell_offsets_are_still_refused_without_fine(tmp_path, charset):
-    """The default is unchanged: 0xA5 and 0xA6 are unconfirmed, so a plan does
-    not start depending on them because a layer scheme asked it to."""
+def test_refusing_a_fine_offset_says_which_switch_did_it(tmp_path, charset):
+    """The refusal is now a consequence of a flag rather than of the machine, so
+    it has to name the flag -- otherwise it reads as "your scheme is impossible",
+    which it was until the control-code sheet came back and is not any more."""
     path = _write_choices(tmp_path, {"layer0_0.25_0": [[1, 2]]})
-    with pytest.raises(PlanError, match="not typeable by keystroke"):
-        planner.build_plan(path, charset)
-    # And the message says what to do about it.
-    with pytest.raises(PlanError, match=r"--fine"):
-        planner.build_plan(path, charset)
+    with pytest.raises(PlanError, match="turned it off"):
+        planner.build_plan(path, charset, fine=False)
 
 
 @pytest.mark.parametrize("pitch,ok", [("sigma-10", True), ("sigma-12", False)])
@@ -2632,3 +2636,46 @@ def test_a_serpentine_pass_is_a_paper_position_not_a_row(tmp_path, charset):
         sweeps[-1][1].append(s.x)
     directions = {tuple(xs) == tuple(sorted(xs)) for _, xs in sweeps if len(xs) > 1}
     assert directions == {True, False}
+
+
+# ---------------------------------------------------------------------------
+# the defaults, now that the control-code sheet has been printed
+# ---------------------------------------------------------------------------
+
+
+def test_the_machines_own_mechanisms_are_the_default():
+    """Every one of these was off until the sheet came back positive, and each is
+    off again the moment somebody changes a default without meaning to. Cheap to
+    pin, and the failure it prevents is a picture that is quietly worse."""
+    import inspect
+
+    from erika import pipeline
+
+    assert inspect.signature(planner.build_plan).parameters["fine"].default is True
+    assert inspect.signature(planner.encode).parameters["no_advance"].default is True
+
+    args = pipeline.build_parser().parse_args(["print"])
+    assert args.fine is True
+    assert args.no_advance is True
+
+
+def test_the_opt_outs_still_work_and_name_a_mechanism():
+    """They exist for one purpose: a sheet came out wrong and the question is
+    which mechanism did it. So each has to actually go back to the old one."""
+    from erika import pipeline
+
+    args = pipeline.build_parser().parse_args(["print", "--keystrokes-only"])
+    assert args.fine is False
+    args = pipeline.build_parser().parse_args(["print", "--backspace-overstrike"])
+    assert args.no_advance is False
+
+
+@pytest.mark.skipif(NO_FIRMWARE, reason=NO_FIRMWARE_REASON)
+def test_the_firmware_defaults_to_using_the_step_commands():
+    """AUTO rather than ALL: the commands are cheaper on a blank run and dearer
+    on the one-cell hops a picture is mostly made of, which was measured. And
+    not the completion report, which no printed sheet can confirm."""
+    text = open(os.path.join(FIRMWARE_SRC, "erika_image.h"), encoding="utf-8").read()
+    assert re.search(r"DirectSteps _directSteps = StepsAuto;", text)
+    assert re.search(r"bool _completionReport = false;", text)
+    assert re.search(r"bool _prepare = false;", text)

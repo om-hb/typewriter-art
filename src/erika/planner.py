@@ -163,7 +163,8 @@ def offset_to_units(value: float, what: str, pitch: int, fine: bool = False
     halves, which is every scheme this pipeline could type before ``fine``
     existed.
 
-    With ``fine``, an offset is typeable if it lands on a whole motor step: the
+    With ``fine`` -- the default, since the machine has been shown to honour
+    0xA5 and 0xA6 -- an offset is typeable if it lands on a whole motor step: the
     carriage moves in 1/120" and the platen in 1/240", which is far finer than
     any keystroke. That is what makes the quarter-cell schemes physically
     realisable, and it is more general than quarters -- ``daisy_full``'s
@@ -188,8 +189,9 @@ def offset_to_units(value: float, what: str, pitch: int, fine: bool = False
             f"Either re-run optimize.py with a layer scheme built from halves "
             f"({schemes}), or pass --fine, which places strikes with the "
             f"machine's own motor steps instead -- 1/120 inch across, 1/240 "
-            f"down. That needs 0xA5 and 0xA6, which are unconfirmed on this "
-            f"machine: type `erika.pipeline codes` first."
+            f"down. Those are 0xA5 and 0xA6, which this machine honours -- "
+            f"`erika.pipeline codes` sections 2 to 4 -- so the flag is normally "
+            f"on and something has turned it off."
         )
 
     per_half = (
@@ -260,7 +262,7 @@ def build_plan(
     home_each_row: bool = True,
     boustrophedon: bool = True,
     group_by_force: bool = True,
-    fine: bool = False,
+    fine: bool = True,
 ) -> Plan:
     strikes, cols, rows, offsets = load_choices(choices_path, charset.pitch, fine)
 
@@ -390,17 +392,21 @@ def encode(
     plan: Plan,
     settle_ms: int = 0,
     cr_delay_ms: int = 0,
-    no_advance: bool = False,
+    no_advance: bool = True,
 ) -> etp.Job:
     """Emit the opcode stream for a plan, tracking the head as we go.
 
     `no_advance` types a stack of glyphs in one cell with Doppeldruck (0xA9)
-    instead of with a backspace between each pair. Same number of bytes; the
-    difference is that the escapement never moves, so the marks land on top of
-    each other rather than as close as the escapement's repeatability allows.
-    A picture is mostly stacked characters, so that is not a small difference --
-    but the code has not been on paper on this machine, which is what
-    `erika.pipeline codes` part 6 is for, so it is off by default.
+    instead of with a backspace between each pair. Same number of bytes on the
+    wire and two fewer in the file; the difference that matters is that the
+    escapement never moves, so the marks land on top of each other rather than
+    as close as the escapement's repeatability allows. A picture is mostly
+    stacked characters, so that is not a small difference.
+
+    On by default since section 6 of `erika.pipeline codes` came back with eight
+    O struck through and no backspace anywhere in the plan. Pass False to get
+    the backspace behaviour, which is what to do if a sheet comes out with the
+    stacks smeared and you want to know which mechanism is at fault.
     """
     enc = etp.Encoder()
     cs = plan.charset
