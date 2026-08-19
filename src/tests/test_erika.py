@@ -2243,3 +2243,56 @@ def test_the_firmware_has_the_same_three_settings():
     names = set(re.findall(r"Steps(\w+)\s*=", match.group(1)))
     assert names == {"Off", "Auto", "All"}
     assert {m.capitalize() for m in MODES} == names
+
+
+@pytest.mark.skipif(NO_FIRMWARE, reason=NO_FIRMWARE_REASON)
+def test_nothing_the_preamble_sends_could_move_the_head_or_eat_a_byte():
+    """`IMG PREPARE` writes a handful of bytes before the first opcode, and they
+    are the only bytes in a job that no plan accounted for.
+
+    So they have to be inert as far as position goes. A byte in the motion block
+    would displace the whole picture before it started, one from the wheel's own
+    range would type a character into the top-left corner, and one that carries
+    an operand would eat the first opcode of the body. None of those would look
+    like a preamble problem on the paper.
+    """
+    text = open(os.path.join(FIRMWARE_SRC, "erika_image.h"), encoding="utf-8").read()
+    defines = _parse_cpp_defines(os.path.join(FIRMWARE_SRC, "erika_image.h"))
+    names = [
+        "ERIKA_RESET", "ERIKA_LINE_SPACING_1", "ERIKA_PITCH_10", "ERIKA_PITCH_12",
+        "ERIKA_KEYBOARD_OFF", "ERIKA_KEYBOARD_ON", "ERIKA_REPORT_WHEN_PRINTED",
+    ]
+    for name in names:
+        code = defines.get(name)
+        assert code is not None, f"{name} is gone from the firmware"
+        assert code not in ec.CONTROL_CODES, f"{name} is a motion code"
+        assert not ec.is_glyph_code(code), f"{name} is a key on the wheel"
+        assert code not in ec.OPERAND_CODES, f"{name} carries an operand"
+        # And it is a code the published table names, not an invention.
+        assert code in ec.CONTROL_CODE_NAMES, f"0x{code:02X} is not in the table"
+
+    # The postamble exists to undo 0x91, and it has to be the byte that does.
+    match = re.search(r"_postamble\[_postambleLen\+\+\] = (\w+);",
+                      open(os.path.join(FIRMWARE_SRC, "erika_image.cpp"),
+                           encoding="utf-8").read())
+    assert match and match.group(1) == "ERIKA_KEYBOARD_ON"
+    assert "ERIKA_KEYBOARD_OFF" in text  # the thing it is undoing
+
+
+@pytest.mark.skipif(NO_FIRMWARE, reason=NO_FIRMWARE_REASON)
+def test_the_postamble_runs_on_every_exit_from_a_job():
+    """The property the whole preamble depends on. A machine left in duplex has a
+    keyboard that does nothing, and nothing on the device says why -- so finish,
+    abort and fail all have to put it back, and a failure is exactly the path
+    somebody would forget."""
+    text = open(os.path.join(FIRMWARE_SRC, "erika_image.cpp"), encoding="utf-8").read()
+    for func in ("abort", "fail"):
+        body = re.search(
+            rf"void ErikaImagePrinter::{func}\(.*?\n}}", text, re.S
+        )
+        assert body, f"could not find {func}()"
+        assert "flushPostamble()" in body.group(0), (
+            f"{func}() does not send the postamble, so it can leave the keyboard dead"
+        )
+    # finish() is reached only after the postamble has drained through tick().
+    assert re.search(r"_bodyEnded = true;\s*\n\s*if \(nextPostambleByte\(\)\)", text)
