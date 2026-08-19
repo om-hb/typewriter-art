@@ -129,6 +129,14 @@ def expand(body: bytes, direct_steps: str = STEPS_OFF, pitch: int = 10) -> list[
             out.append(operand)
         elif op == etp.OP_NO_ADVANCE:
             out.append(ec.NO_ADVANCE)
+        elif op in (etp.OP_RIGHT_FINE, etp.OP_LEFT_FINE):
+            # Finer than any keystroke, so there is nothing else these could
+            # expand to -- the direct-step commands are not optional here.
+            steps = operand if op == etp.OP_RIGHT_FINE else -operand
+            out += _step_chunks(ec.CARRIAGE_STEPS, steps)
+        elif op in (etp.OP_DOWN_FINE, etp.OP_UP_FINE):
+            steps = operand if op == etp.OP_DOWN_FINE else -operand
+            out += _step_chunks(ec.PLATEN_STEPS, steps)
         elif op == etp.OP_DELAY:
             pass  # timing only; nothing reaches the paper
         else:
@@ -144,6 +152,12 @@ class Impression:
     x: int  #: half-steps right of the left margin
     code: int  #: the key that struck
     force: int | None = None  #: the strike force in effect, if one was set
+    #: Motor steps beyond (y, x), for a strike placed finer than a keystroke can
+    #: reach. Zero throughout a plan built from half-cell offsets -- and part of
+    #: the identity of a mark, so that two strikes a quarter of a cell apart do
+    #: not compare equal.
+    fy: int = 0
+    fx: int = 0
 
 
 @dataclass
@@ -249,8 +263,10 @@ class Typewriter:
             pass  # sub-half-line; the planner never relies on it for placement
         elif code == ec.CARRIAGE_RETURN:
             self.x = 0
+            self._x_fine = 0
         elif code == ec.NEWLINE:
             self.x = 0
+            self._x_fine = 0
             self.y += 2
         elif code == ec.TAB:
             raise EmulationError("TAB has no defined position model")
@@ -258,7 +274,10 @@ class Typewriter:
             glyph = ec.glyph_for_code(code)
             if glyph is None:
                 raise EmulationError(f"struck unknown key 0x{code:02X}")
-            self.impressions.append(Impression(self.y, self.x, code, self.force))
+            self.impressions.append(
+                Impression(self.y, self.x, code, self.force,
+                           self._y_fine, self._x_fine)
+            )
             if glyph.advances and not self._no_advance:
                 self._move(2)
             self._no_advance = False

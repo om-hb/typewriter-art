@@ -113,9 +113,19 @@ Ordering matters mechanically:
   half-line steps, because the detented full-line advance is more repeatable.
 
 Constraints are checked rather than assumed: layer offsets that aren't
-multiples of 0.5 are rejected (so `16x1` and `daisy_full` are out — the machine
-has no quarter-step), and an image wider than the carriage (65 columns at pitch
-10, 78 at pitch 12) is rejected with the `-r` value that would fit.
+multiples of 0.5 are rejected, because half a cell and half a line are the
+finest motions the *keyboard* has; and an image wider than the carriage (65
+columns at pitch 10, 78 at pitch 12) is rejected with the `-r` value that would
+fit.
+
+`--fine` lifts the first of those. The carriage moves in 1/120" motor steps and
+the platen in 1/240", far finer than any key, so an offset is typeable if it
+lands on a whole step — which makes `16x1` realisable at pitch 10 (a quarter of
+a cell is three carriage steps) and `daisy_full` realisable at pitch 15 (an
+eighth of a cell is one step, a fifth of a line is eight). Not at pitch 12,
+where a quarter of a cell is two and a half steps and half a motor step does not
+exist; the error says so rather than blaming the scheme. It needs `0xA5` and
+`0xA6`, which are unconfirmed here — see **The codes the pipeline does not use**.
 
 ## The `.etp` print job
 
@@ -535,7 +545,9 @@ Useful planning flags for `print` and `plan`:
 | flag | effect |
 |---|---|
 | `-r 48` | characters per row; sets the printed size |
-| `-l 4x1` | layer scheme; `1x1`…`4x2` are typeable, quarter-cell ones are not |
+| `-l 4x1` | layer scheme; `1x1`…`4x2` are typeable by keystroke, finer ones need `--fine` |
+| `--fine` | place strikes with the machine's own motor steps, for offsets between the half-cell grid points (`16x1`, `daisy_full`) |
+| `--no-advance` | stack a cell's glyphs with Doppeldruck instead of a backspace between each pair |
 | `--no-home` | serpentine sweep instead of returning each pass — faster, less accurate |
 | `--settle-ms 200` | pause after each paper feed, if the platen needs to settle |
 | `--jitter 0.1` | registration error used for the shaky preview |

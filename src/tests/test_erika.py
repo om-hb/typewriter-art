@@ -2388,3 +2388,120 @@ def test_the_plan_summary_says_when_it_used_doppeldruck(tmp_path, charset):
     assert "without advancing" in planner.summarize(plan, job)
     plain = planner.encode(plan)
     assert "without advancing" not in planner.summarize(plan, plain)
+
+
+# ---------------------------------------------------------------------------
+# offsets finer than a keystroke (planner --fine)
+# ---------------------------------------------------------------------------
+
+QUARTER_LAYERS = [(0, 0), (0, 0.25), (0.25, 0), (0.25, 0.25)]
+
+
+def test_quarter_cell_offsets_are_still_refused_without_fine(tmp_path, charset):
+    """The default is unchanged: 0xA5 and 0xA6 are unconfirmed, so a plan does
+    not start depending on them because a layer scheme asked it to."""
+    path = _write_choices(tmp_path, {"layer0_0.25_0": [[1, 2]]})
+    with pytest.raises(PlanError, match="not typeable by keystroke"):
+        planner.build_plan(path, charset)
+    # And the message says what to do about it.
+    with pytest.raises(PlanError, match=r"--fine"):
+        planner.build_plan(path, charset)
+
+
+@pytest.mark.parametrize("pitch,ok", [("sigma-10", True), ("sigma-12", False)])
+def test_a_quarter_cell_is_whole_carriage_steps_at_pitch_10_and_not_at_12(
+    tmp_path, pitch, ok
+):
+    """Three steps at pitch 10, two and a half at pitch 12. Half a motor step
+    does not exist, so the same layer scheme is typeable at one pitch and not at
+    the other -- which the error has to say rather than blaming the scheme."""
+    cs = Charset.load(pitch, SRC)
+    path = _write_choices(tmp_path, _random_choices(cs, 4, 6, QUARTER_LAYERS, seed=2))
+    if ok:
+        plan = planner.build_plan(path, cs, fine=True)
+        assert {s.fx for s in plan.strikes} == {0, 3}
+    else:
+        with pytest.raises(PlanError, match="not a whole number of"):
+            planner.build_plan(path, cs, fine=True)
+
+
+def test_a_quarter_line_is_ten_platen_steps_at_any_pitch(tmp_path, charset):
+    """Vertical is the easy half: a line is 40 platen steps whatever the pitch,
+    so every offset built from halves, quarters, fifths or eighths is exact."""
+    for offset, steps in ((0.25, 10), (0.2, 8), (0.125, 5), (0.75, 30)):
+        half, residue = planner.offset_to_units(offset, "vertical", 10, fine=True)
+        assert half * ec.PLATEN_STEPS_PER_HALF_LINE + residue == steps
+
+
+def test_daisy_full_becomes_typeable_at_pitch_15():
+    """The scheme the planner used to call physically unrealisable. Its eighth-
+    cell offsets are one carriage step each at 15 characters per inch, and its
+    fifth-line offsets are eight platen steps -- both exact, neither reachable
+    by any key on the machine."""
+    for offset in (0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 0.875):
+        planner.offset_to_units(offset, "horizontal", 15, fine=True)
+    for offset in (0.2, 0.4, 0.6, 0.8):
+        planner.offset_to_units(offset, "vertical", 15, fine=True)
+    # And not at pitch 10, where an eighth of a cell is a step and a half.
+    with pytest.raises(PlanError, match="not a whole number of"):
+        planner.offset_to_units(0.125, "horizontal", 10, fine=True)
+
+
+def test_a_fine_plan_lands_a_quarter_cell_from_the_grid(tmp_path, charset):
+    """End to end through the virtual machine: the residue survives the encoder,
+    the firmware's expansion and the machine's own arithmetic, and comes back
+    out as a mark a quarter of a cell off the half-cell grid."""
+    path = _write_choices(tmp_path, {"layer0_0_0": [[1]], "layer1_0_0.25": [[1]]})
+    plan = planner.build_plan(path, charset, fine=True)
+    job = planner.encode(plan)
+    machine = emulate.type_job(job, max_columns=charset.max_columns)
+
+    places = [(i.y, i.fy, i.x, i.fx) for i in machine.impressions]
+    assert places == [(0, 0, 0, 0), (0, 0, 0, 3)]
+    assert machine.overruns == 0
+
+
+def test_a_half_cell_plan_is_byte_identical_with_fine_switched_on(tmp_path,
+                                                                 charset):
+    """The property that makes --fine safe to have. Nothing about a scheme built
+    from halves reaches the new opcodes, so turning the flag on cannot change a
+    picture that never needed it."""
+    path = _write_choices(tmp_path, _random_choices(charset, 6, 9, FOUR_LAYERS,
+                                                    seed=17))
+    plain = planner.encode(planner.build_plan(path, charset))
+    fine = planner.encode(planner.build_plan(path, charset, fine=True))
+    assert fine.body == plain.body
+
+
+def test_a_fine_plan_still_only_feeds_the_paper_forward(tmp_path, charset):
+    """The residue is part of the position, so it has to be part of the sort --
+    otherwise a quarter-line layer is typed before the layer above it and the
+    platen has to come back, which is where banding comes from."""
+    path = _write_choices(tmp_path, _random_choices(charset, 5, 7, QUARTER_LAYERS,
+                                                    seed=4))
+    job = planner.encode(planner.build_plan(path, charset, fine=True))
+    ops = [op for _, op, _ in etp.iter_ops(job.body)]
+    assert etp.OP_UP not in ops
+    assert etp.OP_UP_FINE not in ops
+    assert etp.OP_MICRO_UP not in ops
+
+
+def test_the_preview_places_a_fine_strike_off_the_grid(tmp_path, charset):
+    """Or the offline check against the optimizer's mockup would be comparing a
+    quarter-cell plan against a half-cell render and calling it exact."""
+    import numpy as np
+    from erika import preview
+
+    tiles = np.ones((len(charset) + 1, charset.cell_h, charset.cell_w),
+                    dtype=np.float32)
+    tiles[1] = 0.0  # index 1 lays down solid ink, so its position is visible
+
+    def inked_columns(offset):
+        path = _write_choices(tmp_path, {f"layer0_0_{offset}": [[1]]})
+        plan = planner.build_plan(path, charset, fine=True)
+        img = preview.render(plan, tiles)
+        return np.flatnonzero((img < 0.5).any(axis=0))
+
+    at_zero = inked_columns(0)
+    at_quarter = inked_columns(0.25)
+    assert at_quarter[0] - at_zero[0] == charset.cell_w // 4

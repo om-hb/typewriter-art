@@ -62,11 +62,15 @@ OP_NEWLINE = 0x0B  # n            carriage return + n full line feeds
 OP_SET_FORCE = 0x0C  # n            strike force (Anschlagstärke) for what follows
 OP_RAW = 0x0D  # byte         send this byte to the machine, untouched
 OP_NO_ADVANCE = 0x0E  # -     the next strike prints where the head stands
+OP_RIGHT_FINE = 0x0F  # n     move right n carriage steps (1/120")
+OP_LEFT_FINE = 0x10  # n      move left  n carriage steps
+OP_DOWN_FINE = 0x11  # n      feed paper down n platen steps (1/240")
+OP_UP_FINE = 0x12  # n        feed paper up   n platen steps
 
 _HAS_OPERAND = {
     OP_RIGHT, OP_LEFT, OP_DOWN, OP_UP, OP_STRIKE, OP_STRIKE_NA,
     OP_DELAY, OP_MICRO_DOWN, OP_MICRO_UP, OP_NEWLINE, OP_SET_FORCE,
-    OP_RAW,
+    OP_RAW, OP_RIGHT_FINE, OP_LEFT_FINE, OP_DOWN_FINE, OP_UP_FINE,
 }
 
 OPCODE_NAMES = {
@@ -75,6 +79,8 @@ OPCODE_NAMES = {
     OP_DELAY: "DELAY", OP_MICRO_DOWN: "MICRO_DOWN", OP_MICRO_UP: "MICRO_UP",
     OP_NEWLINE: "NEWLINE", OP_SET_FORCE: "SET_FORCE", OP_RAW: "RAW",
     OP_NO_ADVANCE: "NO_ADVANCE",
+    OP_RIGHT_FINE: "RIGHT_FINE", OP_LEFT_FINE: "LEFT_FINE",
+    OP_DOWN_FINE: "DOWN_FINE", OP_UP_FINE: "UP_FINE",
 }
 
 MAX_OPERAND = 0xFF
@@ -157,6 +163,41 @@ class Encoder:
             self.down(delta_half_lines)
         elif delta_half_lines < 0:
             self.up(-delta_half_lines)
+
+    # -- motion finer than a keystroke -------------------------------------
+    # The machine's own motor steps: 1/120" across and 1/240" down. Nothing the
+    # keyboard can do reaches them -- the half-step key and the micro-line key
+    # are the finest keystrokes there are -- so these expand to 0xA5 and 0xA6 in
+    # the firmware, and a machine that does not honour those cannot type a plan
+    # containing them at all. `erika.pipeline codes` is what says whether it does.
+    #
+    # They exist for layer schemes offset by a fraction the half-cell grid
+    # cannot express: a quarter of a cell, or the eighths and fifths that
+    # `daisy_full` asks for. See `planner.offset_to_units`.
+
+    def right_fine(self, steps: int) -> None:
+        self._repeat(OP_RIGHT_FINE, steps)
+
+    def left_fine(self, steps: int) -> None:
+        self._repeat(OP_LEFT_FINE, steps)
+
+    def horizontal_fine(self, steps: int) -> None:
+        if steps > 0:
+            self.right_fine(steps)
+        elif steps < 0:
+            self.left_fine(-steps)
+
+    def down_fine(self, steps: int) -> None:
+        self._repeat(OP_DOWN_FINE, steps)
+
+    def up_fine(self, steps: int) -> None:
+        self._repeat(OP_UP_FINE, steps)
+
+    def vertical_fine(self, steps: int) -> None:
+        if steps > 0:
+            self.down_fine(steps)
+        elif steps < 0:
+            self.up_fine(-steps)
 
     def carriage_return(self) -> None:
         self._emit(OP_CR)
@@ -456,7 +497,7 @@ def disassemble(job: Job, limit: int | None = None) -> str:
             "; the column and row below do NOT account for "
             + ", ".join(f"0x{b:02X} {ec.CONTROL_CODE_NAMES[b]}" for b in unmodelled)
         )
-    lines.append(";  offset  col   row  opcode")
+    lines.append(";  offset    col    row  opcode")
     x = y = 0  # half-steps from left margin, half-lines from the datum
     # Sub-half-step and sub-half-line residue, in the machine's own motor steps.
     # Only 0xA5 and 0xA6 can produce it, and only through OP_RAW.
@@ -475,10 +516,19 @@ def disassemble(job: Job, limit: int | None = None) -> str:
             y += operand
         elif op == OP_UP:
             y -= operand
+        elif op in (OP_RIGHT_FINE, OP_LEFT_FINE):
+            x_fine += operand if op == OP_RIGHT_FINE else -operand
+            carry, x_fine = divmod(x_fine, per_half_step)
+            x += carry
+        elif op in (OP_DOWN_FINE, OP_UP_FINE):
+            y_fine += operand if op == OP_DOWN_FINE else -operand
+            carry, y_fine = divmod(y_fine, ec.PLATEN_STEPS_PER_HALF_LINE)
+            y += carry
         elif op == OP_CR:
-            x = 0
+            x = x_fine = 0
         elif op == OP_NEWLINE:
             x, y = 0, y + 2 * operand
+            x_fine = 0
         elif op == OP_STRIKE:
             if no_advance:
                 no_advance = False
@@ -525,7 +575,12 @@ def disassemble(job: Job, limit: int | None = None) -> str:
             text = f"{text:<9} 0x{operand:02X}"
         elif operand is not None:
             text = f"{text:<9} {operand}"
-        lines.append(f"  {off:6d}  {x / 2:5.1f} {y / 2:5.1f}  {text}")
+        # The residue is part of the position, so it belongs in the columns --
+        # a quarter-line layer that showed the same row as the layer above it
+        # would make the listing agree with a plan it was meant to check.
+        col = (x + x_fine / per_half_step) / 2
+        row = (y + y_fine / ec.PLATEN_STEPS_PER_HALF_LINE) / 2
+        lines.append(f"  {off:6d}  {col:6.2f} {row:6.2f}  {text}")
 
         n += 1
         if limit is not None and n >= limit:

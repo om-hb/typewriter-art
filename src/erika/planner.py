@@ -29,9 +29,8 @@ if __package__ in (None, ""):
 from erika import SRC_DIR, erika_codes as ec
 from erika import etp
 
-#: Layer offsets the machine can hit. The head moves in half-steps and the
-#: platen in half-lines, so quarter-cell schemes ("16x1", "daisy_full") have
-#: no physical realisation on this typewriter.
+#: Layer offsets the *keyboard* can hit. The head moves in half-steps and the
+#: platen in half-lines, and those are the finest keystrokes the machine has.
 SUPPORTED_OFFSETS = (0.0, 0.5)
 
 
@@ -41,11 +40,19 @@ class PlanError(ValueError):
 
 @dataclass(frozen=True)
 class Strike:
-    """One key press at an absolute position on the page."""
+    """One key press at an absolute position on the page.
+
+    The position is a half-cell grid point plus, for a layer offset the keyboard
+    cannot reach, a residue in the machine's own motor steps. Both residues are
+    zero for every scheme built from halves, which is every scheme that was
+    typeable before ``--fine``, so nothing about an existing plan changes.
+    """
 
     y: int  #: half-lines below the top of the image
     x: int  #: half-steps right of the left margin
     index: int  #: charset index, as chosen by optimize.py
+    fy: int = 0  #: extra 1/240" platen steps below y
+    fx: int = 0  #: extra 1/120" carriage steps right of x
 
 
 @dataclass
@@ -147,20 +154,73 @@ class Plan:
         return max((s.y for s in self.strikes), default=0) / 2 + 1
 
 
-def _offset_to_units(value: float, what: str) -> int:
-    """Convert a fractional layer offset to half-cell units."""
+def offset_to_units(value: float, what: str, pitch: int, fine: bool = False
+                    ) -> tuple[int, int]:
+    """Split a fractional layer offset into half-cells and leftover motor steps.
+
+    Returns ``(half_units, steps)``. ``steps`` is zero for the offsets the
+    keyboard can reach -- 0 and 0.5 -- and that is every scheme built from
+    halves, which is every scheme this pipeline could type before ``fine``
+    existed.
+
+    With ``fine``, an offset is typeable if it lands on a whole motor step: the
+    carriage moves in 1/120" and the platen in 1/240", which is far finer than
+    any keystroke. That is what makes the quarter-cell schemes physically
+    realisable, and it is more general than quarters -- ``daisy_full``'s
+    eighth-cell offsets come out exact at pitch 15 (one carriage step each) and
+    its fifth-line offsets at eight platen steps.
+
+    What it cannot do is round. A quarter of a cell is three carriage steps at
+    pitch 10 and two at pitch 15, but two and a half at pitch 12, and half a
+    motor step does not exist -- so the same scheme is typeable at one pitch and
+    not at another, and the error has to say which.
+    """
     for i, allowed in enumerate(SUPPORTED_OFFSETS):
         if abs(value - allowed) < 1e-9:
-            return i
-    raise PlanError(
-        f"layer {what} offset {value} is not typeable on the Sigma. The machine "
-        f"moves in half-steps and half-lines, so offsets must be one of "
-        f"{list(SUPPORTED_OFFSETS)}. Re-run optimize.py with a layer scheme "
-        f"built from halves (1x1, 1x2, 1x4, 2Hx1, 2Hx2, 2Vx1, 2Vx2, 4x1, 4x2)."
+            return i, 0
+
+    schemes = ("1x1, 1x2, 1x4, 2Hx1, 2Hx2, 2Vx1, 2Vx2, 4x1, 4x2")
+    if not fine:
+        raise PlanError(
+            f"layer {what} offset {value} is not typeable by keystroke. The "
+            f"machine's finest keys move half a cell across and half a line "
+            f"down, so offsets have to be one of {list(SUPPORTED_OFFSETS)}. "
+            f"Either re-run optimize.py with a layer scheme built from halves "
+            f"({schemes}), or pass --fine, which places strikes with the "
+            f"machine's own motor steps instead -- 1/120 inch across, 1/240 "
+            f"down. That needs 0xA5 and 0xA6, which are unconfirmed on this "
+            f"machine: type `erika.pipeline codes` first."
+        )
+
+    per_half = (
+        ec.carriage_steps_per_half_step(pitch)
+        if what == "horizontal"
+        else ec.PLATEN_STEPS_PER_HALF_LINE
     )
+    exact = value * 2 * per_half  # motor steps into the cell / line
+    if abs(exact - round(exact)) > 1e-9:
+        unit = "1/120 inch carriage" if what == "horizontal" else "1/240 inch platen"
+        raise PlanError(
+            f"layer {what} offset {value} is not a whole number of {unit} steps "
+            f"at pitch {pitch} -- it comes to {exact:.4g} of them, and half a "
+            f"motor step does not exist. "
+            + (
+                "A quarter of a cell is exact at pitch 10 (three steps) and at "
+                "pitch 15 (two), but not at pitch 12. Rebuild the charset at "
+                "another pitch, or use a layer scheme built from halves."
+                if what == "horizontal"
+                else "Use a layer scheme whose vertical offsets are whole "
+                "1/240 inch steps of a line -- halves, quarters, fifths and "
+                "eighths all are."
+            )
+        )
+    steps = int(round(exact))
+    return divmod(steps, per_half)
 
 
-def load_choices(path: str) -> tuple[list[Strike], int, int, list[tuple[float, float]]]:
+def load_choices(
+    path: str, pitch: int = 10, fine: bool = False
+) -> tuple[list[Strike], int, int, list[tuple[float, float]]]:
     """Flatten choices.json into absolute strikes.
 
     Keys look like ``layer3_0.5_0`` -- layer index, vertical offset, horizontal
@@ -181,14 +241,16 @@ def load_choices(path: str) -> tuple[list[Strike], int, int, list[tuple[float, f
         except ValueError as exc:
             raise PlanError(f"{path}: cannot parse layer key {key!r}") from exc
         offsets.append((off_v, off_h))
-        dy = _offset_to_units(off_v, "vertical")
-        dx = _offset_to_units(off_h, "horizontal")
+        dy, fy = offset_to_units(off_v, "vertical", pitch, fine)
+        dx, fx = offset_to_units(off_h, "horizontal", pitch, fine)
         rows = max(rows, len(grid))
         for i, row in enumerate(grid):
             cols = max(cols, len(row))
             for j, index in enumerate(row):
                 if index:  # index 0 is the blank cell -- nothing to type
-                    strikes.append(Strike(2 * i + dy, 2 * j + dx, index))
+                    strikes.append(
+                        Strike(2 * i + dy, 2 * j + dx, index, fy, fx)
+                    )
     return strikes, cols, rows, offsets
 
 
@@ -198,8 +260,9 @@ def build_plan(
     home_each_row: bool = True,
     boustrophedon: bool = True,
     group_by_force: bool = True,
+    fine: bool = False,
 ) -> Plan:
-    strikes, cols, rows, offsets = load_choices(choices_path)
+    strikes, cols, rows, offsets = load_choices(choices_path, charset.pitch, fine)
 
     bad = [s for s in strikes if not 0 <= s.index < len(charset)]
     if bad:
@@ -239,10 +302,14 @@ def build_plan(
     # can outnumber the strikes. What it costs is one carriage sweep per force
     # per line, so any error the carriage accumulates across a line lands
     # differently in each group; group_by_force=False buys that back.
+    # The residues are part of the position, so they are part of the sort -- the
+    # paper must still only ever feed forward, and within a line the carriage
+    # must still only sweep one way.
     if group_by_force and charset.has_forces:
-        strikes.sort(key=lambda s: (s.y, charset.force_rank(s.index), s.x))
+        strikes.sort(key=lambda s: (s.y, s.fy, charset.force_rank(s.index),
+                                    s.x, s.fx))
     else:
-        strikes.sort(key=lambda s: (s.y, s.x))
+        strikes.sort(key=lambda s: (s.y, s.fy, s.x, s.fx))
 
     if boustrophedon and not home_each_row:
         strikes = _serpentine(strikes)
@@ -261,6 +328,21 @@ def _serpentine(strikes: list[Strike]) -> list[Strike]:
             flip = not flip
             start = i
     return out
+
+
+def _split(delta: int, per_unit: int) -> tuple[int, int]:
+    """Split a signed motion into whole units and a residue of the same sign.
+
+    Same sign, and that is the point. A move computed as "whole units to the new
+    grid point, then the residue" mixes directions whenever the residue shrinks:
+    going from a quarter-line layer to the next row's unoffset one would feed the
+    platen a whole half-line forward and then ten steps *back*, which is a
+    reversal the planner exists to avoid -- it is where banding comes from. Doing
+    the arithmetic on the absolute step count first leaves one direction.
+    """
+    sign = -1 if delta < 0 else 1
+    whole, residue = divmod(abs(delta), per_unit)
+    return sign * whole, sign * residue
 
 
 def encode(
@@ -282,6 +364,10 @@ def encode(
     enc = etp.Encoder()
     cs = plan.charset
     x = y = 0
+    # Where the head is *within* the half-cell, in the machine's motor steps.
+    # Always zero unless a layer offset asked for a position the keyboard cannot
+    # reach, which keeps a half-cell plan byte-identical to what it was.
+    x_fine = y_fine = 0
     prev_y: int | None = None
     # None until the first force is asserted. A charset without forces never
     # asserts one, so its job is byte-identical to what it was before strike
@@ -298,40 +384,53 @@ def encode(
         stacked = (
             no_advance
             and i + 1 < len(strikes)
-            and strikes[i + 1].y == s.y
-            and strikes[i + 1].x == s.x
+            and (strikes[i + 1].y, strikes[i + 1].fy) == (s.y, s.fy)
+            and (strikes[i + 1].x, strikes[i + 1].fx) == (s.x, s.fx)
             and cs.advances[s.index]
         )
-        if s.y != prev_y:
-            dy = s.y - y
-            if dy < 0:  # build_plan sorts by y, so this cannot happen
+        if (s.y, s.fy) != prev_y:
+            # In the platen's own steps, so that a residue which shrinks between
+            # rows still comes out as one forward feed rather than a whole
+            # half-line forward and a fraction back.
+            delta = ((s.y * ec.PLATEN_STEPS_PER_HALF_LINE + s.fy)
+                     - (y * ec.PLATEN_STEPS_PER_HALF_LINE + y_fine))
+            if delta < 0:  # build_plan sorts by (y, fy), so this cannot happen
                 raise PlanError(f"plan feeds the paper backwards to row {s.y}")
+            dy, dy_fine = _split(delta, ec.PLATEN_STEPS_PER_HALF_LINE)
             if plan.home_each_row:
                 # A full NEWLINE drives the standard line-feed mechanism, which
                 # is more repeatable than stacking half-line steps -- use it
                 # whenever the gap happens to be a whole number of lines.
-                if dy and dy % 2 == 0:
+                if dy and dy % 2 == 0 and dy_fine == 0:
                     enc.newline(dy // 2)
                 else:
                     enc.carriage_return()
                     enc.vertical(dy)
+                    enc.vertical_fine(dy_fine)
                 x = 0
+                x_fine = 0
                 if cr_delay_ms:
                     enc.delay_ms(cr_delay_ms)
             else:
                 enc.vertical(dy)
+                enc.vertical_fine(dy_fine)
             if settle_ms:
                 enc.delay_ms(settle_ms)
-            y = s.y
-            prev_y = s.y
+            y, y_fine = s.y, s.fy
+            prev_y = (s.y, s.fy)
 
         want = cs.forces[s.index] if s.index < len(cs.forces) else None
         if want is not None and want != force:
             enc.set_force(want)
             force = want
 
-        enc.horizontal(s.x - x)
-        x = s.x
+        # The same arithmetic across, for the same reason.
+        per_half = ec.carriage_steps_per_half_step(cs.pitch)
+        dx, dx_fine = _split((s.x * per_half + s.fx) - (x * per_half + x_fine),
+                             per_half)
+        enc.horizontal(dx)
+        enc.horizontal_fine(dx_fine)
+        x, x_fine = s.x, s.fx
         advances = cs.advances[s.index] and not stacked
         if stacked:
             enc.no_advance()
@@ -371,6 +470,13 @@ def summarize(plan: Plan, job: etp.Job, ops_per_second: float = 10.0) -> str:
         if op in (etp.OP_RIGHT, etp.OP_LEFT, etp.OP_DOWN, etp.OP_UP,
                   etp.OP_MICRO_DOWN, etp.OP_MICRO_UP):
             mech_ops += operand
+        elif op in (etp.OP_RIGHT_FINE, etp.OP_LEFT_FINE,
+                    etp.OP_DOWN_FINE, etp.OP_UP_FINE):
+            # One command whatever the distance, and it moves less than any
+            # keystroke can, so it costs about what a carriage step does.
+            mech_ops += 1
+        elif op == etp.OP_NO_ADVANCE:
+            mech_ops += 1
         elif op in (etp.OP_STRIKE, etp.OP_STRIKE_NA, etp.OP_CR):
             mech_ops += 1
         elif op == etp.OP_NEWLINE:

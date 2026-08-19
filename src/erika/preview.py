@@ -22,14 +22,22 @@ import numpy as np
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from erika import erika_codes as ec
 from erika.planner import Plan
 
 
 def _canvas_shape(plan: Plan) -> tuple[int, int]:
-    """Match the padded mockup shape optimize.py produces."""
+    """Match the padded mockup shape optimize.py produces.
+
+    The padding is the largest layer offset, in pixels. For a scheme built from
+    halves that is ``ch // 2`` and ``cw // 2``, which is what this was before and
+    what optimize.py produces -- but a quarter-cell scheme offsets a layer by
+    three quarters, and a canvas padded by half a cell would clip its last row
+    and column.
+    """
     ch, cw = plan.charset.cell_h, plan.charset.cell_w
-    pad_v = ch // 2 if any(ov for ov, _ in plan.layer_offsets) else 0
-    pad_h = cw // 2 if any(oh for _, oh in plan.layer_offsets) else 0
+    pad_v = int(max((ov for ov, _ in plan.layer_offsets), default=0) * ch)
+    pad_h = int(max((oh for _, oh in plan.layer_offsets), default=0) * cw)
     return plan.rows * ch + pad_v, plan.cols * cw + pad_h
 
 
@@ -61,9 +69,16 @@ def render(
 
     rng = np.random.default_rng(seed)
     strikes = plan.strikes[:upto] if upto is not None else plan.strikes
+    # Pixels per motor step, for the sub-half-cell residue a --fine plan
+    # carries. Zero residue on every plan built from half-cell offsets, so this
+    # arithmetic changes nothing for them.
+    px_per_platen_step = ch / (2 * ec.PLATEN_STEPS_PER_HALF_LINE)
+    px_per_carriage_step = cw / (
+        2 * ec.carriage_steps_per_half_step(plan.charset.pitch)
+    )
     for s in strikes:
-        top = s.y * (ch // 2) + pad
-        left = s.x * (cw // 2) + pad
+        top = s.y * (ch // 2) + pad + int(round(s.fy * px_per_platen_step))
+        left = s.x * (cw // 2) + pad + int(round(s.fx * px_per_carriage_step))
         if jitter:
             top += int(round(rng.normal(0, jitter * ch)))
             left += int(round(rng.normal(0, jitter * cw)))

@@ -342,6 +342,7 @@ def plan_and_encode(args, choices_path: str) -> tuple[planner.Plan, etp.Job]:
         charset,
         home_each_row=not args.no_home,
         boustrophedon=not args.no_serpentine,
+        fine=args.fine,
     )
     job = planner.encode(plan, settle_ms=args.settle_ms, cr_delay_ms=args.cr_delay_ms,
                          no_advance=args.no_advance)
@@ -1161,6 +1162,13 @@ def _add_plan_args(p):
                    help="pause after each carriage return, in ms")
     p.add_argument("--jitter", type=float, default=0.05,
                    help="registration error for the shaky preview, in cells (default 0.05)")
+    p.add_argument("--fine", action="store_true",
+                   help="place strikes with the machine's own motor steps "
+                        "(1/120 inch across, 1/240 down) where a layer offset "
+                        "falls between the half-cell grid points -- which is what "
+                        "makes the quarter-cell schemes (16x1) and daisy_full "
+                        "typeable. UNCONFIRMED: needs 0xA5 and 0xA6, so type "
+                        "`erika.pipeline codes` first")
     p.add_argument("--no-advance", action="store_true",
                    help="type a stack of glyphs in one cell with Doppeldruck "
                         "(0xA9) instead of a backspace between each pair, so the "
