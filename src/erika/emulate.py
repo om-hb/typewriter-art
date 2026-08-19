@@ -34,24 +34,87 @@ class EmulationError(RuntimeError):
     pass
 
 
-def expand(body: bytes) -> list[int]:
-    """Opcodes -> the raw byte stream the firmware sends to the typewriter."""
+def _step_chunks(code: int, steps: int) -> list[int]:
+    """One direct-step run as the bytes the firmware would send for it.
+
+    A deliberate re-implementation of ``startStepChunk()``, in the same spirit
+    as ``expand()`` itself: one command carries at most 127 steps, and the
+    platen refuses four counts in the middle of its range, so a run comes out as
+    a sequence of pairs. If this and the firmware disagree, one of them is wrong
+    and the test suite says which.
+    """
     out: list[int] = []
+    while steps:
+        take = max(-ec.MAX_STEPS_PER_COMMAND, min(ec.MAX_STEPS_PER_COMMAND, steps))
+        if code == ec.PLATEN_STEPS and abs(take) in ec.FORBIDDEN_PLATEN_STEPS:
+            take = 2 if take > 0 else -2
+        out += [code, ec.encode_step_operand(take)]
+        steps -= take
+    return out
+
+
+#: The three settings behind the firmware's ``IMG STEPS``.
+STEPS_OFF = "off"
+STEPS_AUTO = "auto"
+STEPS_ALL = "all"
+
+
+def _use_steps(mode: str, code: int, steps: int, keystrokes: int) -> bool:
+    """Would this move go out as step commands? Mirrors ``stepsAreWorthIt()``.
+
+    Two bytes per command against one per keystroke, and strictly fewer rather
+    than no worse -- a tie stays on the mechanism that has been on paper.
+    """
+    if mode == STEPS_ALL:
+        return True
+    if mode == STEPS_OFF:
+        return False
+    if mode != STEPS_AUTO:
+        raise EmulationError(f"unknown direct-step mode {mode!r}")
+    return len(_step_chunks(code, steps)) < keystrokes
+
+
+def expand(body: bytes, direct_steps: str = STEPS_OFF, pitch: int = 10) -> list[int]:
+    """Opcodes -> the raw byte stream the firmware sends to the typewriter.
+
+    ``direct_steps`` mirrors the firmware's ``IMG STEPS``: "auto" sends a move as
+    a count of absolute motor steps wherever that is fewer bytes than the
+    keystrokes would be, "all" does it everywhere. Every setting has to put the
+    head in the same place, which is what
+    ``test_direct_steps_land_where_the_keystrokes_would`` checks -- offline,
+    because the alternative is finding out on an hour of paper.
+    """
+    out: list[int] = []
+    per_half_step = ec.carriage_steps_per_half_step(pitch)
     for _, op, operand in etp.iter_ops(body):
         if op == etp.OP_END:
             break
         elif op in (etp.OP_RIGHT, etp.OP_LEFT):
             right = op == etp.OP_RIGHT
+            keystrokes = operand // 2 + (operand & 1)
+            steps = operand * per_half_step
+            if _use_steps(direct_steps, ec.CARRIAGE_STEPS, steps, keystrokes):
+                out += _step_chunks(ec.CARRIAGE_STEPS, steps if right else -steps)
+                continue
             # Full steps first, then the odd half -- same order as the firmware.
             out += [ec.SPACE if right else ec.BACKSPACE] * (operand // 2)
             if operand & 1:
                 out.append(ec.HALF_STEP_FORWARD if right else ec.HALF_STEP_BACK)
         elif op in (etp.OP_DOWN, etp.OP_UP):
-            code = ec.HALF_LINE_FORWARD if op == etp.OP_DOWN else ec.HALF_LINE_BACK
-            out += [code] * operand
+            down = op == etp.OP_DOWN
+            steps = operand * ec.PLATEN_STEPS_PER_HALF_LINE
+            if _use_steps(direct_steps, ec.PLATEN_STEPS, steps, operand):
+                out += _step_chunks(ec.PLATEN_STEPS, steps if down else -steps)
+                continue
+            out += [ec.HALF_LINE_FORWARD if down else ec.HALF_LINE_BACK] * operand
         elif op in (etp.OP_MICRO_DOWN, etp.OP_MICRO_UP):
-            code = ec.MICRO_LINE_FORWARD if op == etp.OP_MICRO_DOWN else ec.MICRO_LINE_BACK
-            out += [code] * operand
+            down = op == etp.OP_MICRO_DOWN
+            # A micro line is a twentieth of a line, which is two steps.
+            steps = 2 * operand
+            if _use_steps(direct_steps, ec.PLATEN_STEPS, steps, operand):
+                out += _step_chunks(ec.PLATEN_STEPS, steps if down else -steps)
+                continue
+            out += [ec.MICRO_LINE_FORWARD if down else ec.MICRO_LINE_BACK] * operand
         elif op == etp.OP_CR:
             out.append(ec.CARRIAGE_RETURN)
         elif op == etp.OP_NEWLINE:
@@ -210,9 +273,12 @@ class Typewriter:
         return self
 
 
-def type_job(job: etp.Job, max_columns: int = 65) -> Typewriter:
+def type_job(job: etp.Job, max_columns: int = 65,
+             direct_steps: str = STEPS_OFF) -> Typewriter:
     """Run a whole print job through the virtual machine."""
-    return Typewriter(max_columns=max_columns, pitch=job.pitch).run(expand(job.body))
+    return Typewriter(max_columns=max_columns, pitch=job.pitch).run(
+        expand(job.body, direct_steps=direct_steps, pitch=job.pitch)
+    )
 
 
 def impressions_to_strikes(machine: Typewriter, charset) -> list:

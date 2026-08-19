@@ -109,6 +109,14 @@ def test_firmware_motion_codes_match_python():
         "ERIKA_MICRO_LINE_FWD": ec.MICRO_LINE_FORWARD,
         "ERIKA_MICRO_LINE_BACK": ec.MICRO_LINE_BACK,
         "ERIKA_SET_STRIKE_FORCE": ec.SET_STRIKE_FORCE,
+        # Unused by default -- IMG STEPS and IMG ACK turn them on -- but mirrored
+        # by hand all the same, and a mirrored constant is a constant that drifts.
+        "ERIKA_CARRIAGE_STEPS": ec.CARRIAGE_STEPS,
+        "ERIKA_PLATEN_STEPS": ec.PLATEN_STEPS,
+        "ERIKA_CARRIAGE_STEPS_PER_INCH": ec.CARRIAGE_STEPS_PER_INCH,
+        "ERIKA_PLATEN_STEPS_PER_INCH": ec.PLATEN_STEPS_PER_INCH,
+        "ERIKA_MAX_STEPS_PER_COMMAND": ec.MAX_STEPS_PER_COMMAND,
+        "ERIKA_REPORT_WHEN_PRINTED": 0x96,
     }
     for name, value in expected.items():
         assert defines.get(name) == value, f"{name} differs from erika_codes.py"
@@ -2101,3 +2109,137 @@ def test_the_probe_sheets_two_combs_ask_for_the_same_distance(tmp_path):
     combs = [xs for xs in rows.values() if len(xs) == 20]
     assert len(combs) == 2, "expected the escapement comb and the stepped one"
     assert combs[0] == combs[1]
+
+
+# ---------------------------------------------------------------------------
+# direct step expansion (IMG STEPS ON -- erika_ai/src/erika_image.cpp)
+# ---------------------------------------------------------------------------
+
+
+MODES = (emulate.STEPS_OFF, emulate.STEPS_AUTO, emulate.STEPS_ALL)
+
+
+@pytest.mark.parametrize("mode", MODES)
+@pytest.mark.parametrize("home_each_row", [True, False])
+@pytest.mark.parametrize("pitch", ["sigma-10", "sigma-12"])
+def test_direct_steps_land_where_the_keystrokes_would(tmp_path, pitch,
+                                                      home_each_row, mode):
+    """The claim `IMG STEPS` rests on, checked on a whole plan.
+
+    A move can go out as a run of SPACE and half-step keys or as a count of
+    1/120" carriage steps, and "auto" mixes the two within a single job. All
+    three have to put the head in the same place -- so the setting is a matter of
+    bytes and units rather than of geometry, and switching it does not change
+    the picture. If they disagree the difference is a whole print job of drift,
+    and here is the only cheap place to notice.
+    """
+    cs = Charset.load(pitch, SRC)
+    plan = planner.build_plan(
+        _write_choices(tmp_path, _random_choices(cs, 7, 11, FOUR_LAYERS, seed=5)),
+        cs,
+        home_each_row=home_each_row,
+    )
+    job = planner.encode(plan)
+
+    keystrokes = emulate.type_job(job, max_columns=cs.max_columns)
+    stepped = emulate.type_job(job, max_columns=cs.max_columns, direct_steps=mode)
+
+    assert stepped.impressions == keystrokes.impressions
+    assert stepped.overruns == keystrokes.overruns == 0
+
+
+def test_using_step_commands_for_everything_costs_bytes(tmp_path, charset):
+    """The measurement that made the setting three-state rather than a switch.
+
+    A step command is two bytes whatever the distance and a keystroke run is one
+    byte per half cell, so the commands lose on the one-cell hops that most of a
+    picture is made of. "all" is for the units, not the bytes, and saying so
+    needs this to be a number rather than an impression.
+    """
+    plan = planner.build_plan(
+        _write_choices(tmp_path, _random_choices(charset, 8, 20, FOUR_LAYERS,
+                                                 seed=3, density=0.25)),
+        charset,
+    )
+    body = planner.encode(plan).body
+    plain = len(emulate.expand(body))
+    assert len(emulate.expand(body, direct_steps=emulate.STEPS_ALL)) > plain
+
+
+def test_auto_never_costs_more_bytes_than_the_keystrokes(tmp_path, charset):
+    """Which is the whole of what "auto" promises."""
+    for seed, density in ((3, 0.25), (4, 0.6), (5, 0.9)):
+        plan = planner.build_plan(
+            _write_choices(tmp_path, _random_choices(charset, 8, 20, FOUR_LAYERS,
+                                                     seed=seed, density=density)),
+            charset,
+        )
+        body = planner.encode(plan).body
+        assert (len(emulate.expand(body, direct_steps=emulate.STEPS_AUTO))
+                <= len(emulate.expand(body)))
+
+
+def test_auto_takes_the_long_moves_and_leaves_the_short_ones(tmp_path, charset):
+    """A blank run is where a print's time goes, and it is also the only place
+    the commands are cheaper -- so this is what "auto" has to be doing."""
+    short = etp.Encoder()
+    short.right(2)  # one cell: one SPACE against a two-byte command
+    assert emulate.expand(short.body(), direct_steps=emulate.STEPS_AUTO) == [ec.SPACE]
+
+    long_run = etp.Encoder()
+    long_run.right(20)  # ten cells
+    assert emulate.expand(long_run.body(), direct_steps=emulate.STEPS_AUTO) == [
+        ec.CARRIAGE_STEPS, 120,
+    ]
+
+
+def test_a_micro_line_is_two_platen_steps():
+    """Both sides have to agree on this or a sub-half-line offset moves the paper
+    a twentieth of a line in one expansion and a tenth in the other.
+
+    Three of them come to six steps, which the platen refuses, so they go out as
+    2 + 2 + 1 -- six bytes where the keystrokes were three. Exactly why "auto"
+    leaves a feed this small alone.
+    """
+    enc = etp.Encoder()
+    enc.micro_down(3)
+    assert emulate.expand(enc.body(), direct_steps=emulate.STEPS_ALL) == [
+        ec.PLATEN_STEPS, 2, ec.PLATEN_STEPS, 2, ec.PLATEN_STEPS, 2,
+    ]
+    assert emulate.expand(enc.body(), direct_steps=emulate.STEPS_AUTO) == [
+        ec.MICRO_LINE_FORWARD
+    ] * 3
+
+
+def test_a_long_move_is_split_into_commands_the_operand_can_carry():
+    enc = etp.Encoder()
+    enc.right(60)  # 60 half-steps = 360 carriage steps at pitch 10
+    raw = emulate.expand(enc.body(), direct_steps=emulate.STEPS_ALL)
+    counts = [ec.decode_step_operand(v) for v in raw[1::2]]
+    assert raw[0::2] == [ec.CARRIAGE_STEPS] * len(counts)
+    assert sum(counts) == 360
+    assert max(counts) <= ec.MAX_STEPS_PER_COMMAND
+
+
+def test_a_direct_feed_never_asks_the_platen_for_a_forbidden_count():
+    """The firmware splits these too, and it has to split them the same way."""
+    for half_lines in range(1, 12):
+        enc = etp.Encoder()
+        enc.down(half_lines)
+        raw = emulate.expand(enc.body(), direct_steps=emulate.STEPS_ALL)
+        counts = [ec.decode_step_operand(v) for v in raw[1::2]]
+        assert sum(counts) == half_lines * ec.PLATEN_STEPS_PER_HALF_LINE
+        assert not [c for c in counts if abs(c) in ec.FORBIDDEN_PLATEN_STEPS]
+
+
+@pytest.mark.skipif(NO_FIRMWARE, reason=NO_FIRMWARE_REASON)
+def test_the_firmware_has_the_same_three_settings():
+    """expand() is a re-implementation of fetchNext(), and a mode that exists on
+    only one side is a job that comes out differently on the machine than in the
+    check that cleared it."""
+    text = open(os.path.join(FIRMWARE_SRC, "erika_image.h"), encoding="utf-8").read()
+    match = re.search(r"enum DirectSteps\s*:\s*uint8_t\s*\{(.*?)\}", text, re.S)
+    assert match, "could not find the DirectSteps enum"
+    names = set(re.findall(r"Steps(\w+)\s*=", match.group(1)))
+    assert names == {"Off", "Auto", "All"}
+    assert {m.capitalize() for m in MODES} == names
