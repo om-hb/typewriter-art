@@ -247,6 +247,7 @@ erika.pipeline area       bracket the corners of the printable area (--rows, --c
 erika.pipeline sheet      type the charset, for scanning back in (--forces)
 erika.pipeline forces     sweep the strike-force command to see what it takes
                           (--from/--to/--step to widen it and keep it to a sheet)
+erika.pipeline codes      probe the control codes the pipeline does not use yet
 
 erika.send <file.etp>     upload over USB serial   (--port, --print, --watch)
 erika.send --diagnose     test the link step by step
@@ -292,10 +293,11 @@ neighbourhood rather than naming a value: sweep the neighbourhood again at
 `--step 1` to find where it starts and stops. Rows that come out lighter or darker than
 the reference are forces the machine took; a row with a stray character in front
 of the glyphs is a value it typed instead, which rules that value out. Every
-candidate is outside `0x71..0x82` on purpose -- on a machine that ignores the
-command the force byte arrives as an ordinary character, and a character in that
-range is a *motion*, which would shift the rest of the line and ruin the sheet
-exactly where it has to be read.
+candidate is a byte the type wheel could have typed on purpose -- on a machine
+that ignores the command the force byte arrives as an ordinary character, and
+above the wheel's own codes there is no ordinary character: only a *motion*,
+which would shift the rest of the line and ruin the sheet exactly where it has
+to be read, or a command that swallows the byte after it.
 
 With the answer, hardest first:
 
@@ -645,3 +647,43 @@ real figure. Until then plan on six sheets, and know the recovery path before
 you need it: note the pass number from `IMG STATUS`, change the ribbon, and
 resume with `IMG PRINT pass N`, which replays the paper feeds with the strikes
 suppressed (see [Typewriter art](../../../erika_ai/README.md#typewriter-art)).
+
+
+## The codes the pipeline does not use
+
+Eleven control codes drive everything above. The interface answers to about
+sixty, published for the Erika S3004 -- `erika_ai/ressources/steuercodes.md`,
+read against this pipeline in `docs/control-codes.md` at the workspace root.
+The Sigma shares that interface, which is a claim about a family of machines
+and not a measurement of this one.
+
+```bash
+python -m erika.pipeline codes
+python -m erika.send results/control_codes.etp --print
+```
+
+Nine sections, each with a reference typed beside it in codes already known to
+work, because "did it move a twelfth of an inch" is not answerable by looking
+at one mark. In order: the bell (which says whether a command with an operand
+is understood at all, without marking the paper), carriage steps and platen
+steps at `0xA5`/`0xA6`, the forbidden feed counts, Doppeldruck at `0xA9`,
+backward print at `0x8E`, the correction ribbon at `0x8C`, and 15 characters
+per inch at `0x89`. The command prints what to look for on each.
+
+The two that would change the most: `0xA5` and `0xA6` move in absolute
+1/120" and 1/240" steps rather than in fractions of whatever the slide
+switches are set to, which is both the finer grid the quarter-cell layer
+schemes need and the end of `PITCH_WIDTH_MM` being an assumption about a
+switch nobody can read. `0xA9` overstrikes without spending the escapement's
+repeatability on a backspace.
+
+These reach the machine through `OP_RAW`, the one opcode the firmware has no
+opinion about. That is deliberate and it is meant to be temporary: a raw byte
+is outside the position model, so it is outside the offline verification that
+the rest of this package is built around. A code that survives the sheet
+should stop being raw and become an opcode that `planner`, `etp.disassemble`
+and `emulate` all understand.
+
+`0x96`, the completion report, is not on the sheet. It changes when RTS is
+released rather than what is typed, so the firmware's pacing answers it and
+ink cannot.

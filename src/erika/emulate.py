@@ -62,6 +62,8 @@ def expand(body: bytes) -> list[int]:
             # Two bytes: the command, then the force. The firmware sends them
             # as a pending byte plus a tail byte, in this order.
             out += [ec.SET_STRIKE_FORCE, operand]
+        elif op == etp.OP_RAW:
+            out.append(operand)
         elif op == etp.OP_DELAY:
             pass  # timing only; nothing reaches the paper
         else:
@@ -84,7 +86,16 @@ class Typewriter:
     """A carriage, a platen, and a sheet of paper.
 
     Positions are in half-steps / half-lines, so they line up directly with
-    the planner's coordinates.
+    the planner's coordinates. The direct-step codes move by a fraction of
+    those, so there is a residue underneath each -- see `_x_fine`.
+
+    What this models and what it merely *records* is the distinction to keep in
+    view. The keystroke motions, the strike force and the direct step commands
+    are modelled, because a plan's placement depends on them and offline
+    verification is the point of the whole arrangement. The mode switches are
+    recorded in `probes` and otherwise ignored: what 0x8E or 0x8C do to this
+    machine is what `erika.pipeline codes` exists to find out, and a guess here
+    would be a guess that the test suite then certifies.
     """
 
     x: int = 0
@@ -93,10 +104,22 @@ class Typewriter:
     #: Set when the carriage is driven past the machine's physical limit.
     overruns: int = 0
     max_columns: int = 65
+    #: Pitch, which is what a 1/120" carriage step is a fraction *of*.
+    pitch: int = 10
     #: The strike force in effect. None until a job sets one.
     force: int | None = None
+    #: Every control code the machine was sent that this model does not act on,
+    #: as (code, operand or None). Empty for an ordinary print job.
+    probes: list[tuple[int, int | None]] = field(default_factory=list)
     #: True between ERIKA_SET_STRIKE_FORCE and the byte that names the force.
     _awaiting_force: bool = False
+    #: The control code whose operand byte is expected next, if any.
+    _awaiting_operand: int | None = None
+    #: 0xA9 seen: the next strike prints where it stands.
+    _no_advance: bool = False
+    #: Sub-half-step and sub-half-line residue, in the machine's own motor steps.
+    _x_fine: int = 0
+    _y_fine: int = 0
 
     def feed(self, code: int) -> None:
         # The force command swallows the byte after it, whatever that byte is.
@@ -110,6 +133,39 @@ class Typewriter:
             return
         if code == ec.SET_STRIKE_FORCE:
             self._awaiting_force = True
+            return
+
+        # A command that takes a step count: apply it, in the mechanism's own
+        # units, and carry whole half-steps up into the position the planner
+        # thinks in. divmod floors, which is what makes a backwards residue come
+        # out right.
+        if self._awaiting_operand is not None:
+            command, self._awaiting_operand = self._awaiting_operand, None
+            steps = ec.decode_step_operand(code)
+            if command == ec.CARRIAGE_STEPS:
+                self._x_fine += steps
+                carry, self._x_fine = divmod(
+                    self._x_fine, ec.carriage_steps_per_half_step(self.pitch)
+                )
+                self._move(carry)
+            elif command == ec.PLATEN_STEPS:
+                self._y_fine += steps
+                carry, self._y_fine = divmod(
+                    self._y_fine, ec.PLATEN_STEPS_PER_HALF_LINE
+                )
+                self.y += carry
+            else:
+                self.probes.append((command, code))
+            return
+        if code in ec.OPERAND_CODES:
+            self._awaiting_operand = code
+            return
+        if code == 0xA9:  # Doppeldruck: print the next character where we stand
+            self._no_advance = True
+            return
+        if code in ec.CONTROL_CODE_NAMES and code not in ec.CONTROL_CODES:
+            # A mode switch, or something else this model has no opinion about.
+            self.probes.append((code, None))
             return
 
         if code == ec.SPACE:
@@ -138,8 +194,9 @@ class Typewriter:
             if glyph is None:
                 raise EmulationError(f"struck unknown key 0x{code:02X}")
             self.impressions.append(Impression(self.y, self.x, code, self.force))
-            if glyph.advances:
+            if glyph.advances and not self._no_advance:
                 self._move(2)
+            self._no_advance = False
 
     def _move(self, half_steps: int) -> None:
         self.x += half_steps
@@ -155,7 +212,7 @@ class Typewriter:
 
 def type_job(job: etp.Job, max_columns: int = 65) -> Typewriter:
     """Run a whole print job through the virtual machine."""
-    return Typewriter(max_columns=max_columns).run(expand(job.body))
+    return Typewriter(max_columns=max_columns, pitch=job.pitch).run(expand(job.body))
 
 
 def impressions_to_strikes(machine: Typewriter, charset) -> list:

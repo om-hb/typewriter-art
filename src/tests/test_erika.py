@@ -1920,3 +1920,184 @@ def test_align_refuses_to_overwrite_its_own_input():
             base_path=SRC, destination=same,
         )
     assert os.path.getsize(os.path.join(SRC, same)) > 0
+
+
+# ---------------------------------------------------------------------------
+# raw bytes and direct step control (erika/etp.py, erika/emulate.py)
+# ---------------------------------------------------------------------------
+
+
+def test_a_raw_command_will_not_go_out_without_its_operand():
+    """The mistake that breaks the machine rather than the file.
+
+    A command that takes an operand and is sent without one leaves the machine
+    reading whatever comes next as its count. The file is intact, the CRC
+    passes, and the firmware -- which has no opinion about raw bytes -- has
+    nothing to notice.
+    """
+    enc = etp.Encoder()
+    with pytest.raises(etp.EtpError, match="takes an operand"):
+        enc.raw_command(ec.CARRIAGE_STEPS)
+    with pytest.raises(etp.EtpError, match="takes no operand"):
+        enc.raw_command(0x8E, 1)
+
+
+def test_a_move_longer_than_one_command_is_split():
+    enc = etp.Encoder()
+    enc.carriage_steps(300)
+    operands = [operand for _, op, operand in etp.iter_ops(enc.body())
+                if op == etp.OP_RAW]
+    # command, count, command, count, ... and the counts come to 300.
+    assert operands[0::2] == [ec.CARRIAGE_STEPS] * 3
+    assert sum(ec.decode_step_operand(v) for v in operands[1::2]) == 300
+
+
+def test_a_backwards_move_uses_the_tables_own_two_s_complement():
+    enc = etp.Encoder()
+    enc.carriage_steps(-12)
+    operands = [operand for _, op, operand in etp.iter_ops(enc.body())
+                if op == etp.OP_RAW]
+    assert operands == [ec.CARRIAGE_STEPS, 0xF4]  # 256 - 12
+    assert ec.decode_step_operand(0xF4) == -12
+
+
+@pytest.mark.parametrize("steps", list(range(1, 20)) + [40, 127, -5, -40])
+def test_a_platen_feed_never_asks_for_a_forbidden_step_count(steps):
+    """"Die Schritte 3, 4, 5, 6 sind verboten!" -- so a feed that lands on one
+    has to be split, and the split has to come to the same distance."""
+    enc = etp.Encoder()
+    enc.platen_steps(steps)
+    operands = [operand for _, op, operand in etp.iter_ops(enc.body())
+                if op == etp.OP_RAW]
+    counts = [ec.decode_step_operand(v) for v in operands[1::2]]
+    assert operands[0::2] == [ec.PLATEN_STEPS] * len(counts)
+    assert sum(counts) == steps
+    assert not [c for c in counts if abs(c) in ec.FORBIDDEN_PLATEN_STEPS]
+
+
+@pytest.mark.parametrize("pitch", (10, 12))
+def test_carriage_steps_and_the_escapement_come_to_the_same_place(pitch):
+    """The claim the probe sheet is built to test, checked against the model.
+
+    A cell asked for in 1/120" steps has to land where a cell asked for as two
+    half-steps lands, or the two ways of moving the head cannot be mixed -- and
+    mixing them is the whole point of adding the direct commands.
+    """
+    cell = 2 * ec.carriage_steps_per_half_step(pitch)
+
+    stepped = etp.Encoder()
+    for _ in range(20):
+        stepped.strike(ec.glyph_for_char("!").code)
+        stepped.carriage_steps(cell)
+
+    escapement = etp.Encoder()
+    for _ in range(20):
+        escapement.strike(ec.glyph_for_char("!").code)
+        escapement.right(2)
+
+    def marks(enc):
+        machine = emulate.Typewriter(pitch=pitch).run(emulate.expand(enc.body()))
+        return [(i.y, i.x) for i in machine.impressions]
+
+    assert marks(stepped) == marks(escapement)
+
+
+def test_a_step_smaller_than_a_half_step_is_carried_rather_than_lost():
+    """Quarter-cell offsets rest on this: three carriage steps at pitch 10 are a
+    quarter of a cell, and four of them have to come to one whole cell rather
+    than to nothing four times over."""
+    enc = etp.Encoder()
+    for _ in range(4):
+        enc.carriage_steps(3)  # a quarter cell at pitch 10
+    enc.strike(ec.glyph_for_char("!").code)
+    machine = emulate.Typewriter(pitch=10).run(emulate.expand(enc.body()))
+    assert [(i.y, i.x) for i in machine.impressions] == [(0, 2)]  # one whole cell
+
+
+def test_no_advance_prints_the_next_glyph_where_the_head_stands():
+    """0xA9 in the order a plan would use it: the code, the glyphs that stack,
+    and then the one that moves on."""
+    enc = etp.Encoder()
+    enc.raw(0xA9)
+    enc.strike(ec.glyph_for_char("-").code)
+    enc.strike(ec.glyph_for_char("O").code)
+    enc.strike(ec.glyph_for_char("X").code)
+    machine = emulate.Typewriter().run(emulate.expand(enc.body()))
+    assert [(i.x, ec.describe_code(i.code)) for i in machine.impressions] == [
+        (0, "'-'"), (0, "'O'"), (2, "'X'"),
+    ]
+
+
+def test_the_emulator_records_a_mode_switch_rather_than_guessing_at_it():
+    """What 0x8E does to this machine is what the probe sheet exists to find
+    out. A model that assumed an answer would have the test suite certify it."""
+    enc = etp.Encoder()
+    enc.raw(0x8E)
+    enc.raw_command(0xAA, 4)
+    enc.strike(ec.glyph_for_char("A").code)
+    machine = emulate.Typewriter().run(emulate.expand(enc.body()))
+    assert machine.probes == [(0x8E, None), (0xAA, 4)]
+    assert [(i.x) for i in machine.impressions] == [0]  # nothing moved the head
+
+
+def test_the_disassembly_says_which_bytes_its_columns_do_not_account_for():
+    enc = etp.Encoder()
+    enc.raw(0x8E)
+    enc.strike(ec.glyph_for_char("A").code)
+    enc.end()
+    text = etp.disassemble(etp.Job(body=enc.body()))
+    assert "do NOT account for" in text
+    assert "BACKWARD_PRINT_ON" in text
+    # A job that only steps is fully modelled, so it gets no such warning.
+    plain = etp.Encoder()
+    plain.carriage_steps(12)
+    plain.end()
+    assert "do NOT account for" not in etp.disassemble(etp.Job(body=plain.body()))
+
+
+# ---------------------------------------------------------------------------
+# the control code probe sheet (erika.pipeline codes)
+# ---------------------------------------------------------------------------
+
+
+def _codes_sheet(tmp_path, *extra):
+    from erika import pipeline
+
+    out = os.path.join(tmp_path, "codes.etp")
+    assert pipeline.main(["codes", "-o", out, *extra]) == 0
+    return etp.load(out)
+
+
+@pytest.mark.parametrize("pitch", ("10", "12"))
+def test_the_probe_sheet_stays_on_the_paper(tmp_path, pitch):
+    """Every section returns the head to the margin, so a code that displaces it
+    cannot carry the error into the next section -- and nothing runs the
+    carriage off the end even if every probe does exactly what it says."""
+    job = _codes_sheet(tmp_path, "--pitch", pitch)
+    machine = emulate.type_job(job)
+    assert machine.overruns == 0
+
+
+def test_the_probe_sheet_asks_the_machine_the_questions_it_says_it_does(tmp_path):
+    job = _codes_sheet(tmp_path)
+    raw = [operand for _, op, operand in etp.iter_ops(job.body) if op == etp.OP_RAW]
+    for code in (0xAA, ec.CARRIAGE_STEPS, ec.PLATEN_STEPS, 0xA9, 0x8E, 0x8C, 0x89):
+        assert code in raw, f"the sheet never sends 0x{code:02X}"
+    # And it puts the pitch back, or everything typed after it comes out narrow.
+    assert raw[-1] == 0x87
+
+
+def test_the_probe_sheets_two_combs_ask_for_the_same_distance(tmp_path):
+    """Section 2's whole argument: the upper comb is typed with the escapement
+    and the lower one in 1/120" steps, and they are only comparable by eye if
+    the plan asked for the same place twice."""
+    job = _codes_sheet(tmp_path)
+    machine = emulate.type_job(job)
+    ruler = ec.glyph_for_char("!").code
+    rows = {}
+    for imp in machine.impressions:
+        if imp.code == ruler:
+            rows.setdefault(imp.y, []).append(imp.x)
+    combs = [xs for xs in rows.values() if len(xs) == 20]
+    assert len(combs) == 2, "expected the escapement comb and the stepped one"
+    assert combs[0] == combs[1]

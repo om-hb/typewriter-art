@@ -60,17 +60,19 @@ OP_MICRO_DOWN = 0x09  # n            n micro line steps down
 OP_MICRO_UP = 0x0A  # n            n micro line steps up
 OP_NEWLINE = 0x0B  # n            carriage return + n full line feeds
 OP_SET_FORCE = 0x0C  # n            strike force (Anschlagstärke) for what follows
+OP_RAW = 0x0D  # byte         send this byte to the machine, untouched
 
 _HAS_OPERAND = {
     OP_RIGHT, OP_LEFT, OP_DOWN, OP_UP, OP_STRIKE, OP_STRIKE_NA,
     OP_DELAY, OP_MICRO_DOWN, OP_MICRO_UP, OP_NEWLINE, OP_SET_FORCE,
+    OP_RAW,
 }
 
 OPCODE_NAMES = {
     OP_END: "END", OP_RIGHT: "RIGHT", OP_LEFT: "LEFT", OP_DOWN: "DOWN",
     OP_UP: "UP", OP_CR: "CR", OP_STRIKE: "STRIKE", OP_STRIKE_NA: "STRIKE_NA",
     OP_DELAY: "DELAY", OP_MICRO_DOWN: "MICRO_DOWN", OP_MICRO_UP: "MICRO_UP",
-    OP_NEWLINE: "NEWLINE", OP_SET_FORCE: "SET_FORCE",
+    OP_NEWLINE: "NEWLINE", OP_SET_FORCE: "SET_FORCE", OP_RAW: "RAW",
 }
 
 MAX_OPERAND = 0xFF
@@ -241,6 +243,96 @@ class Encoder:
             )
         self._emit(OP_SET_FORCE, force)
 
+    # -- probing -----------------------------------------------------------
+    def raw(self, byte: int) -> None:
+        """Put one byte on the wire exactly as given.
+
+        The escape hatch, and the only opcode about which the firmware has no
+        opinion at all. It exists because the interface answers to about sixty
+        control codes and this pipeline uses eleven of them, and the only way to
+        find out what the other fifty do on *this* machine is to send them and
+        look at the paper. ``erika.pipeline codes`` is that sheet.
+
+        What it costs, and why nothing but a probe sheet should use it:
+
+        - Neither the firmware nor ``disassemble`` nor the emulator knows what
+          the byte does, beyond the handful in ``erika_codes.CONTROL_CODE_NAMES``
+          they have been taught. Offline verification against the optimizer's
+          mockup -- the property the whole .etp arrangement exists for -- is only
+          as good as that model.
+        - Several codes take the byte after them as an operand, so a raw command
+          is two raw bytes and getting the pair wrong desynchronises the machine
+          rather than the file. ``raw_command`` is the way to say it that cannot
+          get that wrong.
+        - The firmware pays a full character delay for a raw byte, being unable
+          to tell a mode switch from an inch of carriage travel. A command that
+          moves further than that wants an explicit ``delay_ms`` after it.
+        - A job containing raw bytes cannot be resumed part-way with
+          ``IMG PRINT pass N``: the firmware replays them, because a raw byte is
+          more often machine state than motion, and replaying a *motion* while
+          fast-forwarding would type the rest of the sheet in the wrong place.
+
+        Once a code has been settled on paper it should stop being raw and
+        become an opcode with a position model, which is what the rest of the
+        chain needs in order to keep checking itself.
+        """
+        if not 0 <= byte <= 0xFF:
+            raise EtpError(f"raw byte {byte} is not a byte")
+        self._emit(OP_RAW, byte)
+
+    def raw_command(self, code: int, operand: int | None = None) -> None:
+        """One control code and, where it takes one, its operand.
+
+        Refuses the two ways of getting the pair wrong: an operand for a code
+        that does not take one, and -- the one that matters -- no operand for a
+        code that does, which leaves the machine treating whatever comes next as
+        the count. The file would be intact and the CRC would pass.
+        """
+        from erika import erika_codes as ec
+
+        wants = code in ec.OPERAND_CODES
+        if wants and operand is None:
+            raise EtpError(
+                f"0x{code:02X} ({ec.describe_code(code)}) takes an operand -- "
+                "without one the machine reads the next byte as its own"
+            )
+        if operand is not None and not wants:
+            raise EtpError(
+                f"0x{code:02X} ({ec.describe_code(code)}) takes no operand"
+            )
+        self.raw(code)
+        if operand is not None:
+            self.raw(operand)
+
+    def carriage_steps(self, steps: int) -> None:
+        """Move the carriage by a signed count of 1/120" steps, via 0xA5."""
+        from erika import erika_codes as ec
+
+        while steps:
+            take = max(-ec.MAX_STEPS_PER_COMMAND,
+                       min(ec.MAX_STEPS_PER_COMMAND, steps))
+            self.raw_command(ec.CARRIAGE_STEPS, ec.encode_step_operand(take))
+            steps -= take
+
+    def platen_steps(self, steps: int) -> None:
+        """Feed the paper by a signed count of 1/240" steps, via 0xA6.
+
+        Splits around the counts the table forbids as well as around the
+        operand's range: a run of five goes out as 2 + 2 + 1 rather than as one
+        command the mechanism is documented to refuse.
+        """
+        from erika import erika_codes as ec
+
+        while steps:
+            take = max(-ec.MAX_STEPS_PER_COMMAND,
+                       min(ec.MAX_STEPS_PER_COMMAND, steps))
+            if abs(take) in ec.FORBIDDEN_PLATEN_STEPS:
+                # Split off a 2 and let the loop deal with what is left, which is
+                # 1, 2 or a 2-and-something -- never a forbidden count again.
+                take = 2 if take > 0 else -2
+            self.raw_command(ec.PLATEN_STEPS, ec.encode_step_operand(take))
+            steps -= take
+
     def delay_ms(self, ms: int) -> None:
         self._repeat(OP_DELAY, round(ms / 10))
 
@@ -318,14 +410,36 @@ def disassemble(job: Job, limit: int | None = None) -> str:
     """
     from erika import erika_codes as ec
 
+    raw = [operand for _, op, operand in iter_ops(job.body) if op == OP_RAW]
+    unmodelled = sorted(
+        {
+            b
+            for b in raw
+            if b not in ec.OPERAND_CODES and b != 0xA9 and b in ec.CONTROL_CODE_NAMES
+        }
+    )
     lines = [
         f"; ETP1  grid {job.cols}x{job.rows}  strikes {job.strikes}  "
         f"pitch {job.pitch}  home_each_row {job.home_each_row}",
         f"; body {len(job.body)} bytes",
-        ";  offset  col   row  opcode",
     ]
+    if unmodelled:
+        # Said out loud rather than passed over: the columns below are a model,
+        # and these bytes are outside it. Most are mode switches with no effect
+        # on position, but "most" is not the same as "checked".
+        lines.append(
+            "; the column and row below do NOT account for "
+            + ", ".join(f"0x{b:02X} {ec.CONTROL_CODE_NAMES[b]}" for b in unmodelled)
+        )
+    lines.append(";  offset  col   row  opcode")
     x = y = 0  # half-steps from left margin, half-lines from the datum
+    # Sub-half-step and sub-half-line residue, in the machine's own motor steps.
+    # Only 0xA5 and 0xA6 can produce it, and only through OP_RAW.
+    x_fine = y_fine = 0
+    per_half_step = ec.carriage_steps_per_half_step(job.pitch)
     force: int | None = None
+    pending_raw: int | None = None  # a raw command waiting for its operand byte
+    no_advance = False  # 0xA9 seen: the next strike does not move the carriage
     n = 0
     for off, op, operand in iter_ops(job.body):
         if op == OP_RIGHT:
@@ -341,12 +455,38 @@ def disassemble(job: Job, limit: int | None = None) -> str:
         elif op == OP_NEWLINE:
             x, y = 0, y + 2 * operand
         elif op == OP_STRIKE:
-            x += 2
+            if no_advance:
+                no_advance = False
+            else:
+                x += 2
         elif op == OP_SET_FORCE:
             force = operand
+        elif op == OP_RAW:
+            if pending_raw is not None:
+                steps = ec.decode_step_operand(operand)
+                if pending_raw == ec.CARRIAGE_STEPS:
+                    x_fine += steps
+                    carry, x_fine = divmod(x_fine, per_half_step)
+                    x += carry
+                elif pending_raw == ec.PLATEN_STEPS:
+                    y_fine += steps
+                    carry, y_fine = divmod(y_fine, ec.PLATEN_STEPS_PER_HALF_LINE)
+                    y += carry
+                pending_raw = None
+            elif operand in ec.OPERAND_CODES:
+                pending_raw = operand
+            elif operand == 0xA9:
+                no_advance = True
 
         text = OPCODE_NAMES[op]
-        if op in (OP_STRIKE, OP_STRIKE_NA):
+        if op == OP_RAW:
+            text = f"{text:<9} 0x{operand:02X}"
+            named = ec.CONTROL_CODE_NAMES.get(operand)
+            if pending_raw is not None and pending_raw == operand:
+                text += f"  {named} (operand follows)"
+            elif named:
+                text += f"  {named}"
+        elif op in (OP_STRIKE, OP_STRIKE_NA):
             g = ec.glyph_for_code(operand)
             label = repr(g.char) if g else f"0x{operand:02X}"
             # The force in force is what this strike lands with, and a picture

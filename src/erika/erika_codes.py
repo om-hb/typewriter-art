@@ -175,6 +175,74 @@ def is_usable_force(value: int) -> bool:
 
 
 # --------------------------------------------------------------------------
+# Direct step control
+# --------------------------------------------------------------------------
+# 0xA5 and 0xA6 drive the carriage and the platen by a count of motor steps
+# rather than by a keystroke's worth of movement, and the step is an absolute
+# fraction of an inch rather than a fraction of whatever the slide switches are
+# set to. That is what makes them worth having: SPACE and the half-step key move
+# the carriage by a share of the current pitch, and nothing in a print job can
+# check what the pitch switch is actually set to.
+#
+# None of this has been on paper yet. `python -m erika.pipeline codes` is the
+# sheet that answers it.
+CARRIAGE_STEPS = 0xA5  #: next byte is a signed count of 1/120" carriage steps
+PLATEN_STEPS = 0xA6  #: next byte is a signed count of 1/240" platen steps
+WHEEL_STEPS = 0xA7  #: next byte is a signed count of 3.6 deg wheel steps
+RIBBON_STEPS = 0xA8  #: next byte is a count of 10 deg ribbon steps
+
+#: One inch, in each mechanism's own steps.
+CARRIAGE_STEPS_PER_INCH = 120
+PLATEN_STEPS_PER_INCH = 240
+
+#: Platen step counts the table marks as forbidden ("Die Schritte 3, 4, 5, 6
+#: sind verboten!"). 1 and 2 are fine and so is anything from 7 up, so a feed
+#: that lands on one of these has to be split -- five steps go out as 2 + 2 + 1.
+#: No reason is given; treat it as a property of the mechanism.
+FORBIDDEN_PLATEN_STEPS = frozenset({3, 4, 5, 6})
+
+
+def carriage_steps_per_half_step(pitch: int) -> int:
+    """1/120" steps to one half of a character cell.
+
+    Six at pitch 10, five at pitch 12, four at pitch 15 -- all whole, which is
+    what lets a half-step be expressed as a step count without rounding. A
+    quarter of a cell is three steps at pitch 10 and two at pitch 15, but two
+    and a half at pitch 12, which is why quarter-cell offsets are not a
+    pitch-12 feature.
+    """
+    steps = CARRIAGE_STEPS_PER_INCH / (2 * pitch)
+    if steps != int(steps):
+        raise ValueError(f"pitch {pitch} does not divide the carriage's step")
+    return int(steps)
+
+
+#: 1/240" platen steps to half a line, at line spacing 1. The table gives a full
+#: line as 40 motor steps, which is the same number from the other direction.
+PLATEN_STEPS_PER_HALF_LINE = PLATEN_STEPS_PER_INCH // 12
+
+
+def encode_step_operand(steps: int) -> int:
+    """Signed step count -> the operand byte, as the table spells it.
+
+    "0…127 Schritte vorwärts; 256-(1..127) Schritte rückwärts" -- two's
+    complement in a byte, with 128 unreachable in either direction.
+    """
+    if not -127 <= steps <= 127:
+        raise ValueError(f"{steps} steps is outside the operand's range of ±127")
+    return steps & 0xFF
+
+
+def decode_step_operand(byte: int) -> int:
+    """The operand byte -> a signed step count."""
+    return byte - 256 if byte > 127 else byte
+
+
+#: The most one command can move, in each mechanism.
+MAX_STEPS_PER_COMMAND = 127
+
+
+# --------------------------------------------------------------------------
 # Physical geometry
 # --------------------------------------------------------------------------
 #: Character cell width in mm, by pitch (Schriftteilung 10 / 12).

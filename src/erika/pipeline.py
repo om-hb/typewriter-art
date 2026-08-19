@@ -17,6 +17,7 @@ Subcommands:
     area       mark the four corners of the printable area on a sheet
     sheet      an .etp that types the charset, for scanning back in
     forces     sweep the strike-force command, to find what this machine takes
+    codes      put the control codes the pipeline does not use yet on paper
 """
 
 from __future__ import annotations
@@ -780,6 +781,239 @@ def cmd_forces(args) -> int:
     return 0
 
 
+def cmd_codes(args) -> int:
+    """Put the control codes the pipeline does not use yet on paper.
+
+    The interface answers to about sixty control codes and this pipeline sends
+    eleven. The rest are published -- see erika_ai/ressources/steuercodes.md and
+    docs/control-codes.md in the workspace -- but published for an Erika S3004,
+    and this is a Sigma SM 8200i. They share an interface, which is a claim
+    about a family of machines and not a measurement of this one.
+
+    So: send them and look at the paper. Every section has a reference typed
+    beside it with codes that are already known to work, because "did it move a
+    twelfth of an inch" is not a question anyone can answer by looking at a mark
+    on its own.
+
+    Two properties keep the sheet readable when a code does nothing, or does
+    something else:
+
+    - Every row begins with a carriage return, so a section that displaces the
+      head cannot carry the error into the next one.
+    - The sections are ordered by how much they cost if they misbehave. The bell
+      first, because it says whether operand-carrying commands are understood at
+      all without marking the paper; pitch last, because it is the one setting
+      that would silently rescale everything after it.
+
+    One question this sheet cannot answer is 0x96, the completion report. Its
+    effect is on *timing* -- RTS held until the character is actually printed --
+    and timing lives in the firmware's delay table, not in the opcode stream.
+    """
+    per_half = ec.carriage_steps_per_half_step(args.pitch)
+    cell = 2 * per_half  # 1/120" steps to one character cell
+    n = 20
+
+    enc = etp.Encoder()
+    type_line(enc, "CONTROL CODE PROBE")
+    enc.newline(1)
+
+    # 1. The bell. No ink, and it is the cheapest possible answer to "does this
+    #    machine take a command with an operand at all" -- which every section
+    #    below depends on.
+    type_line(enc, "1 BELL 0xAA (LISTEN -- NOTHING IS TYPED)")
+    enc.raw_command(0xAA, 10)  # ~200 ms
+    enc.delay_ms(500)
+    enc.newline(1)
+
+    # 2. Carriage steps against the escapement. Two combs, one cell apart in
+    #    the same columns: if 0xA5 moves 1/120" the lower bars sit under the
+    #    upper ones.
+    type_line(enc, f"2 CARRIAGE STEPS 0xA5 ({cell} STEPS = ONE CELL AT PITCH {args.pitch})")
+    for _ in range(n):
+        enc.strike(ec.glyph_for_char(RULER_CHAR).code)
+        enc.right(2)
+    enc.newline(1)
+    for _ in range(n):
+        enc.strike(ec.glyph_for_char(RULER_CHAR).code)
+        enc.carriage_steps(cell)
+    enc.newline(2)
+
+    # 3. One long move against ten short ones. This is the case 0xA5 is worth
+    #    having for -- ten SPACE bytes and ten escapement steps become one
+    #    command -- and it is also where the operand's range gets exercised.
+    type_line(enc, "3 ONE LONG STEP AGAINST TEN SPACES")
+    enc.strike(ec.glyph_for_char(RULER_CHAR).code)
+    enc.right(2 * 9)  # nine more cells, the strike having taken one
+    enc.strike(ec.glyph_for_char(RULER_CHAR).code)
+    enc.newline(1)
+    enc.strike(ec.glyph_for_char(RULER_CHAR).code)
+    enc.carriage_steps(9 * cell)
+    enc.delay_ms(400)  # an inch of carriage travel, and the firmware cannot know
+    enc.strike(ec.glyph_for_char(RULER_CHAR).code)
+    enc.newline(2)
+
+    # 4. Platen steps against the line-feed mechanism. Four gaps each way, in
+    #    one column, so a feed that disturbs the carriage shows as a sideways
+    #    shift the way it does on the calibration sheet.
+    ladder = 18
+    full_line = 2 * ec.PLATEN_STEPS_PER_HALF_LINE
+    type_line(enc, f"4 PLATEN STEPS 0xA6 ({full_line} STEPS = ONE LINE)")
+    for _ in range(4):
+        enc.carriage_return()
+        enc.right(2 * ladder)
+        enc.strike(ec.glyph_for_char("_").code)
+        enc.newline(1)  # the reference: the detented line-feed mechanism
+    for _ in range(4):
+        enc.carriage_return()
+        enc.right(2 * ladder)
+        enc.strike(ec.glyph_for_char("_").code)
+        enc.platen_steps(full_line)  # the same distance, by motor steps
+    enc.newline(2)
+
+    # 5. The forbidden counts. Eight feeds of five steps come to one line, and
+    #    five is a count the table says the mechanism refuses -- so the encoder
+    #    splits it, and this is whether the split lands where the arithmetic
+    #    says it does.
+    #
+    #    Nine marks and eight feeds, so the first and last are exactly a line
+    #    apart -- eight marks would span seven gaps and land seven eighths of the
+    #    way down, which is not a distance anyone can check by eye.
+    fine = full_line // 8
+    type_line(enc, f"5 FINE FEED (EIGHT FEEDS OF {fine} STEPS = ONE LINE)")
+    for i in range(9):
+        enc.carriage_return()
+        enc.right(2 * ladder)
+        enc.strike(ec.glyph_for_char("-").code)
+        if i < 8:
+            enc.platen_steps(fine)
+    enc.newline(2)
+
+    # 6. Doppeldruck, in exactly the order a plan would use it: the code, then
+    #    every glyph in the stack but the last, then the last one to advance.
+    type_line(enc, "6 NO ADVANCE 0xA9 (O SHOULD BE STRUCK THROUGH)")
+    for _ in range(8):
+        enc.raw(0xA9)
+        enc.strike(ec.glyph_for_char("-").code)
+        enc.strike(ec.glyph_for_char("O").code)
+        enc.right(2)
+    enc.newline(2)
+
+    # 7. Backward printing. Five letters from a known column: forwards they run
+    #    away from it, backwards they run into it.
+    start = 20
+    type_line(enc, "7 BACKWARD PRINT 0x8E (ABCDE FROM COLUMN 20)")
+    enc.carriage_return()
+    enc.right(2 * start)
+    enc.raw(0x8E)
+    type_text(enc, "ABCDE")
+    enc.raw(0x8D)
+    enc.newline(2)
+
+    # 8. The correction ribbon. Both halves on one line and one of them left
+    #    alone, because what 0x8C does depends on the tape fitted and the
+    #    difference between "erased" and "never typed" is the reference.
+    type_line(enc, "8 CORRECTION 0x8C (RIGHT GROUP RETYPED THROUGH IT)")
+    type_row(enc, [(0, "MMMMM"), (10, "MMMMM")])
+    enc.carriage_return()
+    enc.right(2 * 10)
+    enc.raw(0x8C)
+    type_text(enc, "MMMMM")
+    enc.raw(0x8B)
+    enc.newline(2)
+
+    # 9. Pitch, last, because a pitch that sticks rescales everything after it.
+    pitch15 = 0x89
+    restore = 0x87 if args.pitch == 10 else 0x88
+    type_line(enc, "9 PITCH 15 0x89 (LOWER COMB SHOULD BE NARROWER)")
+    for _ in range(15):
+        enc.strike(ec.glyph_for_char(RULER_CHAR).code)
+        enc.right(2)
+    enc.newline(1)
+    enc.raw(pitch15)
+    for _ in range(15):
+        enc.strike(ec.glyph_for_char(RULER_CHAR).code)
+        enc.right(2)
+    enc.raw(restore)
+    enc.newline(2)
+
+    enc.carriage_return()
+    enc.end()
+
+    job = etp.Job(body=enc.body(), cols=n + 2, rows=34, strikes=enc.strikes,
+                  pitch=args.pitch, home_each_row=True)
+    out = args.out if os.path.isabs(args.out) else os.path.join(SRC_DIR, args.out)
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    size = etp.save(out, job)
+    print(f"control code probe -> {out} ({size} bytes, {job.strikes} strikes)")
+    print(f"  pitch {args.pitch}: one cell is {cell} carriage steps, "
+          f"one line is {full_line} platen steps")
+    print()
+    print("None of these codes has been on paper on this machine. They are")
+    print("published for the Erika S3004 (erika_ai/ressources/steuercodes.md);")
+    print("the Sigma shares that interface, which is a claim about a family of")
+    print("machines rather than a measurement of this one. This sheet is the")
+    print("measurement.")
+    print()
+    print("What to check on the printed sheet:")
+    print("  1  A beep, roughly a fifth of a second, and nothing typed. That is")
+    print("     one command plus an operand byte understood as a pair. If the")
+    print("     machine types a character instead, it did not understand the")
+    print("     command and took the operand as text -- and 0xA5 and 0xA6 below")
+    print("     will not work either. If nothing at all happens, the command was")
+    print("     swallowed silently, which is the harder case: read part 2.")
+    print("  2  Two combs of bars, the lower under the upper. The upper is typed")
+    print("     with the escapement, the lower by asking for the same distance")
+    print(f"     in {cell} carriage steps. Bars that line up mean 0xA5 moves")
+    print("     1/120 inch and this machine can be driven in absolute units")
+    print("     rather than in fractions of whatever the pitch switch is set to.")
+    print("     A lower comb that is there but at the wrong spacing means the")
+    print("     step is a different size -- measure it and say so. A lower row")
+    print("     that is a single bar means the moves did nothing.")
+    print("  3  Two bars, one cell and nine apart, then the same pair produced")
+    print("     by a single command. They must coincide. This is where the code")
+    print("     earns its place: ten bytes and ten escapement steps become two.")
+    print("  4  Eight marks in ONE column: four gaps driven by the line-feed")
+    print(f"     mechanism, then four asked for as {full_line} platen steps. The")
+    print("     two sets of gaps must be equal. Any sideways shift means a")
+    print("     motor-step feed nudges the carriage, which the detented feed")
+    print("     does not.")
+    print(f"  5  Nine marks {fine} steps apart, so the first and last are exactly")
+    print("     one line apart and the seven between are evenly spaced within it.")
+    print(f"     {fine} is one of the counts the table says the mechanism refuses,")
+    print("     so this also checks that splitting it into 2 + 2 + 1 comes to the")
+    print("     same distance. Uneven gaps mean the split does not, and a first")
+    print("     and last more or less than a line apart means the step is not")
+    print("     1/240 inch.")
+    print("  6  Eight O struck through, with no backspace anywhere in the plan.")
+    print("     That is 0xA9 printing a character where the head stands. It")
+    print("     matters because overstriking is how layers stack, and doing it")
+    print("     with a backspace spends the escapement's repeatability on every")
+    print("     stacked character. Plain O with the hyphens beside them means")
+    print("     0xA9 did nothing; hyphens one cell left means it did something")
+    print("     else.")
+    print("  7  Five letters, from column 20. Reading ABCDE to the right of")
+    print("     column 20 means backward print did nothing. Reading EDCBA and")
+    print("     *ending* at column 20 means it works -- and a serpentine pass")
+    print("     can then cost one byte per cell instead of three.")
+    print("  8  Two groups of five M. The left group is the reference and is")
+    print("     never touched. The right group was typed, then typed again with")
+    print("     the correction ribbon selected. Blank means a lift-off tape and")
+    print("     an erase; white or pale means a cover-up tape, which is white")
+    print("     ink and a thing this machine could not do before; unchanged")
+    print("     means 0x8C did nothing or there is no correction tape fitted.")
+    print("  9  Two combs of fifteen bars. If the lower is about two-thirds the")
+    print("     width of the upper, this machine takes 15 characters per inch --")
+    print("     which the slide switch does not offer, and which is about 97")
+    print("     columns of carriage instead of 65. Same width means 0x89 did")
+    print("     nothing. If everything *after* this sheet comes out narrow, the")
+    print(f"     restore (0x{restore:02X}) did not take: set the pitch switch by")
+    print("     hand, or send 0x95 to reset the machine.")
+    print()
+    print("0x96, the completion report, is not on this sheet: it changes when")
+    print("RTS is released rather than what is typed, so it is answered by the")
+    print("firmware's pacing and not by ink. See docs/control-codes.md.")
+    return 0
+
 def _parse_forces_arg(text: str | None) -> list[int]:
     from erika.make_charset import parse_forces
 
@@ -1033,6 +1267,12 @@ def build_parser() -> argparse.ArgumentParser:
                          "--from-scan` -- the grid is what identifies the tiles")
     sh.set_defaults(func=cmd_sheet)
 
+    co = sub.add_parser("codes", help="probe the control codes the pipeline does "
+                                     "not use yet")
+    co.add_argument("--out", "-o", default="results/control_codes.etp")
+    co.add_argument("--pitch", "-p", type=int, default=10, choices=(10, 12))
+    co.set_defaults(func=cmd_codes)
+
     fo = sub.add_parser("forces", help="sweep the strike-force command on paper")
     fo.add_argument("--out", "-o", default="results/strike_forces.etp")
     fo.add_argument("--pitch", "-p", type=int, default=10, choices=(10, 12))
@@ -1049,9 +1289,9 @@ def build_parser() -> argparse.ArgumentParser:
     fo.add_argument("--step", type=lambda v: int(v, 0), default=1,
                     help="sweep every Nth value rather than every one (default 1, "
                          "accepts 0x..). What makes a wide --from/--to readable: "
-                         "the whole byte is 245 usable values, 251 lines and four "
-                         "sheets of paper, and at --step 16 it is sixteen lines and "
-                         "one. Find the neighbourhood coarsely, then sweep it")
+                         f"the usable space is {ec.MAX_FORCE + 1} values and more "
+                         "than one sheet of paper, and at --step 16 it is seven "
+                         "lines. Find the neighbourhood coarsely, then sweep it")
     fo.set_defaults(func=cmd_forces)
 
     return p
