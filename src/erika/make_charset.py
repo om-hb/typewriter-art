@@ -395,10 +395,11 @@ def make_charset(
     bad = [f for f in forces if not ec.is_usable_force(f)]
     if bad:
         raise ValueError(
-            f"strike force(s) {', '.join(f'0x{f:02X}' for f in bad)} are motion "
-            "codes. A machine that ignores the force command types the byte "
-            "instead, and those bytes move the head -- pick values outside "
-            "0x71..0x82. `pipeline forces` sweeps two ranges that are safe."
+            f"strike force(s) {', '.join(f'0x{f:02X}' for f in bad)} are "
+            "commands, not inert characters. A machine that ignores the force "
+            "command types the byte instead, and those bytes move the head or "
+            f"swallow the one after them -- pick values of 0x{ec.MAX_FORCE:02X} "
+            "or below. `pipeline forces` sweeps two ranges that are safe."
         )
     if len(set(forces)) != len(forces):
         raise ValueError(f"duplicate strike force in {forces}")

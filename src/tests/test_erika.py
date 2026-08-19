@@ -115,6 +115,40 @@ def test_firmware_motion_codes_match_python():
 
 
 @pytest.mark.skipif(NO_FIRMWARE, reason=NO_FIRMWARE_REASON)
+def test_firmware_and_python_agree_on_which_bytes_are_keys():
+    """The bound both ends use to decide whether a byte may be struck.
+
+    The firmware has no glyph table to consult -- only these two numbers -- so if
+    they drift apart, one side accepts strikes the other refuses. Drifting *up*
+    is the dangerous direction: the codes above the wheel include seven that take
+    the byte after them as an operand, and one of those reaching the machine as a
+    strike leaves the interpreter reading opcodes out of operands for the rest of
+    the job, with every byte legal and the CRC intact.
+    """
+    defines = _parse_cpp_defines(os.path.join(FIRMWARE_SRC, "erika_image.h"))
+    assert defines.get("ERIKA_MIN_GLYPH_CODE") == ec.MIN_GLYPH_CODE
+    assert defines.get("ERIKA_MAX_GLYPH_CODE") == ec.MAX_GLYPH_CODE
+
+
+@pytest.mark.skipif(NO_FIRMWARE, reason=NO_FIRMWARE_REASON)
+def test_the_firmware_checks_a_strike_against_the_range_not_a_list():
+    """The shape of the check, not its constants.
+
+    A list of the codes we have named is not the guard: the published table runs
+    to 0xAF and the pipeline has read only part of it, so anything unnamed above
+    the wheel has to be refused too. Reverting this to isMotionCode() would put
+    back exactly the hole it was written to close, and the constants above would
+    still agree.
+    """
+    text = open(os.path.join(FIRMWARE_SRC, "erika_image.cpp"), encoding="utf-8").read()
+    match = re.search(r"case ETP_STRIKE:.*?case ETP_SET_FORCE:", text, re.S)
+    assert match, "could not find the STRIKE case in fetchNext()"
+    assert "isTypeableGlyph(operand)" in match.group(0), (
+        "the STRIKE case no longer checks the operand against the wheel's range"
+    )
+
+
+@pytest.mark.skipif(NO_FIRMWARE, reason=NO_FIRMWARE_REASON)
 def test_firmware_opcodes_match_python():
     defines = _parse_cpp_defines(os.path.join(FIRMWARE_SRC, "erika_image.h"))
     expected = {
@@ -562,8 +596,48 @@ def test_encoder_rejects_negative_moves():
 def test_motion_codes_cannot_be_struck_as_glyphs():
     """Both ends refuse this; a struck SPACE would shift the rest of the row."""
     for code in (ec.SPACE, ec.BACKSPACE, ec.CARRIAGE_RETURN, ec.HALF_STEP_FORWARD):
-        with pytest.raises(etp.EtpError, match="motion code"):
+        with pytest.raises(etp.EtpError, match="motion"):
             etp.Encoder().strike(code)
+
+
+def test_a_command_that_eats_the_next_byte_cannot_be_struck_either():
+    """The worse half of the same hazard, and the one the old guard let through.
+
+    A motion code struck as a glyph moves the head: wrong, and visible on the
+    sheet. A code that carries an operand swallows the byte after it, so from
+    there the firmware reads every opcode out of an operand -- every byte still
+    legal, the CRC still passing over an intact file, and nothing to say why the
+    picture became noise.
+    """
+    assert ec.OPERAND_CODES  # the guard is worth nothing if this is empty
+    for code in sorted(ec.OPERAND_CODES):
+        with pytest.raises(etp.EtpError, match="one byte out of step"):
+            etp.Encoder().strike(code)
+
+
+def test_nothing_above_the_wheels_range_can_be_struck():
+    """The guard is the range, not a list of the codes that have been named.
+
+    An unnamed byte above the wheel is not known to be harmless -- the published
+    table runs to 0xAF and this pipeline has read only part of it -- so the
+    default has to be refusal.
+    """
+    for code in range(ec.MAX_GLYPH_CODE + 1, 0x100):
+        with pytest.raises(etp.EtpError):
+            etp.Encoder().strike(code)
+    with pytest.raises(etp.EtpError):
+        etp.Encoder().strike(0x00)
+
+
+def test_every_key_on_the_wheel_is_inside_the_range_the_guards_use():
+    """Which is what makes a bound safe to use in place of a lookup -- on the
+    firmware side there is no glyph table to consult, only these two numbers."""
+    for g in ec.GLYPHS + ec.DEAD_KEY_GLYPHS:
+        assert ec.is_glyph_code(g.code), f"{g.char!r} is outside the range"
+    # And the bounds are tight: something really does sit on each of them.
+    codes = {g.code for g in ec.GLYPHS + ec.DEAD_KEY_GLYPHS}
+    assert ec.MIN_GLYPH_CODE in codes
+    assert ec.MAX_GLYPH_CODE in codes
 
 
 def test_iter_ops_rejects_unknown_opcodes():
@@ -1172,11 +1246,27 @@ def test_a_job_hands_the_machine_back_at_full_force(tmp_path):
 
 def test_a_force_that_is_a_motion_code_is_refused():
     enc = etp.Encoder()
-    with pytest.raises(etp.EtpError, match="motion code"):
+    with pytest.raises(etp.EtpError, match="move the head"):
         enc.set_force(ec.HALF_STEP_FORWARD)
 
 
-@pytest.mark.parametrize("value", [0x00, 0x39, 0xFF])
+def test_a_force_that_would_eat_the_byte_after_it_is_refused():
+    """The same hole as the strike guard had. A machine that ignores the force
+    command types the force byte, and 0xA5 typed is a carriage command that
+    takes the byte after it -- which is the glyph the force was chosen for."""
+    for code in sorted(ec.OPERAND_CODES):
+        with pytest.raises(etp.EtpError, match="desynchronise"):
+            etp.Encoder().set_force(code)
+
+
+def test_no_force_above_the_wheels_range_is_offered():
+    """A force has to be inert when typed, and only the wheel's own codes are
+    known to be. Everything above is a motion or a command."""
+    assert not any(ec.is_usable_force(v) for v in range(ec.MAX_FORCE + 1, 0x100))
+    assert all(ec.is_usable_force(v) for v in range(0, ec.MAX_FORCE + 1))
+
+
+@pytest.mark.parametrize("value", [0x00, 0x39, 0x67])
 def test_a_force_of_any_usable_value_survives_the_wire(value):
     """Force 0 is the interesting one: the firmware used to signal "no trailing
     byte" with a zero, so a force of 0 would have been swallowed."""
@@ -1290,15 +1380,16 @@ def test_a_step_strides_the_values_and_drops_motion_codes_afterwards(tmp_path):
     what a coarse pass is for.
     """
     forces, _ = _probe_forces(tmp_path, "over.etp",
-                              "--from", "0x70", "--to", "0x84", "--step", "2")
+                              "--from", "0x60", "--to", "0x74", "--step", "2")
 
-    # 0x70..0x84 by twos is 0x70,0x72,...,0x84; the motion codes among them go.
-    asked = range(0x70, 0x85, 2)
+    # 0x60..0x74 by twos straddles the top of the wheel's range; what lies above
+    # it -- motions, and then commands -- goes.
+    asked = range(0x60, 0x75, 2)
     assert forces == [v for v in asked if ec.is_usable_force(v)]
     # The gap is real -- something was dropped -- and every value still sits on the
     # stride from the first one.
     assert len(forces) < len(list(asked))
-    assert all((v - 0x70) % 2 == 0 for v in forces)
+    assert all((v - 0x60) % 2 == 0 for v in forces)
 
 
 def test_a_coarse_probe_is_still_safe_and_still_has_its_reference_row(tmp_path):
@@ -1316,15 +1407,21 @@ def test_a_coarse_probe_is_still_safe_and_still_has_its_reference_row(tmp_path):
             if i.y < first_force_row and i.force is None]
 
 
-def test_the_whole_byte_fits_one_sheet_at_a_coarse_enough_step(tmp_path):
-    """The case the flag exists for, stated as a number of lines of typing."""
+def test_the_whole_usable_range_fits_one_sheet_at_a_coarse_enough_step(tmp_path):
+    """The case the flag exists for, stated as a number of lines of typing.
+
+    "The whole byte" is asked for and something narrower comes back: only the
+    wheel's own codes are safe to hand the machine as a force, so a sweep of
+    0x00..0xFF is a sweep of 0x00..MAX_FORCE with a note saying what it dropped.
+    That is still more than one sheet of paper.
+    """
     from erika.pipeline import DEFAULT_AREA_ROWS
 
     _, fine = _probe_forces(tmp_path, "fine.etp", "--from", "0x00", "--to", "0xFF")
     _, coarse = _probe_forces(tmp_path, "coarse.etp",
                               "--from", "0x00", "--to", "0xFF", "--step", "16")
 
-    assert fine.rows > 4 * DEFAULT_AREA_ROWS  # several sheets of paper
+    assert fine.rows > DEFAULT_AREA_ROWS  # more than one sheet of paper
     assert coarse.rows <= DEFAULT_AREA_ROWS  # one
 
 
@@ -1458,7 +1555,7 @@ def test_resolve_densities_refuses_a_list_that_does_not_fit():
 def test_make_charset_refuses_a_force_that_would_move_the_head(tmp_path):
     from erika.make_charset import make_charset
 
-    with pytest.raises(ValueError, match="motion codes"):
+    with pytest.raises(ValueError, match="commands"):
         make_charset(name="bad", base_path=str(tmp_path),
                      forces=(0x00, ec.HALF_LINE_FORWARD))
 

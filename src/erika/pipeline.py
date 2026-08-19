@@ -694,12 +694,18 @@ def cmd_forces(args) -> int:
     - The first row is typed before the command is ever sent, so it shows the
       force the machine powers up with. Every row after states its own force,
       which means it does not matter whether a setting persists.
-    - Every candidate value is outside 0x71..0x82. On a machine that does not
-      implement the command the value byte arrives as an ordinary character, and
-      a character in that range is a *motion* -- it would shift the rest of the
-      line and make the sheet unreadable exactly where it needs reading. Outside
-      it, the worst case is a visible stray character, which is itself the
-      answer: the command did nothing.
+    - Every candidate value is one the wheel could have typed. On a machine that
+      does not implement the command the value byte arrives as an ordinary
+      character; inside the wheel's range the worst case is a visible stray
+      character, which is itself the answer -- the command did nothing. Above the
+      range it would be a *motion*, shifting the rest of the line and making the
+      sheet unreadable exactly where it needs reading, or worse a command that
+      eats the byte after it and takes the rest of the sheet with it.
+
+    The published control code table (erika_ai/ressources/steuercodes.md) gives
+    a weak steer on which hypothesis to read first: 0xA5, 0xA6 and 0xA7 all
+    spell their operand out as a raw count, and 0xA3 uses the same phrasing for
+    the force. That points at the `raw` block rather than the `ascii` one.
     """
     blocks = _force_probe_blocks(args)
     run = args.run
@@ -781,9 +787,10 @@ def _parse_forces_arg(text: str | None) -> list[int]:
     bad = [f for f in forces if not ec.is_usable_force(f)]
     if bad:
         raise PlanError(
-            f"strike force(s) {', '.join(f'0x{f:02X}' for f in bad)} are motion "
-            "codes -- a machine that ignores the force command would type them "
-            "and move the head. Pick values outside 0x71..0x82."
+            f"strike force(s) {', '.join(f'0x{f:02X}' for f in bad)} are "
+            "commands -- a machine that ignores the force command would type "
+            "them, and they would move the head or swallow the byte after "
+            f"them. Pick values of 0x{ec.MAX_FORCE:02X} or below."
         )
     if len(set(forces)) != len(forces):
         raise PlanError(f"duplicate strike force in {text!r}")
@@ -793,8 +800,8 @@ def _parse_forces_arg(text: str | None) -> list[int]:
 def _force_probe_blocks(args) -> dict[str, list[int]]:
     """What the probe sweeps: either an explicit range, or both hypotheses.
 
-    ``--step`` strides the *value space* and the motion codes are dropped after,
-    not before. That is the order that makes a coarse pass mean what it says: every
+    ``--step`` strides the *value space* and the unusable values are dropped
+    after, not before. That is the order that makes a coarse pass mean what it says: every
     Nth candidate byte, at even intervals, with a gap where the sweep happens to
     land on a code that would move the head. Filtering first would renumber the
     values and hand back N usable ones at uneven spacing, which is unreadable as a
@@ -819,17 +826,22 @@ def _force_probe_blocks(args) -> dict[str, list[int]]:
         if not values:
             raise PlanError(
                 f"every value a sweep of 0x{first:02X}..0x{last:02X} in steps of "
-                f"{step} lands on is a motion code"
+                f"{step} lands on is a command rather than a force the machine "
+                f"could type -- those stop at 0x{ec.MAX_FORCE:02X}"
             )
         if skipped:
-            print(f"note: skipping {skipped} motion code(s) in the requested range")
+            print(
+                f"note: skipping {skipped} value(s) above 0x{ec.MAX_FORCE:02X} in "
+                "the requested range; a machine that ignores the force command "
+                "would type them as motions or commands"
+            )
         return {"custom": values}
 
     blocks = {
         name: [v for v in range(lo, hi + 1, step) if ec.is_usable_force(v)]
         for name, (lo, hi) in ec.FORCE_PROBE_BLOCKS.items()
     }
-    # A block whose every stepped-to value is a motion code contributes nothing but
+    # A block whose every stepped-to value is unusable contributes nothing but
     # a heading. None of the blocks in erika_codes can do that -- the stride always
     # includes the first value and both begin on a usable one -- but a block added
     # later could, and a heading with no rows under it reads as a failed sweep.

@@ -168,15 +168,47 @@ class Encoder:
 
     # -- printing ----------------------------------------------------------
     def strike(self, code: int, advances: bool = True) -> None:
-        # A motion code struck as a glyph would move the head without the plan
-        # knowing about it, and everything after would land in the wrong place.
-        # The firmware refuses these too; catch it here where it is debuggable.
+        """Type the key with this code.
+
+        Only a key. The interface's vocabulary does not stop at the motion block
+        -- it runs to 0xAF -- and the codes above it fail in two different ways
+        if one reaches the machine where a glyph was meant:
+
+            a motion code          moves the head, so every mark after it lands
+                                   in the wrong place. Wrong, and visible.
+
+            an operand-carrying    eats the byte after it, so the firmware and
+            code                   the machine disagree about where opcodes
+                                   begin for the rest of the job. Every byte is
+                                   still legal and the CRC still passes over an
+                                   intact file; the sheet is half an hour of
+                                   arbitrary motion and nothing says why.
+
+        So the test is the wheel's own range rather than a list of the codes we
+        happen to have named. The firmware makes the same check, against the
+        same two bounds; this one is here because it is the one with a stack
+        trace attached.
+        """
         from erika import erika_codes as ec
 
-        if code in ec.CONTROL_CODES:
+        if not ec.is_glyph_code(code):
             raise EtpError(
-                f"0x{code:02X} ({ec.describe_code(code)}) is a motion code, "
-                "not a glyph -- it cannot be struck"
+                f"0x{code:02X} ({ec.describe_code(code)}) is not a key on the "
+                f"wheel -- those run 0x{ec.MIN_GLYPH_CODE:02X}.."
+                f"0x{ec.MAX_GLYPH_CODE:02X} -- so it cannot be struck"
+                + (
+                    ". It is a motion: striking it would move the head without "
+                    "the plan knowing"
+                    if code in ec.CONTROL_CODES
+                    else ""
+                )
+                + (
+                    ". It takes the following byte with it: striking it would "
+                    "put the interpreter one byte out of step for the rest of "
+                    "the job"
+                    if code in ec.OPERAND_CODES
+                    else ""
+                )
             )
         self._emit(OP_STRIKE if advances else OP_STRIKE_NA, code)
         self.strikes += 1
@@ -185,19 +217,27 @@ class Encoder:
         """Set the strike force (Anschlagstärke) for every strike that follows.
 
         One opcode here, two bytes on the wire. A machine that does not honour
-        the command types the force byte as a character instead, so a value
-        that is really a motion code would move the head without the plan
-        knowing -- the same failure `strike()` refuses above, and the reason
-        the probe sheet only sweeps values outside that range.
+        the command types the force byte as a character instead, so the value
+        has to be one that is harmless when typed -- inside the wheel's range.
+        Above it lies the motion block, and above that the commands, seven of
+        which would swallow the byte after the force as their own operand. That
+        is the same pair of failures `strike()` refuses above, and the reason
+        the probe sheet only sweeps values the wheel could have typed.
         """
         from erika import erika_codes as ec
 
         if not ec.is_usable_force(force):
             raise EtpError(
                 f"strike force 0x{force:02X} ({ec.describe_code(force)}) is a "
-                "motion code. If this machine ignores the force command the byte "
-                "arrives as a character, and that one would move the head -- pick "
-                "a force outside 0x71..0x82"
+                "command, not an inert character. If this machine ignores the "
+                "force command the byte arrives as one, and that one would "
+                + (
+                    "take the byte after it with it and desynchronise the rest "
+                    "of the job"
+                    if force in ec.OPERAND_CODES
+                    else "move the head"
+                )
+                + f" -- pick a force of 0x{ec.MAX_FORCE:02X} or below"
             )
         self._emit(OP_SET_FORCE, force)
 

@@ -56,11 +56,12 @@ MICRO_LINE_BACK = 0x82  # Mikrozeilenschaltung rückwärts
 # answer. Until that has been on paper, treat every number below as a guess.
 SET_STRIKE_FORCE = 0xA3  # Anschlagstärke - next byte is the force
 
-#: Values `pipeline forces` sweeps, as {label: (first, last)}. Both blocks
-#: deliberately avoid 0x71..0x82: if this machine does not honour
-#: SET_STRIKE_FORCE, the force byte arrives as an ordinary character, and a
-#: character in that range is a *motion* -- which would shift everything after
-#: it and make the sheet unreadable exactly where it needs to be read.
+#: Values `pipeline forces` sweeps, as {label: (first, last)}. Both blocks stay
+#: inside the wheel's own range (see MAX_FORCE): if this machine does not
+#: honour SET_STRIKE_FORCE, the force byte arrives as an ordinary character,
+#: and a character the wheel can type is a visible stray mark rather than a
+#: motion that shifts the rest of the line or a command that eats the byte
+#: after it.
 FORCE_PROBE_BLOCKS = {
     "raw": (0x00, 0x09),
     "ascii": (0x30, 0x39),
@@ -71,7 +72,8 @@ FORCE_PROBE_BLOCKS = {
 FULL_STRIKE_FORCE = 0x00
 
 
-#: Codes that must never appear as a glyph strike.
+#: The motion codes: they move the head instead of marking the paper, and must
+#: never appear as a glyph strike. This is the block 0x71..0x82.
 CONTROL_CODES = frozenset(
     {
         SPACE,
@@ -88,15 +90,88 @@ CONTROL_CODES = frozenset(
     }
 )
 
+# --------------------------------------------------------------------------
+# The rest of the interface's vocabulary
+# --------------------------------------------------------------------------
+# The motion block is not where the machine's commands stop -- it is where the
+# ones this pipeline *uses* stop. The published table (see
+# erika_ai/ressources/steuercodes.md and docs/control-codes.md in the
+# workspace) runs to 0xAF, and what matters here is not what those codes do but
+# that some of them **swallow the byte after them**.
+#
+# That is the difference between a wrong byte and a ruined job. A stray motion
+# code moves the head, and every mark after it lands in the wrong place -- bad,
+# and visible. A stray operand-carrying code eats the next byte, so from there
+# every opcode is read out of an operand and every operand out of an opcode:
+# the same one-byte-out-of-step failure the workspace CLAUDE.md describes for
+# adding an opcode, with every byte still individually legal and the CRC still
+# passing over an intact file.
+
+#: Codes that take a following byte when *sent* to the machine. A byte from this
+#: set arriving where a character was meant desynchronises the whole stream.
+OPERAND_CODES = frozenset(
+    {
+        0xA1,  # Übertragungsrate  - next byte is the baud code
+        0xA3,  # Anschlagstärke    - next byte is the force (SET_STRIKE_FORCE)
+        0xA5,  # Wagensteuerung    - next byte is a 1/120" step count
+        0xA6,  # Papiervorschub    - next byte is a 1/240" step count
+        0xA7,  # Typenrad drehen   - next byte is a 3.6 deg step count
+        0xA8,  # Farbbandtransport - next byte is a 10 deg step count
+        0xAA,  # BEL               - next byte is the signal length
+    }
+)
+
+#: 0xA9 (Doppeldruck) does not eat the next byte, it *changes* it: the character
+#: after it prints without advancing the carriage. So a stray 0xA9 does not
+#: desynchronise the stream, it silently drops one advance -- which shifts
+#: everything after it on the line. Named here because it is the one code above
+#: the motion block that is neither inert nor stream-breaking.
+MODIFIER_CODES = frozenset({0xA9})
+
+# --------------------------------------------------------------------------
+# What the wheel can be told to type
+# --------------------------------------------------------------------------
+# The type wheel's codes are a contiguous range with a few unused slots in it,
+# and every code above the range is a command of some kind. So the cheap,
+# drift-proof test for "could this byte be a glyph" is the range itself -- one
+# bound rather than a table -- and the test suite pins it against GLYPHS so it
+# cannot quietly stop being true.
+MIN_GLYPH_CODE = 0x01
+MAX_GLYPH_CODE = 0x67
+
+#: The highest byte a strike force may be. A machine that does not implement
+#: SET_STRIKE_FORCE types the force byte as an ordinary character, so a force
+#: has to be a byte that is *harmless when typed* -- which means inside the
+#: wheel's own range. Above it lies the motion block and then the commands, and
+#: seven of those would eat the byte after the force and take the rest of the
+#: job with them.
+MAX_FORCE = MAX_GLYPH_CODE
+
+
+def is_glyph_code(value: int) -> bool:
+    """Could `value` be a key on the wheel rather than a command?
+
+    A range check, not a lookup. The unused slots inside the range are harmless
+    -- at worst the machine types nothing -- whereas every byte outside it is a
+    motion or a command, and seven of those consume the byte that follows.
+    ``glyph_for_code`` is the exact answer where an exact one is wanted.
+    """
+    return MIN_GLYPH_CODE <= value <= MAX_GLYPH_CODE
+
 
 def is_usable_force(value: int) -> bool:
-    """Can `value` be sent as a force byte without risking a stray motion?
+    """Can `value` be sent as a force byte without risking anything worse?
 
-    A machine that ignores SET_STRIKE_FORCE types the force byte instead, so a
-    value that collides with a motion code moves the head without the plan
-    knowing -- the same hazard `Encoder.strike` refuses a motion code for.
+    A machine that ignores SET_STRIKE_FORCE types the force byte instead, so the
+    value has to be inert as a character. Inside the wheel's range it types a
+    glyph and the plan's own position model already accounts for the advance
+    (the probe sheet is built to be readable either way). Outside it, the value
+    is a motion at best and a command that eats the following byte at worst.
+
+    0 is allowed although it is below the wheel: nothing on the machine answers
+    to it, which is what FULL_STRIKE_FORCE is counting on.
     """
-    return 0 <= value <= 0xFF and value not in CONTROL_CODES
+    return 0 <= value <= MAX_FORCE
 
 
 # --------------------------------------------------------------------------
@@ -286,27 +361,75 @@ def glyph_for_char(char: str) -> Glyph | None:
     return _BY_CHAR.get(char)
 
 
+#: Names for the interface's control codes, for diagnostics only.
+#:
+#: The motion block is what the pipeline sends; the rest is here so that a byte
+#: which has gone somewhere it should not can be *named* in the error. A message
+#: that says 0xA5 has to be read against a table; one that says "direct carriage
+#: control, and it takes the next byte with it" explains the failure.
+#:
+#: Only the codes worth recognising, not the whole table -- see
+#: erika_ai/ressources/steuercodes.md for that.
+CONTROL_CODE_NAMES = {
+    SPACE: "SPACE",
+    BACKSPACE: "BACKSPACE",
+    HALF_STEP_FORWARD: "HALF_STEP_FWD",
+    HALF_STEP_BACK: "HALF_STEP_BACK",
+    HALF_LINE_FORWARD: "HALF_LINE_FWD",
+    HALF_LINE_BACK: "HALF_LINE_BACK",
+    NEWLINE: "NEWLINE",
+    CARRIAGE_RETURN: "CR",
+    TAB: "TAB",
+    MICRO_LINE_FORWARD: "MICRO_FWD",
+    MICRO_LINE_BACK: "MICRO_BACK",
+    0x7A: "SET_TAB",
+    0x7B: "CLEAR_TAB",
+    0x7C: "CLEAR_ALL_TABS",
+    0x7D: "SET_TAB_GRID",
+    0x7E: "SET_LEFT_MARGIN",
+    0x7F: "SET_RIGHT_MARGIN",
+    0x80: "RELEASE_MARGINS",
+    0x83: "FEED_SHEET",
+    0x84: "LINE_SPACING_1",
+    0x85: "LINE_SPACING_1_5",
+    0x86: "LINE_SPACING_2",
+    0x87: "PITCH_10",
+    0x88: "PITCH_12",
+    0x89: "PITCH_15",
+    0x8B: "CORRECTION_OFF",
+    0x8C: "CORRECTION_ON",
+    0x8D: "BACKWARD_PRINT_OFF",
+    0x8E: "BACKWARD_PRINT_ON",
+    0x8F: "MARGIN_RELEASE_ON",
+    0x91: "KEYBOARD_OFF",
+    0x92: "KEYBOARD_ON",
+    0x95: "RESET",
+    0x96: "REPORT_WHEN_PRINTED",
+    0x9B: "AUTOREPEAT_ON",
+    0x9C: "AUTOREPEAT_OFF",
+    0x9F: "LINE_FEED",
+    0xA1: "SET_BAUD",
+    SET_STRIKE_FORCE: "SET_STRIKE_FORCE",
+    0xA5: "CARRIAGE_STEPS",
+    0xA6: "PLATEN_STEPS",
+    0xA7: "WHEEL_STEPS",
+    0xA8: "RIBBON_STEPS",
+    0xA9: "NO_ADVANCE",
+    0xAA: "BELL",
+}
+
+
 def describe_code(code: int) -> str:
     """Human-readable label for one raw typewriter byte (for disassembly)."""
-    control = {
-        SPACE: "SPACE",
-        BACKSPACE: "BACKSPACE",
-        HALF_STEP_FORWARD: "HALF_STEP_FWD",
-        HALF_STEP_BACK: "HALF_STEP_BACK",
-        HALF_LINE_FORWARD: "HALF_LINE_FWD",
-        HALF_LINE_BACK: "HALF_LINE_BACK",
-        NEWLINE: "NEWLINE",
-        CARRIAGE_RETURN: "CR",
-        TAB: "TAB",
-        MICRO_LINE_FORWARD: "MICRO_FWD",
-        MICRO_LINE_BACK: "MICRO_BACK",
-    }
-    if code in control:
-        return control[code]
     g = _BY_CODE.get(code)
-    if g is None:
+    if g is not None and code not in CONTROL_CODES:
+        return g.name or repr(g.char)
+    name = CONTROL_CODE_NAMES.get(code)
+    if name is None:
         return f"0x{code:02X}"
-    return g.name or repr(g.char)
+    if code in OPERAND_CODES:
+        return f"{name}+operand"
+    return name
 
 
 def _check_unique():
@@ -314,6 +437,15 @@ def _check_unique():
     for g in GLYPHS + DEAD_KEY_GLYPHS:
         if g.code in CONTROL_CODES:
             raise AssertionError(f"{g.char!r} collides with a control code")
+        if not is_glyph_code(g.code):
+            # MIN/MAX_GLYPH_CODE is what both this module and the firmware use
+            # to decide whether a byte could be a key at all. A glyph outside it
+            # would be refused as a command by the very guard meant to protect
+            # it, so the bound has to move first.
+            raise AssertionError(
+                f"{g.char!r} is 0x{g.code:02X}, outside the wheel's range "
+                f"0x{MIN_GLYPH_CODE:02X}..0x{MAX_GLYPH_CODE:02X}"
+            )
         if g.code in seen:
             raise AssertionError(
                 f"duplicate code 0x{g.code:02X}: {seen[g.code]!r} and {g.char!r}"
