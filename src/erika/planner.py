@@ -316,18 +316,59 @@ def build_plan(
     return Plan(strikes, cols, rows, charset, offsets, home_each_row)
 
 
+def _pass_key(s: Strike) -> tuple[int, int]:
+    """What makes two strikes part of the same carriage sweep.
+
+    The paper position, and that is (y, fy) rather than y alone: a layer offset
+    by a quarter of a line is a *different* sweep from the one above it, and
+    grouping the two together would let the serpentine reverse them into each
+    other and feed the platen backwards to reach the second.
+    """
+    return (s.y, s.fy)
+
+
 def _serpentine(strikes: list[Strike]) -> list[Strike]:
     """Reverse every other pass so the carriage sweeps back and forth."""
     out: list[Strike] = []
     start = 0
     flip = False
     for i in range(1, len(strikes) + 1):
-        if i == len(strikes) or strikes[i].y != strikes[start].y:
+        if i == len(strikes) or _pass_key(strikes[i]) != _pass_key(strikes[start]):
             row = strikes[start:i]
             out.extend(reversed(row) if flip else row)
             flip = not flip
             start = i
     return out
+
+
+def _one_mechanism(delta: int, per_unit: int) -> tuple[int, int]:
+    """Split a move into whole keystroke units and motor steps -- or all steps.
+
+    A move with no residue is left to the keystrokes: the detented line-feed and
+    the escapement are what the machine is built around, and the calibration
+    sheet says they are repeatable.
+
+    A move that needs motor steps is done *entirely* in them, rather than as
+    "whole units, then the remainder". That is a measurement, not a preference.
+    Part 5 of `erika.pipeline codes` feeds the platen five steps at a time, eight
+    times over; every gap came out equal except the first, which follows the
+    detented line feed that ends the section heading and came out short. Part 4
+    feeds forty steps at a time from the same starting condition and looked even
+    -- which is the same fault seen from further away, since one or two steps
+    lost is a fortieth of that gap and a fifth of part 5's.
+
+    So a motor-step feed immediately after the detented mechanism appears to
+    lose a step or two taking up the detent, and the way not to pay it is not to
+    change mechanism part-way through a move.
+
+    It is cheaper too, which is the sort of agreement worth noticing: the
+    remainder already costs an opcode and an operand, so folding the whole move
+    into it removes one and shortens the byte stream rather than lengthening it.
+    """
+    whole, residue = _split(delta, per_unit)
+    if residue:
+        return 0, delta
+    return whole, residue
 
 
 def _split(delta: int, per_unit: int) -> tuple[int, int]:
@@ -396,7 +437,7 @@ def encode(
                      - (y * ec.PLATEN_STEPS_PER_HALF_LINE + y_fine))
             if delta < 0:  # build_plan sorts by (y, fy), so this cannot happen
                 raise PlanError(f"plan feeds the paper backwards to row {s.y}")
-            dy, dy_fine = _split(delta, ec.PLATEN_STEPS_PER_HALF_LINE)
+            dy, dy_fine = _one_mechanism(delta, ec.PLATEN_STEPS_PER_HALF_LINE)
             if plan.home_each_row:
                 # A full NEWLINE drives the standard line-feed mechanism, which
                 # is more repeatable than stacking half-line steps -- use it
@@ -426,8 +467,9 @@ def encode(
 
         # The same arithmetic across, for the same reason.
         per_half = ec.carriage_steps_per_half_step(cs.pitch)
-        dx, dx_fine = _split((s.x * per_half + s.fx) - (x * per_half + x_fine),
-                             per_half)
+        dx, dx_fine = _one_mechanism(
+            (s.x * per_half + s.fx) - (x * per_half + x_fine), per_half
+        )
         enc.horizontal(dx)
         enc.horizontal_fine(dx_fine)
         x, x_fine = s.x, s.fx

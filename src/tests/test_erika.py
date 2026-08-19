@@ -2534,3 +2534,101 @@ def test_which_schemes_fine_unlocks_depends_on_the_pitch():
     assert at12 == keystroke  # nothing, and the flag should not pretend otherwise
     assert "16x1" in at10 - keystroke
     assert {"daisy_full", "daisy_x2"} <= at15 - at10
+
+
+COARSE_V = (etp.OP_DOWN, etp.OP_UP, etp.OP_NEWLINE, etp.OP_MICRO_DOWN, etp.OP_MICRO_UP)
+FINE_V = (etp.OP_DOWN_FINE, etp.OP_UP_FINE)
+COARSE_H = (etp.OP_RIGHT, etp.OP_LEFT)
+FINE_H = (etp.OP_RIGHT_FINE, etp.OP_LEFT_FINE)
+
+
+@pytest.mark.parametrize("home_each_row", [True, False])
+def test_a_move_never_changes_mechanism_part_way_through(tmp_path, charset,
+                                                         home_each_row):
+    """What part 5 of the control-code sheet showed, on paper.
+
+    It feeds the platen five steps at a time, eight times; every gap came out
+    equal except the first, which is the one that follows the detented line feed
+    ending the section heading. A motor-step feed straight after the detent
+    appears to lose a step or two taking up the detent -- invisible in part 4,
+    which asks for forty steps from the same starting condition, and a fifth of
+    the gap here.
+
+    So a move is either all keystrokes or all motor steps, never a keystroke run
+    with the remainder appended. This is the check that it stays that way.
+    """
+    path = _write_choices(tmp_path, _random_choices(charset, 6, 9, QUARTER_LAYERS,
+                                                    seed=21))
+    job = planner.encode(
+        planner.build_plan(path, charset, home_each_row=home_each_row, fine=True)
+    )
+    ops = [op for _, op, _ in etp.iter_ops(job.body)]
+    for a, b in zip(ops, ops[1:]):
+        assert not (a in COARSE_V and b in FINE_V), "coarse feed then a fine one"
+        assert not (a in FINE_V and b in COARSE_V), "fine feed then a coarse one"
+        assert not (a in COARSE_H and b in FINE_H), "coarse move then a fine one"
+        assert not (a in FINE_H and b in COARSE_H), "fine move then a coarse one"
+
+
+def test_one_mechanism_per_move_is_also_the_shorter_stream(tmp_path, charset):
+    """The agreement worth noticing: the remainder already costs an opcode and an
+    operand, so folding the whole move into it removes one rather than adding."""
+    path = _write_choices(tmp_path, _random_choices(charset, 6, 9, QUARTER_LAYERS,
+                                                    seed=22))
+    plan = planner.build_plan(path, charset, fine=True)
+    job = planner.encode(plan)
+
+    # What the two-mechanism form would have cost, counted from the same plan.
+    split = etp.Encoder()
+    x = y = x_fine = y_fine = 0
+    per_half = ec.carriage_steps_per_half_step(charset.pitch)
+    for s in plan.strikes:
+        dv = ((s.y * ec.PLATEN_STEPS_PER_HALF_LINE + s.fy)
+              - (y * ec.PLATEN_STEPS_PER_HALF_LINE + y_fine))
+        whole, rest = planner._split(dv, ec.PLATEN_STEPS_PER_HALF_LINE)
+        split.vertical(whole)
+        split.vertical_fine(rest)
+        dh = (s.x * per_half + s.fx) - (x * per_half + x_fine)
+        whole, rest = planner._split(dh, per_half)
+        split.horizontal(whole)
+        split.horizontal_fine(rest)
+        split.strike(charset.codes[s.index], charset.advances[s.index])
+        y, y_fine, x, x_fine = s.y, s.fy, s.x, s.fx
+        if charset.advances[s.index]:
+            x += 2
+    assert len(job.body) < len(split.body())
+
+
+def test_a_half_cell_plan_still_uses_the_detented_mechanism(tmp_path, charset):
+    """The change is for moves that need motor steps. A plan built from halves
+    has none, and should still drive the line feed the calibration sheet
+    measured -- which is the more repeatable of the two when it can be used."""
+    path = _write_choices(tmp_path, _random_choices(charset, 5, 8, FOUR_LAYERS,
+                                                    seed=23))
+    job = planner.encode(planner.build_plan(path, charset, fine=True))
+    ops = [op for _, op, _ in etp.iter_ops(job.body)]
+    assert etp.OP_NEWLINE in ops
+    assert not [op for op in ops if op in FINE_V + FINE_H]
+
+
+def test_a_serpentine_pass_is_a_paper_position_not_a_row(tmp_path, charset):
+    """A layer offset by a quarter of a line is its own sweep.
+
+    _serpentine grouped by y alone, which was right while y was the whole of the
+    paper position. With a residue under it, grouping by y folds two sweeps into
+    one and reversing them puts the quarter-line strikes before the ones above
+    them -- so the platen has to come back, which encode() refuses outright.
+    """
+    path = _write_choices(tmp_path, _random_choices(charset, 5, 8, QUARTER_LAYERS,
+                                                    seed=24))
+    plan = planner.build_plan(path, charset, home_each_row=False, fine=True)
+    positions = [(s.y, s.fy) for s in plan.strikes]
+    assert positions == sorted(positions), "a sweep was reversed into another one"
+    # And it still alternates, which is the whole point of the serpentine.
+    sweeps = []
+    for s in plan.strikes:
+        if not sweeps or (s.y, s.fy) != sweeps[-1][0]:
+            sweeps.append(((s.y, s.fy), []))
+        sweeps[-1][1].append(s.x)
+    directions = {tuple(xs) == tuple(sorted(xs)) for _, xs in sweeps if len(xs) > 1}
+    assert directions == {True, False}
