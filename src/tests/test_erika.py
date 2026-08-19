@@ -2505,3 +2505,32 @@ def test_the_preview_places_a_fine_strike_off_the_grid(tmp_path, charset):
     at_zero = inked_columns(0)
     at_quarter = inked_columns(0.25)
     assert at_quarter[0] - at_zero[0] == charset.cell_w // 4
+
+
+def test_the_listed_typeable_schemes_are_the_ones_the_planner_accepts():
+    """TYPEABLE_LAYER_SCHEMES is written out so that importing pipeline does not
+    read layers.json. That makes it a copy, and a copy needs a comparison."""
+    from erika import pipeline
+
+    assert pipeline.typeable_layer_schemes(10) == pipeline.TYPEABLE_LAYER_SCHEMES
+    assert pipeline.typeable_layer_schemes(12) == pipeline.TYPEABLE_LAYER_SCHEMES
+
+
+def test_which_schemes_fine_unlocks_depends_on_the_pitch():
+    """The reason typeable_layer_schemes takes a pitch at all.
+
+    A quarter of a cell is three carriage steps at pitch 10 and two at pitch 15,
+    but two and a half at pitch 12 -- so pitch 12 gains nothing from --fine. An
+    eighth is one step only at pitch 15, which is the pitch the slide switch does
+    not offer and part 9 of the probe sheet asks about.
+    """
+    from erika import pipeline
+
+    at10 = set(pipeline.typeable_layer_schemes(10, fine=True))
+    at12 = set(pipeline.typeable_layer_schemes(12, fine=True))
+    at15 = set(pipeline.typeable_layer_schemes(15, fine=True))
+    keystroke = set(pipeline.TYPEABLE_LAYER_SCHEMES)
+
+    assert at12 == keystroke  # nothing, and the flag should not pretend otherwise
+    assert "16x1" in at10 - keystroke
+    assert {"daisy_full", "daisy_x2"} <= at15 - at10

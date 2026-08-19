@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import os
 import sys
 
@@ -36,8 +37,34 @@ from erika import SRC_DIR, erika_codes as ec
 from erika import etp, planner, preview
 from erika.planner import Charset, PlanError
 
-#: Layer schemes in layers.json whose offsets are all multiples of 0.5.
+#: Layer schemes in layers.json whose offsets are all multiples of 0.5 -- the
+#: ones the *keyboard* can place, and so the ones typeable without --fine at any
+#: pitch. Written out rather than derived so that importing this module does not
+#: read layers.json; ``typeable_layer_schemes`` derives the same answer, and a
+#: test compares the two.
 TYPEABLE_LAYER_SCHEMES = ("1x1", "1x2", "1x4", "2Hx1", "2Hx2", "2Vx1", "2Vx2", "4x1", "4x2")
+
+
+def typeable_layer_schemes(pitch: int = 10, fine: bool = False) -> tuple[str, ...]:
+    """Which schemes in layers.json this machine can place, at this pitch.
+
+    Derived from the planner's own rule rather than listed, because with --fine
+    the answer depends on the pitch: an eighth of a cell is one carriage step at
+    pitch 15, one and a half at pitch 10, and there is no such thing as half a
+    motor step. ``daisy_full`` is typeable on one of those and not the other.
+    """
+    with open(os.path.join(SRC_DIR, "layers.json"), encoding="utf-8") as f:
+        schemes = json.load(f)
+    out = []
+    for name, offsets in schemes.items():
+        try:
+            for off_v, off_h in offsets:
+                planner.offset_to_units(off_v, "vertical", pitch, fine)
+                planner.offset_to_units(off_h, "horizontal", pitch, fine)
+        except PlanError:
+            continue
+        out.append(name)
+    return tuple(out)
 
 #: Glyph used for the calibration rulers. It wants to be a narrow vertical
 #: mark, so a half-step offset is obvious, and a character every type wheel
@@ -274,10 +301,34 @@ def run_optimizer(args) -> str:
     """Run optimize.py and return the path to the choices it wrote."""
     import optimize
 
-    if args.layers not in TYPEABLE_LAYER_SCHEMES:
+    pitch = Charset.load(args.charset, SRC_DIR).pitch
+    allowed = typeable_layer_schemes(pitch, args.fine)
+    if args.layers not in allowed:
+        # A scheme that --fine would accept is a different problem from one
+        # nothing can type, and the difference is the whole of what to do next.
+        with_fine = typeable_layer_schemes(pitch, fine=True)
+        hint = ""
+        if not args.fine and args.layers in with_fine:
+            hint = (
+                f" It is typeable with --fine, which places strikes with the "
+                f"machine's own motor steps -- but that needs 0xA5 and 0xA6, so "
+                f"type `erika.pipeline codes` first."
+            )
+        elif args.layers in typeable_layer_schemes(15, fine=True):
+            hint = (
+                " Its offsets are not a whole number of motor steps at pitch "
+                f"{pitch}, but they are at pitch 15 -- an eighth of a cell is "
+                "exactly one carriage step there. Nothing can act on that yet: "
+                "make_charset builds 10 and 12, and whether this machine even "
+                "accepts 15 characters per inch is what part 9 of "
+                "`erika.pipeline codes` asks."
+            )
         raise PlanError(
-            f"layer scheme '{args.layers}' uses offsets the Sigma cannot hit. "
-            f"Pick one of: {', '.join(TYPEABLE_LAYER_SCHEMES)}"
+            f"layer scheme '{args.layers}' uses offsets this machine cannot hit "
+            f"at pitch {pitch}"
+            + (" by keystroke." if not args.fine else ".")
+            + hint
+            + f" Pick one of: {', '.join(allowed)}"
         )
 
     target = preprocess_target(args)
@@ -1207,7 +1258,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="characters per row; sets the printed size (default 40)")
     r.add_argument("--num_loops", "-n", type=int, default=15)
     r.add_argument("--layers", "-l", default="4x1",
-                   help=f"layer scheme; typeable ones are {', '.join(TYPEABLE_LAYER_SCHEMES)}")
+                   help=f"layer scheme; typeable by keystroke are "
+                        f"{', '.join(TYPEABLE_LAYER_SCHEMES)}. --fine adds the "
+                        f"finer ones the motor steps can reach, which depends on "
+                        f"the charset's pitch")
     r.add_argument("--init_mode", "-i", default="random")
     r.add_argument("--asymmetry", "-a", type=float, default=0.1)
     r.add_argument("--search", "-s", default="simAnneal")
