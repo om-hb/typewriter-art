@@ -146,8 +146,13 @@ class Link:
             print(f"  <- {line}")
         return line
 
-    def await_reply(self, *prefixes: str, timeout: float = 30.0) -> str:
-        """Read until a line starts with one of `prefixes`, or with ERR."""
+    def await_reply(self, *prefixes: str, timeout: float = 30.0,
+                    errors: str = "raise") -> str:
+        """Read until a line starts with one of `prefixes`, or with ERR.
+
+        `errors="skip"` treats an ERR as ordinary noise instead. Only `resync`
+        wants that, and for a specific reason -- see there.
+        """
         wanted = prefixes or REPLY_PREFIXES
         deadline = time.time() + timeout
         seen = []
@@ -157,7 +162,10 @@ class Link:
             except TimeoutError:
                 continue
             if line.startswith("ERR"):
-                raise RuntimeError(line)
+                if errors != "skip":
+                    raise RuntimeError(line)
+                seen.append(line)
+                continue
             if any(line.startswith(p) for p in wanted):
                 return line
             seen.append(line)
@@ -194,17 +202,49 @@ class Link:
         return out
 
     def resync(self) -> None:
-        """Get the device to a known-quiet state before starting a transfer.
+        """Get the device to a known-quiet state before trusting a reply.
 
         A transfer that died leaves the firmware answering the data lines still
         in flight. Those replies arrive after the port is opened, so without
         this the next run reads a stale error as the answer to its first
         command -- which is exactly as confusing as it sounds.
+
+        Two things make draining until silence the wrong way to do it, and the
+        first is not an error at all:
+
+        `IMG CANCEL` is answered "ERR no upload in progress" whenever nothing is
+        in flight, which is the normal state of a board that has just been
+        opened. So this provokes an ERR every time it runs, and its own reply is
+        the stale line most likely to be mistaken for the next answer.
+
+        And the board may still be in `setup()`, answering nothing for many
+        seconds: WiFi association waits up to 15s and `loop()` does not run until
+        it returns. The commands sit in the receive buffer meanwhile and are all
+        answered in one pass when it does -- so the reply to `IMG CANCEL` can
+        arrive *after* the next command was sent, whatever was drained first.
+
+        Hence a sentinel instead. `IMG STATUS` is answered with "STATE ..." in
+        every state the firmware has, so everything ahead of that line is stale
+        by definition, whenever it turns up and whatever it says.
+
+        Asked twice, because the other thing a reset does is throw the question
+        away: lines that arrive while the boot ROM still holds the port are
+        consumed by it and never reach the firmware, and waiting the whole
+        timeout out for a reply nothing ever heard is a poor way to spend it.
         """
-        self.send_line("IMG CANCEL")
-        for _ in range(20):
-            if not self.drain(0.3):
+        # Half the budget each: long enough to outlast association (15s) plus
+        # the fixed delays in setup(), and a board silent for both halves is not
+        # merely booting.
+        for attempt in (1, 2):
+            self.send_line("IMG CANCEL")
+            self.send_line("IMG STATUS")
+            try:
+                self.await_reply("STATE", timeout=12.5, errors="skip")
                 break
+            except TimeoutError:
+                if attempt == 2:
+                    raise
+        self.drain()
         self.ser.reset_input_buffer()
 
 

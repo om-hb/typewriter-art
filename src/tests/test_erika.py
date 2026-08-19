@@ -206,7 +206,8 @@ class FakeDevice:
 
     Mirrors ImageReceiver::handleLine() closely enough to exercise the host's
     framing and ACK accounting: base64 decode, running total, and the
-    UPLOAD-READY / ACK / OK replies.
+    UPLOAD-READY / ACK / OK replies -- and the two lines a resync sends, whose
+    firmware answers are the whole point of test_resync_survives_a_board_in_setup.
     """
 
     def __init__(self, chunk=None):
@@ -231,6 +232,18 @@ class FakeDevice:
                 return f"UPLOAD-READY {self.chunk}"
             if sub.upper() == "PING":
                 return f"PONG chunk={self.chunk}"
+            if sub.upper() == "CANCEL":
+                # Cancelling nothing is an error, not a no-op. A resync sends
+                # this first, so that ERR is the normal answer to the very first
+                # line the host ever sends.
+                if not self.active:
+                    return "ERR no upload in progress"
+                self.active = False
+                return "OK upload cancelled"
+            if sub.upper() == "STATUS":
+                # Answered in every state, which is what makes it a usable
+                # sentinel for resync.
+                return "STATE READY" if self.received else "STATE IDLE"
             return "ERR unknown"
         if head == "D" and self.active:
             data = base64.b64decode(rest)
@@ -277,6 +290,87 @@ class FakeLink:
 
     def resync(self) -> None:
         self._pending = []
+
+
+class SleepySerial:
+    """A port whose board is still in setup(): it takes lines in and answers
+    nothing, then answers all of them at once when loop() finally runs.
+
+    That is the real timeline -- Serial.setRxBufferSize() buys 4 kB before
+    Serial.begin(), WiFiConfig::begin() then waits up to 15s for association, and
+    poll() drains the whole buffer in one pass afterwards. Modelled on the write
+    count rather than on a clock, so the test does not sleep: the wake-up is the
+    moment the `wake_after`th line is taken in.
+    """
+
+    def __init__(self, device: FakeDevice, wake_after: int = 2):
+        self.device = device
+        self.wake_after = wake_after
+        self.port = None
+        self.baudrate = None
+        self.timeout = None
+        self.write_timeout = None
+        self.dtr = True
+        self.rts = True
+        self.is_open = False
+        self._held: list[str] = []
+        self._wire: list[str] = []
+
+    def open(self) -> None:
+        self.is_open = True
+
+    def close(self) -> None:
+        self.is_open = False
+
+    def write(self, raw: bytes) -> int:
+        text = raw.decode().strip()
+        self.device.sent_lines.append(text)
+        reply = self.device.line(text)
+        (self._held if self.wake_after else self._wire).append(reply)
+        if self.wake_after:
+            self.wake_after -= 1
+            if not self.wake_after:
+                self._wire += self._held
+                self._held = []
+        return len(raw)
+
+    def flush(self) -> None:
+        pass
+
+    def readline(self) -> bytes:
+        # b"" is how pyserial reports the read timeout Link.read_line raises on.
+        return (self._wire.pop(0) + "\r\n").encode() if self._wire else b""
+
+    def reset_input_buffer(self) -> None:
+        # Only what has reached the host: the replies still inside the device are
+        # beyond reach, which is exactly why draining could not clear them.
+        self._wire = []
+
+
+def test_resync_survives_a_board_still_in_setup(monkeypatch):
+    """The resync's own reply must not become the next command's answer.
+
+    IMG CANCEL is answered "ERR no upload in progress" whenever nothing is in
+    flight, and a board still in setup() answers it only after the next line has
+    gone out -- so draining until silence cleared nothing, and the first real
+    command read that ERR as its own. Connecting to a healthy machine failed with
+    the firmware's correct answer to a question the host had asked itself.
+    """
+    import types
+
+    from erika import send
+
+    device = FakeDevice()
+    port = SleepySerial(device)
+    monkeypatch.setattr(send, "_require_serial", lambda: types.SimpleNamespace(
+        Serial=lambda: port))
+
+    link = send.Link("/dev/fake", reset=False)
+    link.resync()
+
+    assert link.command("IMG PING", echo=False).startswith("PONG")
+    # The sentinel, not a silence window: everything ahead of the STATE is stale.
+    assert device.sent_lines == ["IMG CANCEL", "IMG STATUS", "IMG PING"]
 
 
 @pytest.mark.parametrize("noise", [False, True])
