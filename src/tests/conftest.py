@@ -21,8 +21,8 @@ def pytest_terminal_summary(terminalreporter):
     """Warn loudly when the Python/C++ code tables went unchecked.
 
     The Erika codes, the .etp opcodes and the upload chunk size each exist
-    twice -- once in Python here, once in C++ in erika_ai. Six tests compare
-    them, and they only run with the firmware checked out. Without it the suite
+    twice -- once in Python here, once in C++ in erika_ai. A dozen-odd tests
+    compare them, and they only run with the firmware checked out. Without it the suite
     still reports all-green, which is exactly the impression not to give.
 
     This goes in the summary rather than the header because the header is

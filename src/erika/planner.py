@@ -81,6 +81,10 @@ class Charset:
     def has_forces(self) -> bool:
         return any(f is not None for f in self.forces)
 
+    def force_for(self, index: int) -> int | None:
+        """The force this index is typed at, or None if the charset has none."""
+        return self.forces[index] if index < len(self.forces) else None
+
     def force_rank(self, index: int) -> int:
         """Where index's force comes in the typing order."""
         force = self.forces[index] if index < len(self.forces) else None
@@ -343,6 +347,78 @@ def _serpentine(strikes: list[Strike]) -> list[Strike]:
     return out
 
 
+#: Shortest run worth typing backwards. Three, and the arithmetic is worth
+#: writing out because it is the whole case for the feature.
+#:
+#: Walking k adjacent cells leftwards in forward mode costs one byte for the
+#: first glyph and three for each of the rest -- two backspaces to undo the
+#: escapement's advance and take another cell off, then the glyph -- so 3k-2.
+#: Backwards it is one byte to enter the mode, one per glyph and one to leave:
+#: k+2. The approach differs too, by exactly one byte in backward's favour,
+#: since the run is entered one cell further right than it is begun.
+#:
+#: That makes two cells a saving of one byte where the head has to travel to the
+#: run at all, and a tie where it is already standing on the first cell. Three
+#: is the shortest run that is strictly cheaper either way, and a tie stays on
+#: the mechanism that has been on paper longest -- the same rule
+#: ``stepsAreWorthIt`` follows in the firmware.
+MIN_BACKWARD_RUN = 3
+
+
+def _continues_backwards(a: Strike, b: Strike, cs: Charset) -> bool:
+    """Can `b` be typed as the backward strike that follows `a`?
+
+    Backward printing is one motion welded to one strike: the head steps a whole
+    cell left and marks there. So `b` has to be exactly that -- one cell left of
+    `a`, on the same pass, at the same sub-cell offset, with nothing needed
+    between them that the mode has not been asked about.
+
+    The three refusals are all the same refusal. A different paper position or a
+    different residue needs a *motion* in between, and whether the motion keys
+    invert with the printing direction is unasked. A stacked glyph is at the
+    same x, which needs 0xA9, and whether that still means "print where the head
+    stands" is unasked. A dead key does not feed at all, and what "does not
+    feed" means in a mode whose content is the direction of the feed is unasked
+    hardest of all. Section 7 of the sheet answered plain advancing strikes and
+    this is the run of them.
+
+    A force change is refused for a plainer reason: it is two bytes on the wire,
+    which is the whole saving for two cells, and it would sit inside a mode that
+    the machine has only been seen to hold across characters.
+    """
+    return (
+        (b.y, b.fy) == (a.y, a.fy)
+        and b.fx == a.fx
+        and b.x == a.x - 2
+        and cs.advances[a.index]
+        and cs.advances[b.index]
+        and cs.force_for(a.index) == cs.force_for(b.index)
+    )
+
+
+def _backward_runs(strikes: list[Strike], cs: Charset) -> dict[int, int]:
+    """Which stretches of the plan to type right to left.
+
+    Returns ``{first strike index: one past the last}``. Runs are maximal, which
+    is what makes the greedy scan the right answer here: the relation is between
+    neighbours, so a run that cannot be extended contains every shorter run
+    inside it, and splitting one could only add mode switches.
+
+    Empty unless the plan is a serpentine -- a pass that sweeps left to right
+    never has two strikes in descending order, let alone three.
+    """
+    runs: dict[int, int] = {}
+    i, n = 0, len(strikes)
+    while i < n:
+        j = i + 1
+        while j < n and _continues_backwards(strikes[j - 1], strikes[j], cs):
+            j += 1
+        if j - i >= MIN_BACKWARD_RUN:
+            runs[i] = j
+        i = j
+    return runs
+
+
 def _one_mechanism(delta: int, per_unit: int) -> tuple[int, int]:
     """Split a move into whole keystroke units and motor steps -- or all steps.
 
@@ -393,6 +469,7 @@ def encode(
     settle_ms: int = 0,
     cr_delay_ms: int = 0,
     no_advance: bool = True,
+    backward: bool = True,
 ) -> etp.Job:
     """Emit the opcode stream for a plan, tracking the head as we go.
 
@@ -407,6 +484,14 @@ def encode(
     O struck through and no backspace anywhere in the plan. Pass False to get
     the backspace behaviour, which is what to do if a sheet comes out with the
     stacks smeared and you want to know which mechanism is at fault.
+
+    `backward` types a serpentine's reverse passes with Rückwärtsdruck (0x8E)
+    instead of backspacing between every cell: the machine moves left and
+    strikes on one byte instead of three. It costs a byte at each end of a run,
+    so `_backward_runs` picks the stretches where it pays, and a plan that
+    returns the carriage every row has no such stretches -- this does nothing to
+    one. On by default since section 7 of the sheet came back reading EDCBA;
+    pass False for the backspaces, for the same fault-isolating reason as above.
     """
     enc = etp.Encoder()
     cs = plan.charset
@@ -422,7 +507,25 @@ def encode(
     force: int | None = None
 
     strikes = plan.strikes
+    # The stretches to type right to left, as {first index: one past the last}.
+    # Worked out up front because whether a strike starts a run decides where
+    # the carriage has to be *before* it, which is a move this loop has already
+    # emitted by the time it reaches the strike.
+    runs = _backward_runs(strikes, cs) if backward else {}
+    run_stop = 0  # one past the last strike of the run being typed, if any
+
     for i, s in enumerate(strikes):
+        if i < run_stop:
+            # Inside a run: the strike carries its own motion, so there is
+            # nothing to emit but the glyph. Everything the branch below does --
+            # feed the paper, change force, move the carriage -- is a thing
+            # _continues_backwards refused, which is what makes this safe.
+            enc.strike(cs.codes[s.index], cs.advances[s.index])
+            x = s.x  # it moved first, so the head stands on the mark
+            if i + 1 == run_stop:
+                enc.backward_off()
+            continue
+
         # A stack is glyphs at the same place, one after another. They are only
         # adjacent in the list when nothing separates them -- with strike force
         # in play a stack can be split across force groups, and then these are
@@ -466,19 +569,35 @@ def encode(
             y, y_fine = s.y, s.fy
             prev_y = (s.y, s.fy)
 
-        want = cs.forces[s.index] if s.index < len(cs.forces) else None
+        want = cs.force_for(s.index)
         if want is not None and want != force:
             enc.set_force(want)
             force = want
 
+        # Where the carriage has to be for this strike. One cell right of the
+        # mark if a backward run starts here, because the machine takes that
+        # cell off itself before the hammer comes down -- and that is exactly
+        # where the escapement would stand after typing at s.x, so it is not a
+        # position the carriage has to reach and could not before.
+        start = runs.get(i)
+        target = s.x + 2 if start is not None else s.x
+
         # The same arithmetic across, for the same reason.
         per_half = ec.carriage_steps_per_half_step(cs.pitch)
         dx, dx_fine = _one_mechanism(
-            (s.x * per_half + s.fx) - (x * per_half + x_fine), per_half
+            (target * per_half + s.fx) - (x * per_half + x_fine), per_half
         )
         enc.horizontal(dx)
         enc.horizontal_fine(dx_fine)
-        x, x_fine = s.x, s.fx
+        x, x_fine = target, s.fx
+
+        if start is not None:
+            enc.backward_on()
+            run_stop = start
+            enc.strike(cs.codes[s.index], cs.advances[s.index])
+            x = s.x
+            continue
+
         advances = cs.advances[s.index] and not stacked
         if stacked:
             enc.no_advance()
@@ -523,9 +642,12 @@ def summarize(plan: Plan, job: etp.Job, ops_per_second: float = 10.0) -> str:
             # One command whatever the distance, and it moves less than any
             # keystroke can, so it costs about what a carriage step does.
             mech_ops += 1
-        elif op == etp.OP_NO_ADVANCE:
+        elif op in (etp.OP_NO_ADVANCE, etp.OP_BACKWARD_ON, etp.OP_BACKWARD_OFF):
             mech_ops += 1
         elif op in (etp.OP_STRIKE, etp.OP_STRIKE_NA, etp.OP_CR):
+            # A backward strike is still one operation: the escapement takes its
+            # cell and the hammer comes down, which is what a forward strike
+            # does in the other order.
             mech_ops += 1
         elif op == etp.OP_NEWLINE:
             mech_ops += operand
@@ -542,6 +664,17 @@ def summarize(plan: Plan, job: etp.Job, ops_per_second: float = 10.0) -> str:
     layers = len(plan.layer_offsets)
     stacks = sum(1 for _, op, _ in etp.iter_ops(job.body)
                  if op == etp.OP_NO_ADVANCE)
+    backward_runs = 0
+    backward_strikes = 0
+    typing_backwards = False
+    for _, op, _ in etp.iter_ops(job.body):
+        if op == etp.OP_BACKWARD_ON:
+            typing_backwards = True
+            backward_runs += 1
+        elif op == etp.OP_BACKWARD_OFF:
+            typing_backwards = False
+        elif op == etp.OP_STRIKE and typing_backwards:
+            backward_strikes += 1
     force_line = []
     if cs.has_forces:
         force_line = [
@@ -563,5 +696,8 @@ def summarize(plan: Plan, job: etp.Job, ops_per_second: float = 10.0) -> str:
             f"  paper feed   {'carriage return every pass' if plan.home_each_row else 'serpentine, no return'}",
             *([f"  overstrike   {stacks} glyphs typed without advancing (0xA9), "
                "so no backspace between a stack"] if stacks else []),
+            *([f"  backward     {backward_strikes} glyphs typed right to left "
+               f"(0x8E) over {backward_runs} runs, so one byte a cell on the "
+               "reverse sweeps instead of three"] if backward_runs else []),
         ]
     )

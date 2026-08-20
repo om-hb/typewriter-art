@@ -31,7 +31,7 @@ project is also driven through `uv run python`. Substitute whichever applies;
 
 ```bash
 cd src
-PY -m pytest tests -q                                   # 112 tests
+PY -m pytest tests -q                                   # 228 tests
 PY -m erika.pipeline charset --pitch 10                 # build the Sigma charset
 PY -m erika.pipeline print -t images/mwdog_crop.png -r 48
 PY -m erika.pipeline print -t photo.jpg -r 48 --grey c2g   # STRESS, not luma
@@ -105,13 +105,13 @@ half an hour of typing to discover:
 ## Shared tables with erika_ai
 
 The Erika motion codes, the `.etp` opcodes and the upload chunk size each exist
-twice — here in Python, and in C++ in `erika_ai/src/`. Six tests parse those
-headers and compare. **They only run with `erika_ai` checked out**: beside this
-repository by default, or wherever `ERIKA_FIRMWARE_SRC` points. If it is
+twice — here in Python, and in C++ in `erika_ai/src/`. Thirteen tests parse
+those headers and compare. **They only run with `erika_ai` checked out**: beside
+this repository by default, or wherever `ERIKA_FIRMWARE_SRC` points. If it is
 missing the suite prints a loud `drift guards did not run` banner — do not
-ignore it, those six tests are the only protection the tables have.
+ignore it, those thirteen tests are the only protection the tables have.
 
-Two of the six compare the *shape* of the opcode stream rather than its
+Some of them compare the *shape* of the opcode stream rather than its
 constants, and they exist because adding `OP_SET_FORCE` showed how an opcode
 goes wrong: the firmware decides how many bytes to read from its own
 hand-written list of opcodes that carry an operand, and an opcode missing from
@@ -194,6 +194,56 @@ downstream can recover. Hence defaults that lean light.
 `_sheet_from_scan` used to undo this in the one place that measures real ink: it
 mapped the 1st percentile to 0, taking the darkest ink on the sheet and making
 it black. It now normalises the *paper* and leaves the ink where it lies.
+
+## Typing right to left: `0x8E`
+
+A serpentine plan (`--no-home`) sweeps alternate passes backwards, and the
+machine will do that itself: `0x8E` makes a strike step one whole cell *left*
+and then mark, so a reverse pass costs one wire byte a cell instead of a glyph
+and two backspaces. On by default since section 7 of the control-code sheet came
+back reading EDCBA with the A one cell left of where the head started;
+`--backspace-sweep` reverts it, and it does nothing at all to a plan that
+returns the carriage every row, which has no reverse passes to type.
+
+`planner._backward_runs` finds maximal runs of strikes exactly one cell apart
+and descending, and wraps the ones at least three long in `OP_BACKWARD_ON` /
+`OP_BACKWARD_OFF`. Three, because the switch costs a byte at each end and two
+cells is a tie when the carriage was already standing on the first of them.
+
+**Whether it is worth anything at all depends on the layer scheme, and that is
+the thing to know before measuring it.** `0x8E` moves a whole cell, so it helps
+only where consecutive strikes in a pass are a whole cell apart. At 24 columns
+on the sample photograph, serpentine, in head operations:
+
+| scheme | backspacing | backwards | |
+|---|---|---|---|
+| `1x1` | 1526 | 650 | −57% |
+| `2Vx1` | 3088 | 1290 | −58% |
+| `1x2` | 2502 | 2429 | −3% |
+| `4x1` | 5885 | 5815 | −1% |
+
+`4x1` places two layers half a cell apart *across*, so its passes step by halves
+and never by the cell the mode moves; `1x2` puts both layers in one cell, so its
+passes are stacks, and a stack is `0xA9`.
+
+Three things about the restrictions, because they look like timidity and are
+not. The sheet typed five plain letters and asked nothing else, so **nothing but
+a plain advancing strike goes between the two opcodes**: not a motion (whether
+the motion keys invert with the printing direction is unasked), not a `0xA9`
+(whether "print where the head stands" still means that is unasked), not a dead
+key, and not a force change. Every one of those would put each later mark on the
+line in the wrong cell, and none would read as a mode fault on the sheet — they
+would read as the carriage slipping. `emulate.Typewriter` refuses all four
+rather than modelling a guess the suite would then certify.
+
+It is also *state on the machine*, like strike force: a job that stops between
+the two codes leaves the typewriter typing right to left for whoever touches it
+next. The firmware's `flushBackwardPrint()` sends `0x8D` on finish, abort and
+failure, and a drift test checks all three.
+
+The open question, and the reason it is worth another sheet: if `0x73` still
+moves *right* under `0x8E`, a half-cell scheme becomes two bytes a cell instead
+of three, and `4x1` — the row that gains nothing above — joins in.
 
 ## Halftoning: `--match-blur`
 

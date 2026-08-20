@@ -66,6 +66,8 @@ OP_RIGHT_FINE = 0x0F  # n     move right n carriage steps (1/120")
 OP_LEFT_FINE = 0x10  # n      move left  n carriage steps
 OP_DOWN_FINE = 0x11  # n      feed paper down n platen steps (1/240")
 OP_UP_FINE = 0x12  # n        feed paper up   n platen steps
+OP_BACKWARD_ON = 0x13  # -   strikes from here move one cell left, then mark
+OP_BACKWARD_OFF = 0x14  # -  and back to marking, then moving one cell right
 
 _HAS_OPERAND = {
     OP_RIGHT, OP_LEFT, OP_DOWN, OP_UP, OP_STRIKE, OP_STRIKE_NA,
@@ -81,6 +83,7 @@ OPCODE_NAMES = {
     OP_NO_ADVANCE: "NO_ADVANCE",
     OP_RIGHT_FINE: "RIGHT_FINE", OP_LEFT_FINE: "LEFT_FINE",
     OP_DOWN_FINE: "DOWN_FINE", OP_UP_FINE: "UP_FINE",
+    OP_BACKWARD_ON: "BACKWARD_ON", OP_BACKWARD_OFF: "BACKWARD_OFF",
 }
 
 MAX_OPERAND = 0xFF
@@ -308,6 +311,44 @@ class Encoder:
         """
         self._emit(OP_NO_ADVANCE)
 
+    def backward_on(self) -> None:
+        """Type right to left from here until :meth:`backward_off` (0x8E).
+
+        In backward mode the head steps one whole cell *left* and then strikes,
+        so a strike marks where the head is going rather than where it stands.
+        Section 7 of ``erika.pipeline codes`` is what fixes that order: five
+        letters typed from column 20 read EDCBA with the A at column 19, one
+        cell to the *left* of where the head started.
+
+        What it buys is a serpentine's reverse pass. Walking a row leftwards in
+        forward mode costs three bytes a cell -- two backspaces to undo the
+        advance and take another cell off, then the glyph -- and here it costs
+        one, because the machine makes the move itself. The mode switch is a
+        byte at each end, so it pays from three cells up; ``planner`` works that
+        out and leaves shorter runs on the backspaces.
+
+        **Nothing but plain advancing strikes may go between the two.** The
+        sheet answered the strike and nothing else: whether the motion keys
+        invert with the printing direction, whether 0xA9 still means "print
+        where the head stands", and whether a dead key still declines to feed
+        are all unasked. Each of them would put every mark after it in the wrong
+        cell, and none of them would look like a mode problem on the paper. The
+        planner keeps to what was measured and the emulator refuses the rest
+        rather than modelling a guess.
+        """
+        self._emit(OP_BACKWARD_ON)
+
+    def backward_off(self) -> None:
+        """Back to printing left to right (0x8D).
+
+        This is state that outlives the job, like strike force and like the
+        keyboard lock: a machine left in backward mode types the operator's own
+        next line from right to left. So every run ends with one of these, and
+        the firmware sends it again on abort and on failure -- the paths where
+        the opcode never arrives.
+        """
+        self._emit(OP_BACKWARD_OFF)
+
     # -- probing -----------------------------------------------------------
     def raw(self, byte: int) -> None:
         """Put one byte on the wire exactly as given.
@@ -480,7 +521,7 @@ def disassemble(job: Job, limit: int | None = None) -> str:
         {
             b
             for b in raw
-            if b not in ec.OPERAND_CODES and b != ec.NO_ADVANCE
+            if b not in ec.OPERAND_CODES and b not in ec.MODIFIER_CODES
             and b in ec.CONTROL_CODE_NAMES
         }
     )
@@ -506,6 +547,9 @@ def disassemble(job: Job, limit: int | None = None) -> str:
     force: int | None = None
     pending_raw: int | None = None  # a raw command waiting for its operand byte
     no_advance = False  # 0xA9 seen: the next strike does not move the carriage
+    # 0x8E seen: a strike steps one cell left and marks there, so the column
+    # shown against it is where the mark lands and not where the head stood.
+    backward = False
     n = 0
     for off, op, operand in iter_ops(job.body):
         if op == OP_RIGHT:
@@ -530,10 +574,16 @@ def disassemble(job: Job, limit: int | None = None) -> str:
             x, y = 0, y + 2 * operand
             x_fine = 0
         elif op == OP_STRIKE:
-            if no_advance:
+            if backward:
+                x -= 2  # the machine moves first, so the mark is at the new x
+            elif no_advance:
                 no_advance = False
             else:
                 x += 2
+        elif op == OP_BACKWARD_ON:
+            backward = True
+        elif op == OP_BACKWARD_OFF:
+            backward = False
         elif op == OP_SET_FORCE:
             force = operand
         elif op == OP_RAW:
@@ -552,6 +602,10 @@ def disassemble(job: Job, limit: int | None = None) -> str:
                 pending_raw = operand
             elif operand == ec.NO_ADVANCE:
                 no_advance = True
+            elif operand == ec.BACKWARD_PRINT_ON:
+                backward = True
+            elif operand == ec.BACKWARD_PRINT_OFF:
+                backward = False
         elif op == OP_NO_ADVANCE:
             no_advance = True
 

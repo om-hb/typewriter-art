@@ -53,6 +53,12 @@ def _step_chunks(code: int, steps: int) -> list[int]:
     return out
 
 
+#: The keystrokes that move the carriage. Named because backward printing makes
+#: them a question rather than a motion; see ``Typewriter.feed``.
+_HORIZONTAL_KEYS = frozenset(
+    {ec.SPACE, ec.BACKSPACE, ec.HALF_STEP_FORWARD, ec.HALF_STEP_BACK}
+)
+
 #: The three settings behind the firmware's ``IMG STEPS``.
 STEPS_OFF = "off"
 STEPS_AUTO = "auto"
@@ -129,6 +135,10 @@ def expand(body: bytes, direct_steps: str = STEPS_OFF, pitch: int = 10) -> list[
             out.append(operand)
         elif op == etp.OP_NO_ADVANCE:
             out.append(ec.NO_ADVANCE)
+        elif op == etp.OP_BACKWARD_ON:
+            out.append(ec.BACKWARD_PRINT_ON)
+        elif op == etp.OP_BACKWARD_OFF:
+            out.append(ec.BACKWARD_PRINT_OFF)
         elif op in (etp.OP_RIGHT_FINE, etp.OP_LEFT_FINE):
             # Finer than any keystroke, so there is nothing else these could
             # expand to -- the direct-step commands are not optional here.
@@ -169,12 +179,17 @@ class Typewriter:
     those, so there is a residue underneath each -- see `_x_fine`.
 
     What this models and what it merely *records* is the distinction to keep in
-    view. The keystroke motions, the strike force and the direct step commands
-    are modelled, because a plan's placement depends on them and offline
-    verification is the point of the whole arrangement. The mode switches are
-    recorded in `probes` and otherwise ignored: what 0x8E or 0x8C do to this
-    machine is what `erika.pipeline codes` exists to find out, and a guess here
-    would be a guess that the test suite then certifies.
+    view. The keystroke motions, the strike force, the direct step commands and
+    backward printing are modelled, because a plan's placement depends on them
+    and offline verification is the point of the whole arrangement. The
+    remaining mode switches are recorded in `probes` and otherwise ignored: what
+    0x8C does to this machine is what `erika.pipeline codes` exists to find out,
+    and a guess here would be a guess that the test suite then certifies.
+
+    Backward printing crossed that line when section 7 of the sheet came back --
+    but only as far as the sheet went, which was plain advancing strikes. The
+    combinations it did not ask about raise rather than resolving to a position:
+    see `feed`.
     """
 
     x: int = 0
@@ -196,6 +211,8 @@ class Typewriter:
     _awaiting_operand: int | None = None
     #: 0xA9 seen: the next strike prints where it stands.
     _no_advance: bool = False
+    #: 0x8E seen: a strike steps one cell left and marks there, 0x8D undoes it.
+    _backward: bool = False
     #: Sub-half-step and sub-half-line residue, in the machine's own motor steps.
     _x_fine: int = 0
     _y_fine: int = 0
@@ -221,6 +238,12 @@ class Typewriter:
         if self._awaiting_operand is not None:
             command, self._awaiting_operand = self._awaiting_operand, None
             steps = ec.decode_step_operand(code)
+            if command == ec.CARRIAGE_STEPS and self._backward:
+                raise EmulationError(
+                    "0xA5 (carriage steps) while backward printing is on: the "
+                    "sign of a step count in that mode is unasked -- see "
+                    "erika_codes.BACKWARD_PRINT_ON"
+                )
             if command == ec.CARRIAGE_STEPS:
                 self._x_fine += steps
                 carry, self._x_fine = divmod(
@@ -242,10 +265,35 @@ class Typewriter:
         if code == ec.NO_ADVANCE:  # Doppeldruck: print where the head stands
             self._no_advance = True
             return
+        if code == ec.BACKWARD_PRINT_ON:  # Rückwärtsdruck: move left, then mark
+            self._backward = True
+            return
+        if code == ec.BACKWARD_PRINT_OFF:
+            self._backward = False
+            return
         if code in ec.CONTROL_CODE_NAMES and code not in ec.CONTROL_CODES:
             # A mode switch, or something else this model has no opinion about.
             self.probes.append((code, None))
             return
+
+        if code in _HORIZONTAL_KEYS and self._backward:
+            # The one thing 0x8E is *about* is which way the head goes, and the
+            # sheet asked it of the strike alone. Whether SPACE still moves
+            # right in backward mode, or becomes the mechanism that undoes a
+            # backward strike, is unasked -- and either reading places every
+            # later mark on the line, so a guess here would be certified by
+            # every test that runs a plan through this. The planner never puts
+            # a motion inside a backward run for the same reason.
+            #
+            # A carriage return is deliberately not in this set: it returns the
+            # carriage to the left margin, which is the same place whichever way
+            # the printing runs.
+            raise EmulationError(
+                f"0x{code:02X} ({ec.describe_code(code)}) while backward "
+                "printing is on: no sheet has said whether the motion keys "
+                "invert with the printing direction -- see erika_codes."
+                "BACKWARD_PRINT_ON"
+            )
 
         if code == ec.SPACE:
             self._move(2)
@@ -274,11 +322,30 @@ class Typewriter:
             glyph = ec.glyph_for_code(code)
             if glyph is None:
                 raise EmulationError(f"struck unknown key 0x{code:02X}")
+            if self._backward and (self._no_advance or not glyph.advances):
+                # Both of these are "do not feed" said in a mode whose whole
+                # content is *which way* the feed goes, and the probe sheet
+                # asked neither. Modelling one would be inventing an answer that
+                # the test suite would then certify, and the failure on paper is
+                # every mark after it in the wrong cell -- so refuse instead.
+                # `planner` never builds this; a hand-written probe might.
+                raise EmulationError(
+                    f"0x{code:02X} ({ec.describe_code(code)}) was struck "
+                    + ("after 0xA9" if self._no_advance else "as a dead key")
+                    + " while backward printing is on, and no sheet has said "
+                    "what the machine does with that -- see erika_codes."
+                    "BACKWARD_PRINT_ON"
+                )
+            if self._backward:
+                # "erst Vorschub rückwärts, dann Zeichendruck": the head moves
+                # one cell left and the mark lands there, so it ends up standing
+                # on the mark rather than one cell past it.
+                self._move(-2)
             self.impressions.append(
                 Impression(self.y, self.x, code, self.force,
                            self._y_fine, self._x_fine)
             )
-            if glyph.advances and not self._no_advance:
+            if glyph.advances and not self._no_advance and not self._backward:
                 self._move(2)
             self._no_advance = False
 

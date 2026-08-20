@@ -395,7 +395,7 @@ def plan_and_encode(args, choices_path: str) -> tuple[planner.Plan, etp.Job]:
         fine=args.fine,
     )
     job = planner.encode(plan, settle_ms=args.settle_ms, cr_delay_ms=args.cr_delay_ms,
-                         no_advance=args.no_advance)
+                         no_advance=args.no_advance, backward=args.backward)
     return plan, job
 
 
@@ -1314,6 +1314,12 @@ def _add_plan_args(p):
                         "backspacing, as before 0xA9 was confirmed, instead of "
                         "with Doppeldruck. Spends the escapement's repeatability "
                         "on every stacked character; here for the same reason")
+    p.add_argument("--backspace-sweep", dest="backward", action="store_false",
+                   help="type a serpentine's reverse passes by striking and "
+                        "backspacing, as before 0x8E was confirmed, instead of "
+                        "with Rückwärtsdruck. Three bytes a cell instead of one, "
+                        "and it does nothing at all without --no-home, which is "
+                        "what makes a pass run right to left in the first place")
     p.add_argument("--no-preview", action="store_true")
     p.add_argument("--ops-per-second", type=float, default=10.0,
                    help="head operations per second, for the time estimate")

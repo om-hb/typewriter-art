@@ -117,6 +117,12 @@ def test_firmware_motion_codes_match_python():
         "ERIKA_PLATEN_STEPS_PER_INCH": ec.PLATEN_STEPS_PER_INCH,
         "ERIKA_MAX_STEPS_PER_COMMAND": ec.MAX_STEPS_PER_COMMAND,
         "ERIKA_REPORT_WHEN_PRINTED": 0x96,
+        # Rückwärtsdruck, which the planner reaches for on a serpentine's
+        # reverse passes. The pair has to stay a pair on both sides: the firmware
+        # sends the OFF again on every exit, and a drifted OFF would leave the
+        # machine typing right to left with nothing to say why.
+        "ERIKA_BACKWARD_PRINT_ON": ec.BACKWARD_PRINT_ON,
+        "ERIKA_BACKWARD_PRINT_OFF": ec.BACKWARD_PRINT_OFF,
     }
     for name, value in expected.items():
         assert defines.get(name) == value, f"{name} differs from erika_codes.py"
@@ -166,6 +172,8 @@ def test_firmware_opcodes_match_python():
         "ETP_DELAY": etp.OP_DELAY, "ETP_MICRO_DOWN": etp.OP_MICRO_DOWN,
         "ETP_MICRO_UP": etp.OP_MICRO_UP, "ETP_NEWLINE": etp.OP_NEWLINE,
         "ETP_SET_FORCE": etp.OP_SET_FORCE,
+        "ETP_BACKWARD_ON": etp.OP_BACKWARD_ON,
+        "ETP_BACKWARD_OFF": etp.OP_BACKWARD_OFF,
         "ETP_HEADER_SIZE": etp.HEADER_SIZE, "ETP_VERSION": etp.VERSION,
         "ETP_FLAG_PITCH12": etp.FLAG_PITCH12,
         "ETP_FLAG_HOME_EACH_ROW": etp.FLAG_HOME_EACH_ROW,
@@ -1010,6 +1018,9 @@ def test_expand_covers_every_opcode_the_encoder_can_emit():
     enc.delay_ms(30)
     enc.strike(ec.glyph_for_char("A").code)
     enc.strike(ec.DEAD_KEY_GLYPHS[0].code, advances=False)
+    enc.backward_on()
+    enc.strike(ec.glyph_for_char("B").code)
+    enc.backward_off()
     enc.end()
     raw = emulate.expand(enc.body())
     assert raw  # no EmulationError, and something came out
@@ -2043,25 +2054,30 @@ def test_no_advance_prints_the_next_glyph_where_the_head_stands():
 
 
 def test_the_emulator_records_a_mode_switch_rather_than_guessing_at_it():
-    """What 0x8E does to this machine is what the probe sheet exists to find
-    out. A model that assumed an answer would have the test suite certify it."""
+    """What 0x8C does to this machine is what the probe sheet exists to find
+    out. A model that assumed an answer would have the test suite certify it.
+
+    0x8E used to be the example here and is now modelled, which is the shape of
+    the thing: a code moves out of `probes` when a sheet has said what it does,
+    and not before.
+    """
     enc = etp.Encoder()
-    enc.raw(0x8E)
+    enc.raw(0x8C)  # correction ribbon on -- erase or white ink, depending on tape
     enc.raw_command(0xAA, 4)
     enc.strike(ec.glyph_for_char("A").code)
     machine = emulate.Typewriter().run(emulate.expand(enc.body()))
-    assert machine.probes == [(0x8E, None), (0xAA, 4)]
+    assert machine.probes == [(0x8C, None), (0xAA, 4)]
     assert [(i.x) for i in machine.impressions] == [0]  # nothing moved the head
 
 
 def test_the_disassembly_says_which_bytes_its_columns_do_not_account_for():
     enc = etp.Encoder()
-    enc.raw(0x8E)
+    enc.raw(0x8C)
     enc.strike(ec.glyph_for_char("A").code)
     enc.end()
     text = etp.disassemble(etp.Job(body=enc.body()))
     assert "do NOT account for" in text
-    assert "BACKWARD_PRINT_ON" in text
+    assert "CORRECTION_ON" in text
     # A job that only steps is fully modelled, so it gets no such warning.
     plain = etp.Encoder()
     plain.carriage_steps(12)
@@ -2099,6 +2115,28 @@ def test_the_probe_sheet_asks_the_machine_the_questions_it_says_it_does(tmp_path
         assert code in raw, f"the sheet never sends 0x{code:02X}"
     # And it puts the pitch back, or everything typed after it comes out narrow.
     assert raw[-1] == 0x87
+
+
+def test_the_emulator_reproduces_section_7_the_way_the_paper_read_it(tmp_path):
+    """The model tied back to the measurement it came from.
+
+    The printed sheet reported the five letters reading EDCBA with the A at
+    column 19 -- one cell left of the column 20 the head started at. That single
+    observation is the whole of the position model for 0x8E, so this is the test
+    that fails if the model is ever quietly inverted into the mirror of the
+    forward one, which is the plausible wrong answer.
+    """
+    job = _codes_sheet(tmp_path)
+    machine = emulate.type_job(job)
+    letters = [(i.x / 2, ec.glyph_for_code(i.code).char)
+               for i in machine.impressions]
+    groups = [letters[k:k + 5] for k in range(len(letters) - 4)
+              if [c for _, c in letters[k:k + 5]] == list("ABCDE")]
+    # Two of them: the section heading says ABCDE, and then section 7 types it.
+    # The heading runs forwards, which is what makes the second one legible.
+    assert len(groups) == 2
+    assert groups[0] == [(23, "A"), (24, "B"), (25, "C"), (26, "D"), (27, "E")]
+    assert groups[1] == [(19, "A"), (18, "B"), (17, "C"), (16, "D"), (15, "E")]
 
 
 def test_the_probe_sheets_two_combs_ask_for_the_same_distance(tmp_path):
@@ -2394,6 +2432,365 @@ def test_the_plan_summary_says_when_it_used_doppeldruck(tmp_path, charset):
     assert "without advancing" in planner.summarize(plan, job)
     plain = planner.encode(plan, no_advance=False)
     assert "without advancing" not in planner.summarize(plan, plain)
+
+
+# ---------------------------------------------------------------------------
+# typing right to left (0x8E, planner backward=)
+#
+# Section 7 of the control-code sheet answered one question and left three. It
+# answered the strike: five letters typed from column 20 read EDCBA with the A
+# at column *19*, so the head moves one cell left and then marks. It did not ask
+# what a motion key, a Doppeldruck or a dead key does in that mode, and each of
+# those would put every mark after it in the wrong cell.
+#
+# So these tests come in two halves. One says the saving is real and lands where
+# the plan said. The other says the planner stays inside what the sheet actually
+# measured -- and that is the half that matters, because the failure it guards
+# against is a sheet that looks like a registration fault.
+# ---------------------------------------------------------------------------
+
+#: One layer at whole-cell offsets: the case backward printing is *for*. Anything
+#: with a half-cell horizontal offset puts consecutive strikes half a cell apart,
+#: which is not the move 0x8E makes.
+WHOLE_CELL_LAYERS = [(0, 0)]
+
+
+def _ops(job) -> list[int]:
+    return [op for _, op, _ in etp.iter_ops(job.body)]
+
+
+def _count(job, want) -> int:
+    return sum(1 for op in _ops(job) if op == want)
+
+
+def _serpentine_plan(tmp_path, charset, layers=None, seed=17, density=0.95,
+                     rows=6, cols=14):
+    path = _write_choices(
+        tmp_path,
+        _random_choices(charset, rows, cols, layers or WHOLE_CELL_LAYERS,
+                        seed=seed, density=density),
+    )
+    return planner.build_plan(path, charset, home_each_row=False)
+
+
+def test_a_reverse_pass_types_backwards_instead_of_backspacing(tmp_path, charset):
+    plan = _serpentine_plan(tmp_path, charset)
+    backwards = planner.encode(plan)
+    sweeping = planner.encode(plan, backward=False)
+
+    assert _count(backwards, etp.OP_BACKWARD_ON) > 0
+    assert _count(sweeping, etp.OP_BACKWARD_ON) == 0
+    # The backspaces are what it replaces, and the wire is where the saving is:
+    # a byte the machine has to digest costs a character delay whatever it says.
+    assert _count(backwards, etp.OP_LEFT) < _count(sweeping, etp.OP_LEFT)
+    assert len(emulate.expand(backwards.body)) < len(
+        emulate.expand(sweeping.body)
+    )
+
+
+def test_every_backward_strike_lands_where_the_plan_said(tmp_path, charset):
+    """The property everything else rests on, checked the way the rest of the
+    pipeline checks itself: run the opcodes through the virtual machine and
+    compare every impression against the plan.
+
+    Several densities, because what a run *is* depends on where the gaps fall --
+    a dense row is one long run and a sparse one is a scatter of short ones with
+    ordinary carriage moves between them."""
+    for density in (1.0, 0.8, 0.5, 0.2):
+        plan = _serpentine_plan(tmp_path, charset, density=density, seed=23)
+        job = planner.encode(plan)
+        machine = emulate.type_job(job, max_columns=charset.max_columns)
+        assert machine.overruns == 0
+        assert [(i.y, i.x, i.code) for i in machine.impressions] == [
+            (s.y, s.x, charset.codes[s.index]) for s in plan.strikes
+        ], f"density {density}"
+
+
+def test_a_backward_run_costs_one_byte_a_cell_and_a_sweep_three(tmp_path, charset):
+    """The arithmetic behind MIN_BACKWARD_RUN, on the wire rather than on paper.
+
+    A full row of one layer is one run from end to end, so the reverse pass is
+    exactly its glyphs plus the two mode switches -- against a glyph and two
+    backspaces per cell the other way."""
+    cols = 10
+    grid = [[3] * cols, [4] * cols]
+    path = _write_choices(tmp_path, {"layer0_0_0": grid})
+    plan = planner.build_plan(path, charset, home_each_row=False)
+
+    reverse_pass = [s for s in plan.strikes if s.y == 2]
+    assert [s.x for s in reverse_pass] == sorted(
+        (s.x for s in reverse_pass), reverse=True
+    ), "the second pass should sweep right to left"
+
+    backwards = len(emulate.expand(planner.encode(plan).body))
+    sweeping = len(emulate.expand(planner.encode(plan, backward=False).body))
+    # The pass above ends with the escapement one cell right of its last strike,
+    # which is exactly where a backward run wants to begin -- so the run arrives
+    # for nothing and costs one byte at each end plus one per cell: cols + 2.
+    # The sweep pays a backspace to get onto the first cell, a byte for it, and
+    # three for every cell after: 3 * cols - 1.
+    assert sweeping - backwards == (3 * cols - 1) - (cols + 2)
+
+
+def test_nothing_but_a_strike_goes_between_the_two_mode_switches(tmp_path, charset):
+    """The invariant that keeps the plan inside what the sheet measured.
+
+    A motion, a Doppeldruck, a force change or a paper feed in there would each
+    be an assumption about a mode nobody has asked about, and none of them would
+    look like a mode problem on the sheet -- they would look like the carriage
+    slipping."""
+    for layers, density in (
+        (WHOLE_CELL_LAYERS, 1.0),
+        (WHOLE_CELL_LAYERS, 0.5),
+        ([(0, 0)] * 3, 0.9),          # every cell a stack
+        (FOUR_LAYERS, 0.9),           # half-cell offsets across
+        ([(0, 0), (0.5, 0)], 0.7),    # two paper positions per row
+    ):
+        plan = _serpentine_plan(tmp_path, charset, layers=layers, density=density)
+        inside = False
+        for op in _ops(planner.encode(plan)):
+            if op == etp.OP_BACKWARD_ON:
+                assert not inside, "backward printing turned on twice"
+                inside = True
+            elif op == etp.OP_BACKWARD_OFF:
+                inside = False
+            elif inside:
+                assert op == etp.OP_STRIKE, (
+                    f"{etp.OPCODE_NAMES[op]} while typing backwards, and no sheet "
+                    "has said what the machine does with it"
+                )
+
+
+def test_backward_printing_is_always_turned_off_again(tmp_path, charset):
+    """It is a mode, and a mode outlives the job. A plan that ends in it would
+    leave the next thing typed on the machine -- by the firmware's chatbot, or
+    by hand -- running right to left."""
+    plan = _serpentine_plan(tmp_path, charset, density=1.0)
+    ops = _ops(planner.encode(plan))
+    assert ops.count(etp.OP_BACKWARD_ON) == ops.count(etp.OP_BACKWARD_OFF) > 0
+    assert ops.index(etp.OP_BACKWARD_ON) < ops.index(etp.OP_BACKWARD_OFF)
+    last_switch = max(i for i, op in enumerate(ops)
+                      if op in (etp.OP_BACKWARD_ON, etp.OP_BACKWARD_OFF))
+    assert ops[last_switch] == etp.OP_BACKWARD_OFF
+    assert etp.OP_END in ops[last_switch:]
+
+
+def test_a_run_too_short_to_pay_stays_on_the_backspaces(tmp_path, charset):
+    """Two cells is a byte at best and a tie at worst, so the mechanism that has
+    been on paper longest keeps it -- the same rule the firmware's
+    stepsAreWorthIt follows."""
+    # A reverse pass of exactly two adjacent cells, and one of exactly three.
+    cases = {"two": [[1, 1, 1], [0, 1, 1]], "three": [[1, 1, 1], [1, 1, 1]]}
+    paths = {}
+    for name, grid in cases.items():
+        (tmp_path / name).mkdir()
+        paths[name] = _write_choices(tmp_path / name, {"layer0_0_0": grid})
+    for path, expected in ((paths["two"], 0), (paths["three"], 1)):
+        plan = planner.build_plan(path, charset, home_each_row=False)
+        assert _count(planner.encode(plan), etp.OP_BACKWARD_ON) == expected
+
+
+def test_a_stack_is_never_typed_backwards(tmp_path, charset):
+    """0xA9 means "print where the head stands", and in a mode whose whole
+    content is which way the head goes before it prints, nobody has asked what
+    that means. A cell with two glyphs in it therefore ends a run."""
+    every_cell_stacked = _write_choices(
+        tmp_path, {"layer0_0_0": [[5] * 8] * 2, "layer1_0_0": [[6] * 8] * 2}
+    )
+    plan = planner.build_plan(every_cell_stacked, charset, home_each_row=False)
+    job = planner.encode(plan)
+    assert _count(job, etp.OP_NO_ADVANCE) > 0
+    assert _count(job, etp.OP_BACKWARD_ON) == 0
+    # And it is still typed correctly, on the backspaces.
+    machine = emulate.type_job(job, max_columns=charset.max_columns)
+    assert [(i.y, i.x) for i in machine.impressions] == [
+        (s.y, s.x) for s in plan.strikes
+    ]
+
+
+def test_a_run_that_begins_where_a_stack_ended_still_lands(tmp_path, charset):
+    """The one adjacency worth constructing by hand.
+
+    A cell with two glyphs in it is typed with 0xA9, which leaves the head
+    standing *on* the cell rather than one past it -- and a backward run wants to
+    begin one cell to the right of its first mark. So the run has to step right
+    before it turns the mode on, which reads like the wrong direction and is the
+    right one. Row 0 is only there to be the forward pass, so that row 1 is the
+    reversed one: 10, 10, 8, 6, 4, a stack and then a run.
+    """
+    path = _write_choices(tmp_path, {
+        "layer0_0_0": [[2, 2, 0, 0, 0, 0], [0, 0, 3, 4, 5, 6]],
+        "layer1_0_0": [[0, 0, 0, 0, 0, 0], [0, 0, 0, 0, 0, 7]],
+    })
+    plan = planner.build_plan(path, charset, home_each_row=False)
+    assert [s.x for s in plan.strikes] == [0, 2, 10, 10, 8, 6, 4]
+
+    job = planner.encode(plan)
+    assert _count(job, etp.OP_NO_ADVANCE) == 1
+    assert _count(job, etp.OP_BACKWARD_ON) == 1
+    machine = emulate.type_job(job, max_columns=charset.max_columns)
+    assert [(i.y, i.x, i.code) for i in machine.impressions] == [
+        (s.y, s.x, charset.codes[s.index]) for s in plan.strikes
+    ]
+
+
+def test_a_dead_key_is_never_typed_backwards(tmp_path):
+    """It does not feed at all, and "does not feed" in a mode that is entirely
+    about the direction of the feed is the least answerable of the three."""
+    dead = ec.DEAD_KEY_GLYPHS[0]
+    cs = Charset(
+        name="test-dead", pitch=10, cell_w=24, cell_h=40, max_columns=65,
+        codes=[ec.SPACE, ec.glyph_for_char("A").code, dead.code],
+        advances=[True, True, False],
+        chars=[" ", "A", dead.char],
+    )
+    # A reverse pass of five cells with a dead key in the middle of it.
+    path = _write_choices(tmp_path, {"layer0_0_0": [[1] * 5,
+                                                    [1, 1, 2, 1, 1]]})
+    plan = planner.build_plan(path, cs, home_each_row=False)
+    job = planner.encode(plan)
+    inside = False
+    for _, op, operand in etp.iter_ops(job.body):
+        if op == etp.OP_BACKWARD_ON:
+            inside = True
+        elif op == etp.OP_BACKWARD_OFF:
+            inside = False
+        elif inside:
+            assert operand != dead.code
+    machine = emulate.type_job(job, max_columns=cs.max_columns)
+    assert [(i.y, i.x) for i in machine.impressions] == [
+        (s.y, s.x) for s in plan.strikes
+    ]
+
+
+def test_a_force_change_ends_a_run(tmp_path):
+    """Two bytes on the wire, which is the whole saving for two cells -- and it
+    would sit inside a mode the machine has only been seen to hold across
+    characters."""
+    cs = _force_charset()
+    # One row, alternating forces, typed with grouping off so the changes land
+    # inside the pass rather than being sorted out of it.
+    path = _write_choices(tmp_path, {"layer0_0_0": [[1] * 6, [1, 3, 1, 3, 1, 3]]})
+    plan = planner.build_plan(path, cs, home_each_row=False, group_by_force=False)
+    inside = False
+    for op in _ops(planner.encode(plan)):
+        if op == etp.OP_BACKWARD_ON:
+            inside = True
+        elif op == etp.OP_BACKWARD_OFF:
+            inside = False
+        elif inside:
+            assert op != etp.OP_SET_FORCE
+
+
+def test_a_plan_that_returns_the_carriage_never_types_backwards(tmp_path, charset):
+    """Every pass runs left to right, so there is nothing to reverse -- and the
+    byte stream has to be exactly what it was before any of this existed."""
+    path = _write_choices(tmp_path, _random_choices(charset, 5, 9, FOUR_LAYERS,
+                                                    seed=31))
+    plan = planner.build_plan(path, charset, home_each_row=True)
+    assert planner.encode(plan).body == planner.encode(plan, backward=False).body
+    assert _count(planner.encode(plan), etp.OP_BACKWARD_ON) == 0
+
+
+def test_the_opt_out_puts_the_backspaces_back(tmp_path, charset):
+    """--backspace-sweep, for the sheet that comes out wrong and the question of
+    which mechanism did it."""
+    plan = _serpentine_plan(tmp_path, charset)
+    job = planner.encode(plan, backward=False)
+    assert _count(job, etp.OP_BACKWARD_ON) == 0
+    assert _count(job, etp.OP_LEFT) > 0
+    machine = emulate.type_job(job, max_columns=charset.max_columns)
+    assert [(i.y, i.x) for i in machine.impressions] == [
+        (s.y, s.x) for s in plan.strikes
+    ]
+
+
+def test_the_emulator_refuses_what_the_sheet_did_not_ask(tmp_path):
+    """The model stops where the measurement stopped. A guess here would be a
+    guess every test that runs a plan through this then certifies."""
+    def wire(build):
+        enc = etp.Encoder()
+        enc.backward_on()
+        build(enc)
+        enc.backward_off()
+        return emulate.expand(enc.body())
+
+    stacked = wire(lambda e: (e.no_advance(),
+                              e.strike(ec.glyph_for_char("A").code),
+                              e.strike(ec.glyph_for_char("B").code)))
+    with pytest.raises(emulate.EmulationError, match="0xA9"):
+        emulate.Typewriter().run(stacked)
+
+    dead = ec.DEAD_KEY_GLYPHS[0]
+    with pytest.raises(emulate.EmulationError, match="dead key"):
+        emulate.Typewriter().run(wire(lambda e: e.strike(dead.code,
+                                                         advances=False)))
+
+    with pytest.raises(emulate.EmulationError, match="motion keys"):
+        emulate.Typewriter().run(wire(lambda e: e.left(2)))
+
+    with pytest.raises(emulate.EmulationError, match="carriage steps"):
+        emulate.Typewriter().run(wire(lambda e: e.carriage_steps(6)))
+
+    # ...and the one it did ask is modelled, from the sheet's own section 7:
+    # five letters from column 20 read EDCBA with the A at column 19.
+    enc = etp.Encoder()
+    enc.right(2 * 20)
+    enc.backward_on()
+    for char in "ABCDE":
+        enc.strike(ec.glyph_for_char(char).code)
+    enc.backward_off()
+    machine = emulate.Typewriter().run(emulate.expand(enc.body()))
+    assert [(i.x // 2, ec.glyph_for_code(i.code).char)
+            for i in machine.impressions] == [
+        (19, "A"), (18, "B"), (17, "C"), (16, "D"), (15, "E"),
+    ]
+
+
+def test_the_disassembly_follows_the_head_backwards(tmp_path, charset):
+    """The columns are what a plan is checked against without a typewriter, so
+    they have to run the same way the paper does."""
+    plan = _serpentine_plan(tmp_path, charset, density=1.0)
+    text = etp.disassemble(planner.encode(plan))
+    assert "BACKWARD_ON" in text and "BACKWARD_OFF" in text
+    # The strikes between the two switches walk leftwards, one cell at a time.
+    cols, inside = [], False
+    for line in text.splitlines():
+        if "BACKWARD_ON" in line:
+            inside = True
+        elif "BACKWARD_OFF" in line:
+            break
+        elif inside and " STRIKE " in line:
+            cols.append(float(line.split()[1]))
+    assert len(cols) >= planner.MIN_BACKWARD_RUN
+    assert all(b - a == -1.0 for a, b in zip(cols, cols[1:])), cols
+
+
+def test_the_plan_summary_says_when_it_typed_backwards(tmp_path, charset):
+    plan = _serpentine_plan(tmp_path, charset, density=1.0)
+    assert "right to left" in planner.summarize(plan, planner.encode(plan))
+    plain = planner.encode(plan, backward=False)
+    assert "right to left" not in planner.summarize(plan, plain)
+
+
+@pytest.mark.skipif(NO_FIRMWARE, reason=NO_FIRMWARE_REASON)
+def test_the_firmware_turns_backward_printing_off_on_every_exit():
+    """The same property the postamble has, for the same reason: 0x8E is state
+    on the machine, and a job that stops between it and 0x8D leaves the operator
+    with a typewriter that types right to left and nothing to say why. A failure
+    is exactly the path somebody would forget."""
+    text = open(os.path.join(FIRMWARE_SRC, "erika_image.cpp"),
+                encoding="utf-8").read()
+    for func in ("abort", "fail", "finish"):
+        body = re.search(rf"void ErikaImagePrinter::{func}\(.*?\n}}", text, re.S)
+        assert body, f"could not find {func}()"
+        assert "flushBackwardPrint()" in body.group(0), (
+            f"{func}() can leave the machine printing right to left"
+        )
+    # And it is the OFF code that gets sent, not the ON one again.
+    flush = re.search(r"void ErikaImagePrinter::flushBackwardPrint\(.*?\n}",
+                      text, re.S)
+    assert flush and "ERIKA_BACKWARD_PRINT_OFF" in flush.group(0)
 
 
 # ---------------------------------------------------------------------------

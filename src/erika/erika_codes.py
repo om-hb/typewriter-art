@@ -126,12 +126,32 @@ OPERAND_CODES = frozenset(
 #: escapement's repeatability on a backspace between each pair.
 NO_ADVANCE = 0xA9
 
+#: Rückwärtsdruck: while this is on, the head steps one full cell *left* and
+#: then strikes, so typing runs right to left. 0x8D puts it back.
+#:
+#: The order is the whole of it, and section 7 of `erika.pipeline codes` is what
+#: settled it: five letters typed from column 20 came out reading EDCBA with the
+#: A at column *19*, so the table's "erst Vorschub rückwärts, dann Zeichendruck"
+#: is literal. The model is therefore ``x -= 2`` and then mark, which leaves the
+#: head standing on the mark rather than one cell past it -- the mirror of
+#: forward printing in cost but not in arithmetic.
+#:
+#: What the sheet did not ask, and so what nothing here may assume: whether the
+#: motion keys invert with it, whether 0xA9 still means "print where the head
+#: stands", and whether a dead key still declines to feed. The planner keeps a
+#: backward run to plain advancing strikes with no motion inside it for exactly
+#: that reason, and the emulator refuses the combinations rather than guessing.
+BACKWARD_PRINT_ON = 0x8E
+BACKWARD_PRINT_OFF = 0x8D
+
 #: 0xA9 (Doppeldruck) does not eat the next byte, it *changes* it: the character
 #: after it prints without advancing the carriage. So a stray 0xA9 does not
 #: desynchronise the stream, it silently drops one advance -- which shifts
-#: everything after it on the line. Named here because it is the one code above
-#: the motion block that is neither inert nor stream-breaking.
-MODIFIER_CODES = frozenset({NO_ADVANCE})
+#: everything after it on the line. 0x8E is the same shape of hazard one step
+#: further out: it changes what *every* following strike does to the position,
+#: until 0x8D. Named here because these are the codes above the motion block
+#: that are neither inert nor stream-breaking.
+MODIFIER_CODES = frozenset({NO_ADVANCE, BACKWARD_PRINT_ON, BACKWARD_PRINT_OFF})
 
 # --------------------------------------------------------------------------
 # What the wheel can be told to type
@@ -471,8 +491,8 @@ CONTROL_CODE_NAMES = {
     0x89: "PITCH_15",
     0x8B: "CORRECTION_OFF",
     0x8C: "CORRECTION_ON",
-    0x8D: "BACKWARD_PRINT_OFF",
-    0x8E: "BACKWARD_PRINT_ON",
+    BACKWARD_PRINT_OFF: "BACKWARD_PRINT_OFF",
+    BACKWARD_PRINT_ON: "BACKWARD_PRINT_ON",
     0x8F: "MARGIN_RELEASE_ON",
     0x91: "KEYBOARD_OFF",
     0x92: "KEYBOARD_ON",

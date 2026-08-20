@@ -109,6 +109,14 @@ Ordering matters mechanically:
   the first strike, rather than carrying accumulated position across rows. It
   costs travel time and buys registration. `--no-home` turns this off and
   sweeps serpentine instead, which is faster and less accurate.
+- **A serpentine's reverse passes are typed right to left**, with `0x8E`, so
+  the machine makes the leftward move itself: one byte a cell instead of a
+  glyph and two backspaces. Only where consecutive strikes are a whole cell
+  apart, which is what that mode moves — so it is worth about 57% of the head
+  operations on a whole-cell scheme like `1x1` or `2Vx1`, and next to nothing
+  on `4x1`, whose layers sit half a cell apart across. Nothing but plain
+  advancing strikes goes inside such a run; see `planner._continues_backwards`
+  for why each of the exclusions is an exclusion.
 - **Whole-line gaps use the line-feed mechanism** (`NEWLINE`) rather than two
   half-line steps, because the detented full-line advance is more repeatable.
 
@@ -548,6 +556,7 @@ Useful planning flags for `print` and `plan`:
 | `-l 4x1` | layer scheme; `1x1`…`4x2` by keystroke, finer ones by motor step (pitch-dependent) |
 | `--keystrokes-only` | refuse an offset the keyboard cannot reach, instead of placing it with motor steps |
 | `--backspace-overstrike` | stack a cell's glyphs with a backspace between each pair, instead of Doppeldruck |
+| `--backspace-sweep` | sweep a reverse pass with backspaces, instead of typing it right to left with `0x8E` |
 | `--no-home` | serpentine sweep instead of returning each pass — faster, less accurate |
 | `--settle-ms 200` | pause after each paper feed, if the platen needs to settle |
 | `--jitter 0.1` | registration error used for the shaky preview |
@@ -708,11 +717,19 @@ and `emulate` all understand.
 
 **The sheet has been printed and every code on it works** — see
 `docs/control-codes.md` at the workspace root for what each section said. So
-`0xA5`, `0xA6` and `0xA9` are no longer opt-in: the firmware defaults to
-`IMG STEPS AUTO`, and the planner places fine offsets and stacks glyphs with
-Doppeldruck unless told otherwise. The flags above name the *old* mechanism, and
-exist for the case where a sheet comes out wrong and the question is which one
-did it.
+`0xA5`, `0xA6`, `0xA9` and `0x8E` are no longer opt-in: the firmware defaults to
+`IMG STEPS AUTO`, and the planner places fine offsets, stacks glyphs with
+Doppeldruck and types reverse passes backwards unless told otherwise. The flags
+above name the *old* mechanism, and exist for the case where a sheet comes out
+wrong and the question is which one did it.
+
+`0x8E` is the one that stopped being raw and became a pair of opcodes, which is
+what that paragraph above asks for. It is also the one whose answer was
+narrower than the code: the section typed five plain letters, so plain letters
+are all the planner will put between `OP_BACKWARD_ON` and `OP_BACKWARD_OFF` —
+no motion, no `0xA9`, no dead key, no force change. Whether `0x73` still moves
+right in that mode is the one question worth another sheet, because it is what
+would extend the saving to the half-cell layer schemes.
 
 Two things stayed off. `IMG ACK` (`0x96`) is not on the sheet at all: it changes
 when RTS is released rather than what is typed, so only a timed run can answer
