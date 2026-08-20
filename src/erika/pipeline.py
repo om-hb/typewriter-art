@@ -685,27 +685,82 @@ def cmd_area(args) -> int:
 
 
 def cmd_sheet(args) -> int:
-    """Type the full charset so it can be scanned into a real charset."""
+    """Type the full charset so it can be scanned into a real charset.
+
+    Every row carries a registration mark at each end, one blank cell clear of
+    the glyphs. They are what lets `charset --from-scan` recover the cell grid
+    from the scan instead of trusting the crop: two marks of the same glyph a
+    known number of cells apart, so the distance between their ink centroids is
+    that many cells whatever bearing the mark has. See make_charset's note on
+    SHEET_MARK_CHAR for what cropping to the ink costs instead.
+    """
+    from erika.make_charset import (SHEET_MARK_CHAR, SHEET_MARK_GAP,
+                                    sheet_mark_cells)
+
     glyphs = ec.all_glyphs(dead_keys=args.dead_keys)
     forces = _parse_forces_arg(args.forces)
     cols = args.sheet_cols
+    mark = ec.glyph_for_char(SHEET_MARK_CHAR)
+    if mark is None:
+        raise PlanError(f"the Sigma has no key for the registration mark "
+                        f"{SHEET_MARK_CHAR!r}")
+    left_cell, first_cell, right_cell = sheet_mark_cells(cols)
     enc = etp.Encoder()
+
+    # The marks are struck at the hardest force whatever the row is typed at. A
+    # mark is a measurement, not a sample, and a light one on a light-force row
+    # is a measurement that might not be found.
+    hardest = forces[0] if forces else None
+    current: int | None = None
+
+    def strike_mark() -> None:
+        nonlocal current
+        if hardest is not None and current != hardest:
+            enc.set_force(hardest)
+            current = hardest
+        enc.strike(mark.code, mark.advances)
+
+    def restore_force() -> None:
+        nonlocal current
+        if force is not None and current != force:
+            enc.set_force(force)
+            current = force
+
+    def close_row(typed: int) -> None:
+        """Pad from the last glyph of a row out to the closing mark's cell.
+
+        `typed` rather than `cols` because the final row is usually short, and
+        the marks have to sit in the same column on every row or the grid they
+        describe is not a grid.
+        """
+        enc.right(2 * (right_cell - first_cell - typed))
+        strike_mark()
 
     # Contiguous, force block after force block, with no line break where one
     # block ends -- because make_charset lays the tiles out the same way, and it
     # has to: a blank tile between two glyphs would be dropped by chop_charset
     # and shift every index after it. See build_sheet.
     i = 0
+    total = len(glyphs) * max(1, len(forces))
     for force in forces or [None]:
         if force is not None:
             enc.set_force(force)
+            current = force
         for glyph in glyphs:
-            if i and i % cols == 0:
-                enc.newline(1)
+            if i % cols == 0:
+                if i:
+                    close_row(cols)
+                    enc.newline(1)
+                enc.carriage_return()
+                enc.right(2 * left_cell)
+                strike_mark()
+                enc.right(2 * (first_cell - left_cell - 1))
+                restore_force()
             enc.strike(glyph.code, glyph.advances)
             if not glyph.advances:
                 enc.right(2)
             i += 1
+    close_row(i % cols or cols)
     if forces:
         enc.set_force(forces[0])  # leave the machine as it was found
     enc.newline(3)
@@ -714,8 +769,8 @@ def cmd_sheet(args) -> int:
 
     tiles = len(glyphs) * max(1, len(forces))
     rows = (tiles + cols - 1) // cols
-    job = etp.Job(body=enc.body(), cols=cols, rows=rows, strikes=enc.strikes,
-                  pitch=args.pitch, home_each_row=True)
+    job = etp.Job(body=enc.body(), cols=right_cell + 1, rows=rows,
+                  strikes=enc.strikes, pitch=args.pitch, home_each_row=True)
     out = args.out if os.path.isabs(args.out) else os.path.join(SRC_DIR, args.out)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
     size = etp.save(out, job)
@@ -723,8 +778,14 @@ def cmd_sheet(args) -> int:
                    f"({', '.join(f'0x{f:02X}' for f in forces)})" if forces else "")
     print(f"charset sheet -> {out} ({size} bytes, {len(glyphs)} glyphs{forces_note}, "
           f"{cols} per line)")
-    print("\nType it, scan the block of glyphs square-on cropped to the outermost")
-    print("ink, then build a charset from the real type:")
+    print(f"\nEvery row carries a registration mark ({SHEET_MARK_CHAR!r}) at each end,")
+    print(f"{SHEET_MARK_GAP} blank cell clear of the glyphs. Scan the sheet square-on with")
+    print("white paper visible all round -- do NOT crop to the ink. The marks are")
+    print("what the grid is measured from, and cropping to the outermost ink puts")
+    print("the edge inside the outer cell by one side bearing, which on this")
+    print("machine is about an eighth of a cell and depends on which glyph")
+    print("happens to sit in that column.")
+    print("\nThen build a charset from the real type:")
     print(f"  python -m erika.pipeline charset --pitch {args.pitch} "
           f"--name sigma-scanned --from-scan /path/to/scan.png"
           + (f" --forces {args.forces}" if forces else ""))

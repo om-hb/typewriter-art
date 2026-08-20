@@ -78,16 +78,34 @@ still look plausible and the machine would type nonsense. Better to fail loudly
 at build time.
 
 Glyph shapes come from Courier New by default, which is an approximation of the
-Sigma's own face. For a faithful charset, type the calibration sheet on the
-machine and build from the scan:
+Sigma's own face — and a measurably wide one. Fitted so its *advance* matches the
+cell, Courier New draws a capital `M` whose ink is 97% of that advance; the
+Courier 10 wheel prints about 75%, so the bundled `sigma-10` models every glyph
+around 30% wider than the machine puts on paper. That is not cosmetic, because
+the optimizer picks each character by how much ink it lays down — and no check in
+this package can catch it, since `verify` compares the plan's render against the
+optimizer's mockup and both are built from the same charset. See
+`docs/control-codes.md` at the workspace root for how it was measured.
+
+So for anything tonal, type the sheet on the machine and build from the scan:
 
 ```bash
 python -m erika.pipeline sheet                    # writes results/charset_sheet.etp
 python -m erika.send results/charset_sheet.etp --print
-# scan the block of type, cropped square-on to the outermost ink
+# scan square-on with white paper visible all round -- do NOT crop to the ink
 python -m erika.pipeline charset --name sigma-scanned --from-scan scan.png
 python -m erika.pipeline print -c sigma-scanned -t photo.png
 ```
+
+The crop used to matter and no longer does. Every row of the sheet carries a
+registration mark at each end, one blank cell clear of the glyphs, and
+`--from-scan` measures the cell grid from those: two marks of the same glyph a
+known number of cells apart, so the distance between their ink centroids is that
+many cells whatever bearing the mark itself has. Cropping to the outermost ink —
+what this used to ask for — puts the edge one side bearing *inside* the outer
+cell, and which glyph sits in that column depends on `--sheet-cols`, so the error
+was neither small nor predictable. A scan with no marks on it still works and
+says out loud that it is guessing.
 
 ## What the planner does
 

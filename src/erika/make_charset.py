@@ -518,13 +518,117 @@ def make_charset(
     return charset_dir
 
 
+# ---------------------------------------------------------------------------
+# The scanned sheet's registration marks
+# ---------------------------------------------------------------------------
+# A scan has to be turned back into a cell grid, and the crop is what decides
+# where the grid falls. Cropping to the outermost ink -- what the sheet used to
+# ask for -- puts the crop edge at the widest glyph's *ink*, which is inside its
+# cell by one side bearing. That is not a small offset on this machine: the
+# Courier 10 wheel prints a capital M at about three quarters of its advance, so
+# a bearing is an eighth of a cell, and which glyph happens to sit in the outer
+# column depends on --sheet-cols. Nobody can say what the error is, which is the
+# problem rather than its size.
+#
+# So the sheet types a mark at each end of every row, one blank cell clear of
+# the glyphs, and the grid is measured from those instead. Two marks of the same
+# glyph, a known number of cells apart: the distance between their ink centroids
+# is that many cells exactly, because whatever bearing the mark has, it has the
+# same one at both ends and it cancels.
+
+#: Glyph the registration marks are typed with. Narrow, so it cannot be confused
+#: with the glyph block beside it, horizontally symmetric so its ink centroid is
+#: its cell's centre, and on every type wheel.
+SHEET_MARK_CHAR = "!"
+
+#: Blank cells between a mark and the glyph block, so the mark is a separate run
+#: of ink and can be found as one.
+SHEET_MARK_GAP = 1
+
+
+def sheet_mark_cells(cols: int) -> tuple[int, int, int]:
+    """(left mark, first glyph, right mark) as cell offsets in a sheet row.
+
+    One layout, named once. ``pipeline sheet`` types it and ``_sheet_from_scan``
+    measures it, and a disagreement between the two is a charset that is
+    silently a fraction of a cell out of step -- which is exactly the failure
+    the marks were added to remove.
+    """
+    left = 0
+    first = left + 1 + SHEET_MARK_GAP
+    right = first + cols + SHEET_MARK_GAP
+    return left, first, right
+
+
+def _ink_runs(has_ink: np.ndarray) -> list[tuple[int, int]]:
+    """[(start, stop), ...] for each run of True, as half-open ranges."""
+    padded = np.concatenate(([False], has_ink, [False]))
+    edges = np.flatnonzero(padded[1:] != padded[:-1])
+    return list(zip(edges[0::2], edges[1::2]))
+
+
+def _find_sheet_marks(im: np.ndarray, cols: int) -> tuple[float, float] | None:
+    """Ink centroids of the two registration marks, or None if there are none.
+
+    None covers a sheet typed before the marks existed and a crop that cut them
+    off. The caller falls back to the old behaviour and says so out loud, since
+    the fallback is the thing the marks were added to replace.
+
+    A row of glyphs is itself a row of narrow ink runs, so "narrow and at the
+    end" is not enough to identify a mark -- an unmarked sheet would pass it, and
+    then the grid would be measured from two glyphs instead and be wrong in a way
+    nothing announces. What actually distinguishes a mark is the blank cell
+    beside it: the gap between a mark and the block is several times any gap
+    *inside* the block. And once two candidates are in hand there is a second,
+    independent check available -- the cell width they imply has to agree with
+    the spacing of the glyph columns between them.
+    """
+    paper = float(np.percentile(im, 95))
+    ink = np.clip(paper - im.astype(np.float32), 0, None)
+    mask = im < paper * 0.75
+    runs = _ink_runs(mask.sum(axis=0) >= 2)  # two rows, so a speck is not a run
+    if len(runs) < 4:
+        return None
+
+    starts = np.array([a for a, _ in runs], dtype=np.float64)
+    period = float(np.median(np.diff(starts)))  # glyph columns are one cell apart
+    if period <= 0:
+        return None
+
+    gaps = [runs[i + 1][0] - runs[i][1] for i in range(len(runs) - 1)]
+    inner = gaps[1:-1]
+    if not inner:
+        return None
+    inner_median = max(float(np.median(inner)), 1.0)
+    if gaps[0] < 1.5 * inner_median or gaps[-1] < 1.5 * inner_median:
+        return None  # nothing is set apart from the block; no marks
+    for run in (runs[0], runs[-1]):
+        if (run[1] - run[0]) > 0.8 * period:
+            return None  # too wide to be one mark
+
+    def centroid(run):
+        a, b = run
+        w = ink[:, a:b].sum(axis=0)
+        return float((np.arange(a, b) * w).sum() / max(w.sum(), 1e-9))
+
+    left, right = centroid(runs[0]), centroid(runs[-1])
+    _, _, right_cell = sheet_mark_cells(cols)
+    implied = (right - left) / right_cell
+    if abs(implied - period) > 0.15 * period:
+        # The two candidates are the right distance apart for marks only if the
+        # cell they imply is the cell the glyph columns are actually spaced at.
+        return None
+    return left, right
+
+
 def _sheet_from_scan(scan_path, n_tiles, cols, cell_w, cell_h):
     """Slice a scanned charset sheet into the same cell grid.
 
     The charset sheet (see pipeline.py sheet) types the glyphs in GLYPHS order,
     `cols` per line, contiguously -- once per strike force if it was asked for
-    more than one. Scan it square-on, crop to the outermost ink, and pass it
-    here.
+    more than one -- with a registration mark at each end of every row. Scan it
+    square-on with white paper visible all round, and pass it here: the grid is
+    recovered from the marks, so the crop no longer has to be exact.
 
     Only the paper is normalised, and that is the point of this function. It used
     to stretch the 1st percentile to 0 as well, which took the darkest ink on the
@@ -538,6 +642,35 @@ def _sheet_from_scan(scan_path, n_tiles, cols, cell_w, cell_h):
     if im is None:
         raise FileNotFoundError(scan_path)
     rows = (n_tiles + cols - 1) // cols
+
+    marks = _find_sheet_marks(im, cols)
+    if marks is None:
+        print(
+            "WARNING: no registration marks found on the scan, so the grid is "
+            "being taken from the crop itself. That is only right if the crop "
+            "is exactly the glyph block, and a crop to the outermost ink is "
+            "inside it by one side bearing -- an eighth of a cell on this "
+            "machine. Re-type the sheet with `pipeline sheet` if you can."
+        )
+    else:
+        left_c, right_c = marks
+        _, first_cell, right_cell = sheet_mark_cells(cols)
+        cell = (right_c - left_c) / right_cell
+        # A mark sits at the centre of its own cell, so half a cell back from
+        # its centroid is the grid's origin.
+        block_left = left_c + (first_cell - 0.5) * cell
+        x0 = int(round(max(0.0, block_left)))
+        x1 = int(round(min(float(im.shape[1]), block_left + cols * cell)))
+        im = im[:, x0:x1]
+        # Vertically the ink extent is the honest crop and always was: every
+        # outer row has `cols` glyphs defining its extreme where an outer column
+        # has only `rows`, so this is the axis that did not need marks. Taken
+        # from the block alone, with the marks now cropped away.
+        paper = float(np.percentile(im, 95))
+        inked = np.flatnonzero((im < paper * 0.75).any(axis=1))
+        if inked.size:
+            im = im[inked[0] : inked[-1] + 1]
+
     im = cv2.resize(im, (cols * cell_w, rows * cell_h), interpolation=cv2.INTER_AREA)
     # The sheet is mostly paper, so a high percentile *is* the paper -- a robust
     # white point that a stray bright speck cannot drag around.

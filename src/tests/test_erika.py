@@ -3324,3 +3324,184 @@ def test_firmware_character_delay_matches_the_melody_timing_model():
 
     defines = _parse_cpp_defines(os.path.join(FIRMWARE_SRC, "erika_image.h"))
     assert defines.get("ERIKA_CHAR_DELAY_MS") == mel.RAW_BYTE_COST_MS
+
+
+# ---------------------------------------------------------------------------
+# recovering the cell grid from a scanned charset sheet
+# ---------------------------------------------------------------------------
+
+
+def _fake_scan(path, cols=20, rows=5, cell=30, line=50, margin=17,
+              bearing=6, marks=True):
+    """A synthetic scan of a charset sheet, at a scale nothing downstream knows.
+
+    Each glyph cell gets a bar a quarter of the way across it, which is what the
+    assertions read: a grid recovered a fraction of a cell out of step moves
+    every bar by that fraction. `bearing` is how far a glyph's ink sits inside
+    its own cell, and it is the whole reason the marks exist -- a crop to the
+    outermost ink lands `bearing` px inside the block, not on its edge.
+    """
+    import cv2
+    import numpy as np
+
+    from erika.make_charset import sheet_mark_cells
+
+    left_cell, first_cell, right_cell = sheet_mark_cells(cols)
+    width = margin * 2 + (right_cell + 1) * cell
+    img = np.full((margin * 2 + rows * line, width), 255, np.uint8)
+
+    def put(cell_x, row, x0_frac, w_frac):
+        x = margin + int((cell_x + x0_frac) * cell)
+        y = margin + row * line
+        img[y + line // 4 : y + 3 * line // 4,
+            x : x + max(1, int(w_frac * cell))] = 40
+
+    for r in range(rows):
+        for c in range(cols):
+            # A bar a quarter across the cell, inset by the bearing so that
+            # cropping to the ink is wrong by exactly that much.
+            put(first_cell + c, r, 0.25, 0.2)
+        if marks:
+            put(left_cell, r, 0.45, 0.1)
+            put(right_cell, r, 0.45, 0.1)
+    # Inset the block's own ink so a crop-to-ink is demonstrably off.
+    img[:, margin + first_cell * cell : margin + first_cell * cell + bearing] = 255
+    cv2.imwrite(str(path), img)
+    return cols, rows
+
+
+@pytest.mark.parametrize("margin", [0, 17, 60])
+def test_a_scan_grid_is_recovered_from_the_registration_marks(tmp_path, margin):
+    """The marks make the crop stop mattering, which is the point of them.
+
+    Three margins, including none: the recovered grid has to be the same grid
+    each time, because it is measured from two marks a known number of cells
+    apart rather than assumed from the edges of the image.
+    """
+    from erika.make_charset import _sheet_from_scan
+
+    path = tmp_path / f"scan-{margin}.png"
+    cols, rows = _fake_scan(path, margin=margin)
+    sheet, got_cols, got_rows = _sheet_from_scan(
+        str(path), cols * rows, cols, cell_w=24, cell_h=40
+    )
+    assert (got_cols, got_rows) == (cols, rows)
+    assert sheet.shape == (rows * 40, cols * 24)
+
+    # Every tile's bar should sit a quarter of the way across it. Read the
+    # darkest column of each tile and check where it fell.
+    import numpy as np
+
+    for r in range(rows):
+        for c in range(cols):
+            tile = sheet[r * 40 : (r + 1) * 40, c * 24 : (c + 1) * 24]
+            ink = np.flatnonzero(tile.min(axis=0) < 0.6)
+            assert ink.size, f"tile ({r}, {c}) came out blank"
+            start = ink[0] / 24
+            assert abs(start - 0.25) < 0.06, (
+                f"tile ({r}, {c}) bar starts at {start:.3f} of a cell, not 0.25 "
+                "-- the grid is out of step"
+            )
+
+
+def test_a_scan_without_marks_still_works_and_says_it_is_guessing(tmp_path, capsys):
+    """An older sheet, or a crop that cut the marks off. The fallback is the old
+    behaviour, and the old behaviour is the thing the marks replaced -- so it has
+    to be loud rather than silent."""
+    from erika.make_charset import _sheet_from_scan
+
+    path = tmp_path / "nomarks.png"
+    cols, rows = _fake_scan(path, margin=0, marks=False)
+    sheet, _, _ = _sheet_from_scan(str(path), cols * rows, cols, 24, 40)
+    assert sheet.shape == (rows * 40, cols * 24)
+    said = capsys.readouterr().out
+    assert "no registration marks" in said
+    assert "eighth of a cell" in said
+
+
+def test_the_marks_are_where_the_sheet_types_them(tmp_path):
+    """The layout is written down once and used by two modules -- the sheet types
+    it and the scan measures it. A disagreement is a charset silently a fraction
+    of a cell out of step, which is the failure the marks were added to remove.
+    """
+    from erika import pipeline
+    from erika.make_charset import SHEET_MARK_CHAR, sheet_mark_cells
+
+    out = os.path.join(tmp_path, "sheet.etp")
+    assert pipeline.main(["sheet", "-o", out, "--sheet-cols", "20"]) == 0
+    machine = emulate.type_job(etp.load(out))
+    mark = ec.glyph_for_char(SHEET_MARK_CHAR).code
+    left, first, right = sheet_mark_cells(20)
+
+    rows = {}
+    for imp in machine.impressions:
+        rows.setdefault(imp.y, []).append(imp)
+    assert rows, "the sheet typed nothing"
+    for y, line in rows.items():
+        cells = sorted(i.x // 2 for i in line)
+        assert cells[0] == left, f"row {y} does not open at cell {left}"
+        assert cells[-1] == right, f"row {y} does not close at cell {right}"
+        assert line[0].code == mark and line[-1].code == mark
+    assert machine.overruns == 0
+
+
+def test_the_marks_are_struck_hard_even_on_a_light_row(tmp_path):
+    """A mark is a measurement, not a sample. One typed at a light force on a
+    light-force row is a measurement that might not be found on the scan."""
+    from erika import pipeline
+
+    out = os.path.join(tmp_path, "sheet.etp")
+    assert pipeline.main(["sheet", "-o", out, "--forces", "0x00,0x30"]) == 0
+    machine = emulate.type_job(etp.load(out))
+    mark = ec.glyph_for_char("!").code
+    forces = {i.force for i in machine.impressions
+              if i.code == mark and i.x // 2 in (0, 23)}
+    assert forces == {0x00}, f"marks were struck at {forces}, not the hardest force"
+
+
+def test_the_crop_to_ink_the_marks_replaced_really_was_off(tmp_path):
+    """The failure, demonstrated rather than asserted from arithmetic.
+
+    An unmarked sheet cropped exactly to its outermost ink -- which is what the
+    sheet used to ask for -- gives a grid displaced by one side bearing, because
+    the ink of the outer column starts inside its own cell. The same sheet with
+    marks comes back in step. Both are measured here off the same synthetic
+    scan, so the difference is the marks and nothing else.
+    """
+    import numpy as np
+
+    from erika.make_charset import _sheet_from_scan
+
+    def bar_offsets(path):
+        sheet, _, rows = _sheet_from_scan(str(path), 20 * 5, 20, 24, 40)
+        out = []
+        for r in range(rows):
+            for c in range(20):
+                tile = sheet[r * 40 : (r + 1) * 40, c * 24 : (c + 1) * 24]
+                ink = np.flatnonzero(tile.min(axis=0) < 0.6)
+                out.append(ink[0] / 24 if ink.size else None)
+        return [o for o in out if o is not None]
+
+    marked = tmp_path / "marked.png"
+    _fake_scan(marked, margin=40, bearing=6, marks=True)
+
+    # The old way: no marks, and cropped hard against the ink.
+    import cv2
+    bare = tmp_path / "bare.png"
+    _fake_scan(bare, margin=0, bearing=6, marks=False)
+    im = cv2.imread(str(bare), cv2.IMREAD_GRAYSCALE)
+    inked_x = np.flatnonzero((im < 200).any(axis=0))
+    inked_y = np.flatnonzero((im < 200).any(axis=1))
+    cv2.imwrite(str(bare), im[inked_y[0] : inked_y[-1] + 1,
+                              inked_x[0] : inked_x[-1] + 1])
+
+    with_marks = bar_offsets(marked)
+    crop_to_ink = bar_offsets(bare)
+
+    worst_marked = max(abs(o - 0.25) for o in with_marks)
+    worst_cropped = max(abs(o - 0.25) for o in crop_to_ink)
+    assert worst_marked < 0.06, f"the marked grid is out by {worst_marked:.3f} cells"
+    assert worst_cropped > 2 * worst_marked, (
+        "the crop-to-ink grid was supposed to be the worse of the two; it came "
+        f"out at {worst_cropped:.3f} cells against {worst_marked:.3f}"
+    )
