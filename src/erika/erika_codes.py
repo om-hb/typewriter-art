@@ -225,17 +225,29 @@ RIBBON_STEPS = 0xA8  #: next byte is a count of 10 deg ribbon steps
 # has is time -- see erika/melody.py, which is the whole instrument.
 BELL = 0xAA
 
-#: The table's own "etwa 20 ms je Einheit". "Etwa" is the table's word, not a
-#: hedge added here: nothing has timed a beep on this machine.
-BELL_UNIT_MS = 20
+#: Measured, on this machine, with `erika.pipeline melody --probe` and a
+#: stopwatch: 255 units ran 2.3 s and 200 units 1.8 s, which is 9.02 and 9.00 ms
+#: per unit, and a straight line through the pair has a zero offset -- so the
+#: length is proportional to the operand with no fixed cost. 127 units timed
+#: 1.3 s, or 10.2, which is what hand-stopping does to a shorter interval; the
+#: two long readings are the trustworthy ones.
+#:
+#: **The table says "etwa 20 ms je Einheit" and on the Sigma it is about half
+#: that.** That is the S3004 figure, and this is the second thing on this
+#: interface to differ from the table rather than the first -- worth remembering
+#: the next time a number here is taken on the table's word. A tune written
+#: against 20 sounded its notes for 45% of what was asked, which reads as
+#: over-articulated rather than as broken, and is exactly the kind of wrongness
+#: nothing but a measurement finds.
+BELL_UNIT_MS = 9
 
-#: The longest length a melody will ask for. Not a limit the table gives -- it
-#: calls the byte a length code and stops -- but every neighbour of 0xAA in the
-#: operand block reads the high bit as a sign, so a length of 200 is as likely
-#: to come out short as long. Staying below the bit costs 2.5 seconds of beep
-#: nobody wants and removes the question. `erika.pipeline melody --probe`
-#: deliberately goes past it, which is how the question gets answered.
-MAX_BELL_UNITS = 127
+#: The whole operand, because the sweep settled it: 160, 200 and 255 each came
+#: out longer than the one before, so the byte is a plain unsigned length and
+#: the high bit is *not* a sign here as it is on 0xA5, 0xA6 and 0xA7. The cap
+#: was 127 while that was unread, which cost half the range for nothing.
+#:
+#: 255 units is 2.3 s, and that is the longest single beep this machine has.
+MAX_BELL_UNITS = 255
 
 #: One inch, in each mechanism's own steps.
 CARRIAGE_STEPS_PER_INCH = 120

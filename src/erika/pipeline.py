@@ -901,15 +901,24 @@ def cmd_melody(args) -> int:
         print(f"  {len(mel.PROBE_UNITS)} beeps: "
               f"{', '.join(str(n) for n in mel.PROBE_UNITS)} units")
         print()
-        print("Listen, do not look -- nothing is typed. Each beep should be")
-        print("twice the one before it up to 127 units. Time the 127 and divide:")
-        print(f"  that is the unit, which the table only gives as "
-              f"'etwa {ec.BELL_UNIT_MS} ms'.")
-        print("The four lengths after 127 are the question the cap exists for.")
-        print("Longer than 127 means the operand is an unsigned length and")
-        print("erika_codes.MAX_BELL_UNITS can rise to 255; shorter means the")
-        print("high bit is a sign here as it is on 0xA5 and 0xA6; silent is an")
-        print("answer too. Whichever it is, say so in docs/control-codes.md.")
+        print("Listen, do not look -- nothing is typed. Twelve beeps, each")
+        print("longer than the last, then silence.")
+        print()
+        print("This sweep has been run, and it is what the two constants come")
+        print("from: time a long beep and divide by its unit count, and the")
+        print(f"answer was {ec.BELL_UNIT_MS} ms rather than the table's 20 -- "
+              "the Sigma's")
+        print("beeper is about twice as quick as the S3004's is written down as.")
+        print("Every length past 127 came out longer than the one before it, so")
+        print("the operand is a plain unsigned byte and not a signed one; the")
+        print(f"longest beep the machine has is {ec.MAX_BELL_UNITS} units, "
+              f"{ec.MAX_BELL_UNITS * ec.BELL_UNIT_MS / 1000:.1f} s.")
+        print()
+        print("Worth re-running on a machine that has been serviced, on another")
+        print("Sigma, or after the firmware's pacing changes -- it is the only")
+        print("thing that would notice. A gap between two early beeps should")
+        print("come out near 1.6 s; that is the host's timing model, not the")
+        print("bell, and it is the half that would drift.")
     else:
         print(mel.score(melody))
         print()
@@ -918,9 +927,10 @@ def cmd_melody(args) -> int:
               f"per bell byte,")
         print(f"  which is why a note cannot be shorter than {mel.MIN_SLOT_MS} ms: "
               f"{mel.max_tempo_for('q'):.0f} BPM in quarters,")
-        print(f"  {mel.max_tempo_for('e'):.0f} in eighths. None of this has been "
-              "heard on the machine --")
-        print("  `erika.pipeline melody --probe` is what would time it.")
+        print(f"  {mel.max_tempo_for('e'):.0f} in eighths. A beep is "
+              f"{ec.BELL_UNIT_MS} ms per unit, measured, and at most")
+        print(f"  {ec.MAX_BELL_UNITS} units -- `melody --probe` is the sweep "
+              "that timed it.")
     return 0
 
 

@@ -1,7 +1,8 @@
 """Tunes on the typewriter's own beeper.
 
 The instrument is one control code. `0xAA` takes a single operand byte -- a
-length, about 20 ms per unit -- and there is no frequency anywhere in the
+length, about 9 ms per unit on this machine -- and there is no frequency
+anywhere in the
 interface's table. So the signal generator has exactly **one pitch**, and the
 only musical dimension this machine has is time.
 
@@ -16,20 +17,29 @@ that fill their own slots and the beeper produces one continuous tone.
 
 Three numbers bound what can be played, and all three come from somewhere:
 
-- **A beep is 20 ms per unit** (`ec.BELL_UNIT_MS`), so that is the resolution.
+- **A beep is 9 ms per unit** (`ec.BELL_UNIT_MS`), so that is the resolution.
+  Measured with `--probe`; the table's own figure is 20 and is wrong here.
 - **A note occupies at least 200 ms.** The bell is two bytes and the firmware
   charges a full character delay for each byte it cannot recognise as motion
   (`RAW_BYTE_COST_MS`, mirroring `ERIKA_CHAR_DELAY_MS`). Nothing the host does
   makes a note arrive sooner than that, which puts a hard ceiling on tempo --
   see `max_tempo_for`.
-- **A beep is at most 127 units**, 2.54 s (`ec.MAX_BELL_UNITS`), and that one is
-  a choice rather than a measurement. Longer notes hold their slot and simply
-  stop sounding partway through.
+- **A beep is at most 255 units**, 2.3 s (`ec.MAX_BELL_UNITS`) -- the whole
+  operand, the sweep having shown the high bit is not a sign here. Longer notes
+  hold their slot and simply stop sounding partway through.
 
-None of this has been heard on the machine. `erika.pipeline codes` section 1
-established that the bell answers a command-and-operand pair at all; the
-timings here are the table's arithmetic on top of that, and `--probe` is what
-would replace them with measurements.
+All of this has now been heard on the machine, which is why the numbers above
+are not the table's. `--probe` timed the unit at 9 ms and showed the operand to
+be unsigned, and the gaps between its beeps came out where the pacing model put
+them -- 1.55 s measured against 1.62 s predicted for the short ones, which is
+the reading that confirms a delay and a byte gap *overlap* rather than add.
+
+One thing the stopwatch could not settle: the sweep as a whole ran 40-45 s
+against 38.5 s predicted, and the excess sat in the beeps with the longest
+delays -- the ones over 2550 ms, which `delay_ms` splits into several ETP_DELAY
+opcodes. A chain of delays looks like it costs a little more than its parts.
+It is a few percent and it needs an instrument rather than a wristwatch, so it
+is written down here rather than compensated for.
 """
 
 from __future__ import annotations
@@ -59,8 +69,20 @@ RAW_BYTE_COST_MS = 100
 MIN_SLOT_MS = 2 * RAW_BYTE_COST_MS
 
 #: The shortest silence that still reads as a gap rather than as one long note.
-#: Two bell units, because a gap the generator cannot resolve is not a gap.
-MIN_GAP_MS = 2 * ec.BELL_UNIT_MS
+#: This was two bell units while the unit was believed to be 20 ms, and the
+#: measurement pulled it to 18 -- which is not a gap anybody hears. What it was
+#: always expressing is an audibility floor, so it says so as a number: the
+#: generator's resolution and what an ear resolves are different quantities and
+#: only one of them belongs here.
+MIN_GAP_MS = 40
+
+#: Milliseconds to one character of `score()`. Not `ec.BELL_UNIT_MS`, which it
+#: used to be: at 9 ms a second of tune is 111 characters and a bar wraps three
+#: times before it can be read. What the picture wants is a resolution fine
+#: enough to show the shortest gap that matters and coarse enough to fit a
+#: phrase on a line, and that is a different quantity from what the hardware
+#: can resolve -- the same distinction `MIN_GAP_MS` makes.
+MS_PER_SCORE_CHAR = 25
 
 #: Fraction of its slot a note sounds for. 0.6 leaves a gap two fifths as long
 #: as the note, which is about how a staccato reads; the rest of the slot is
@@ -389,7 +411,7 @@ def to_job(melody: Melody) -> etp.Job:
 
 
 def score(melody: Melody, width: int = 60) -> str:
-    """The rhythm as a picture, at one character per 20 ms of bell unit.
+    """The rhythm as a picture, at `MS_PER_SCORE_CHAR` to the character.
 
     A melody job cannot be checked against a mockup the way a print job can --
     there is nothing on the paper to compare. This is the substitute: what the
@@ -398,12 +420,12 @@ def score(melody: Melody, width: int = 60) -> str:
     """
     lines = [f"{melody.name or 'melody'}: {len(melody.events)} slots, "
              f"{melody.beeps} beeps, {melody.total_ms / 1000:.2f} s"]
-    per_char = ec.BELL_UNIT_MS
+    per_char = MS_PER_SCORE_CHAR
     row = ""
     for e in melody.events:
         sound = units_for(e.sound_ms) * ec.BELL_UNIT_MS if not e.is_rest else 0
         cells = max(1, int(round(e.slot_ms / per_char)))
-        on = int(round(sound / per_char))
+        on = min(cells, int(round(sound / per_char)))
         row += "#" * on + "." * (cells - on)
     for i in range(0, len(row), width):
         at = (i * per_char) / 1000
@@ -418,11 +440,13 @@ def score(melody: Melody, width: int = 60) -> str:
 # ---------------------------------------------------------------------------
 
 #: Lengths the probe asks for. Doubling up to the high bit, then four values
-#: past it -- the point of the sweep is the second half. If 160 and 200 come out
-#: longer than 127 did, the operand is a plain unsigned length and
-#: `ec.MAX_BELL_UNITS` can go up to 255; if they come out *short*, the high bit
-#: is a sign here as it is on its neighbours and the cap is doing real work; if
-#: nothing sounds at all above 127, that is the third answer and equally useful.
+#: past it -- the second half was the point of the sweep, and it has been
+#: answered: 160, 200 and 255 each came out longer than the one before, so the
+#: operand is a plain unsigned length and `ec.MAX_BELL_UNITS` is the whole byte.
+#:
+#: Kept as it is, because it is also the instrument that timed the unit and the
+#: only thing that would notice either answer changing -- a machine serviced, a
+#: different Sigma, a firmware whose pacing moved.
 PROBE_UNITS = (1, 2, 4, 8, 16, 32, 64, 96, 127, 160, 200, 255)
 
 #: Silence between probe beeps. Long enough that a beep and the next one cannot
@@ -435,17 +459,17 @@ def probe_job(units=PROBE_UNITS) -> etp.Job:
     """A sweep of bell lengths, for timing the unit and finding where it stops.
 
     Deliberately outside the `Event` machinery, which clamps to
-    `ec.MAX_BELL_UNITS`: the question this asks is what the machine does *past*
-    that cap, and a clamp would quietly turn the interesting half of the sweep
-    into eight identical beeps.
+    `ec.MAX_BELL_UNITS`: a clamp would quietly turn part of the sweep into
+    identical beeps, and the whole value of it is that every step differs.
 
-    Safe to send despite that. The operand of a bell is a length whatever its
-    value, so an unknown one is a wrong-sounding beep and not a desynchronised
-    stream -- unlike a byte that lands where a command was expected.
+    Safe to send. The operand of a bell is a length whatever its value, so an
+    unknown one is a wrong-sounding beep and not a desynchronised stream --
+    unlike a byte that lands where a command was expected.
 
-    What to listen for: the beeps should double in length up to 127, which puts
-    a number on "etwa 20 ms je Einheit" -- count the last one against a watch
-    and divide by 127.
+    What to listen for: twelve beeps, each longer than the last. Time one of
+    the long ones and divide by its unit count -- that is `ec.BELL_UNIT_MS`,
+    and it came out 9 rather than the table's 20. Time a gap between two early
+    beeps as well; ~1.6 s is the pacing model holding.
     """
     enc = etp.Encoder()
     for n in units:

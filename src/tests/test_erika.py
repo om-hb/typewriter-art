@@ -3233,29 +3233,41 @@ def test_a_melody_reaches_the_paper_not_at_all():
     assert {code for code, _ in machine.probes} == {ec.BELL}
 
 
-def test_the_bell_operand_stays_below_the_high_bit():
-    """Every neighbour of 0xAA in the operand block reads the top bit as a
-    sign. Until a sheet says the bell does not, a long note is clamped rather
-    than allowed to wrap into a short one."""
+def test_a_note_longer_than_the_bell_is_clamped_not_wrapped():
+    """The sweep found the operand to be a plain unsigned length, so the cap is
+    now the whole byte -- but it is still a cap, and a note past it has to come
+    out as the longest beep the machine has rather than as a short one."""
     from erika import melody as mel
 
-    assert mel.units_for(10_000) == ec.MAX_BELL_UNITS <= 127
+    assert mel.units_for(10_000) == ec.MAX_BELL_UNITS <= 255
     assert mel.units_for(1) == 1  # and never quantised out of existence
-    long_note = mel.parse("w", tempo=30)  # 8 s, well past the cap
+    long_note = mel.parse("w", tempo=20)  # 12 s, well past the cap
     operands = [operand for _, op, operand in etp.iter_ops(mel.to_job(long_note).body)
                 if op == etp.OP_RAW]
     assert max(operands[1::2]) <= ec.MAX_BELL_UNITS
     assert any("goes quiet early" in p for p in mel.check(long_note))
 
 
-def test_the_probe_asks_what_happens_past_the_cap():
-    """The sweep exists for its second half, so a clamp applied to it would
-    remove the only reason to send it."""
+def test_the_probe_sweeps_the_whole_operand_and_never_repeats_a_length():
+    """What the sweep is for, now that it has answered the question it was
+    built to ask.
+
+    It reaches the top of the byte -- that is how the cap got there -- and every
+    beep differs from the one before it, because the reading is "each longer
+    than the last" and two equal lengths in the middle would make that judgement
+    on a machine nobody can pause. It also has to stay outside `units_for`,
+    which clamps; a probe that clamped would agree with itself no matter what
+    the constants said.
+    """
     from erika import melody as mel
 
     operands = [operand for _, op, operand in etp.iter_ops(mel.probe_job().body)
                 if op == etp.OP_RAW]
-    assert [n for n in operands[1::2] if n > ec.MAX_BELL_UNITS]
+    assert operands[::2] == [ec.BELL] * len(mel.PROBE_UNITS)
+    lengths = operands[1::2]
+    assert lengths == list(mel.PROBE_UNITS)
+    assert max(lengths) == ec.MAX_BELL_UNITS  # the whole range, to its top
+    assert all(b > a for a, b in zip(lengths, lengths[1:]))
 
 
 def test_morse_survives_the_round_trip():
