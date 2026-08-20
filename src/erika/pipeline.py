@@ -833,6 +833,97 @@ def cmd_forces(args) -> int:
     return 0
 
 
+def melody_defaults():
+    """Defaults for the melody parser, without importing melody at module load.
+
+    `erika.melody` imports `erika_codes` and `etp` and nothing heavier, but the
+    argument parser is built on every invocation of every subcommand and this
+    keeps that honest.
+    """
+    from erika import melody as mel
+
+    return mel.DEFAULT_GATE, mel.DEFAULT_MORSE_UNIT_MS
+
+
+def cmd_melody(args) -> int:
+    """Put a rhythm on the beeper.
+
+    The machine's only output that costs neither paper nor ribbon, and the only
+    one that can be tried at three in the morning. It is also the only place in
+    this pipeline where nothing can be verified against a mockup afterwards --
+    a melody leaves no trace -- so the command prints the score it is about to
+    play, which is the closest thing there is to reading it back.
+    """
+    from erika import melody as mel
+
+    if args.list:
+        print("tunes:")
+        for name in sorted(mel.TUNES):
+            notation, tempo = mel.TUNES[name]
+            print(f"  {name:10s} {tempo:5.0f} BPM  {notation}")
+        print()
+        print("Anything else is written with --notes, in the same notation:")
+        print("  w h q e s  whole/half/quarter/eighth/sixteenth")
+        print("  q.         dotted; -q a rest; 350ms an exact slot; | a bar line")
+        return 0
+
+    if args.probe:
+        job = mel.probe_job()
+        melody = None
+    else:
+        # Everything from reading the notation to fitting it into the device's
+        # timing raises the same error, and all of it is the user's typing
+        # rather than a defect -- so it reports as a message and an exit code,
+        # not as a traceback.
+        try:
+            if args.morse:
+                melody = mel.morse(args.morse, unit_ms=args.unit)
+            elif args.notes:
+                melody = mel.parse(
+                    args.notes,
+                    tempo=mel.DEFAULT_TEMPO if args.tempo_given is None
+                    else args.tempo_given,
+                    gate=args.gate, name="notes")
+            else:
+                melody = mel.tune(args.tune, tempo=args.tempo_given,
+                                  gate=args.gate)
+            job = mel.to_job(melody)
+        except mel.MelodyError as exc:
+            print(f"cannot play that: {exc}")
+            return 2
+
+    out = args.out if os.path.isabs(args.out) else os.path.join(SRC_DIR, args.out)
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    size = etp.save(out, job)
+
+    if melody is None:
+        print(f"bell length sweep -> {out} ({size} bytes)")
+        print(f"  {len(mel.PROBE_UNITS)} beeps: "
+              f"{', '.join(str(n) for n in mel.PROBE_UNITS)} units")
+        print()
+        print("Listen, do not look -- nothing is typed. Each beep should be")
+        print("twice the one before it up to 127 units. Time the 127 and divide:")
+        print(f"  that is the unit, which the table only gives as "
+              f"'etwa {ec.BELL_UNIT_MS} ms'.")
+        print("The four lengths after 127 are the question the cap exists for.")
+        print("Longer than 127 means the operand is an unsigned length and")
+        print("erika_codes.MAX_BELL_UNITS can rise to 255; shorter means the")
+        print("high bit is a sign here as it is on 0xA5 and 0xA6; silent is an")
+        print("answer too. Whichever it is, say so in docs/control-codes.md.")
+    else:
+        print(mel.score(melody))
+        print()
+        print(f"-> {out} ({size} bytes, nothing typed)")
+        print(f"  {mel.RAW_BYTE_COST_MS} ms of that is the firmware's own pacing "
+              f"per bell byte,")
+        print(f"  which is why a note cannot be shorter than {mel.MIN_SLOT_MS} ms: "
+              f"{mel.max_tempo_for('q'):.0f} BPM in quarters,")
+        print(f"  {mel.max_tempo_for('e'):.0f} in eighths. None of this has been "
+              "heard on the machine --")
+        print("  `erika.pipeline melody --probe` is what would time it.")
+    return 0
+
+
 def cmd_codes(args) -> int:
     """Put the control codes the pipeline does not use yet on paper.
 
@@ -1456,6 +1547,30 @@ def build_parser() -> argparse.ArgumentParser:
                          "than one sheet of paper, and at --step 16 it is seven "
                          "lines. Find the neighbourhood coarsely, then sweep it")
     fo.set_defaults(func=cmd_forces)
+
+    me = sub.add_parser("melody", help="play a rhythm on the machine's beeper")
+    me.add_argument("--tune", default="shave",
+                    help="one of the built-in rhythms (--list to see them)")
+    me.add_argument("--notes", default=None,
+                    help="a rhythm of your own, e.g. \"q e e q | -q h\"")
+    me.add_argument("--morse", default=None, help="spell this out in Morse")
+    me.add_argument("--list", action="store_true", help="list the built-in tunes")
+    me.add_argument("--probe", action="store_true",
+                    help="sweep the bell's length operand instead of playing "
+                         "anything, to time the unit and find where it stops")
+    me.add_argument("--tempo", "-t", dest="tempo_given", type=float, default=None,
+                    help="beats per minute; a built-in tune keeps its own "
+                         "unless this says otherwise")
+    me.add_argument("--gate", "-g", type=float, default=melody_defaults()[0],
+                    help="fraction of each slot a note sounds for. The rest is "
+                         "the silence that makes it a separate note -- with one "
+                         "pitch there is nothing else to separate them "
+                         f"(default {melody_defaults()[0]})")
+    me.add_argument("--unit", type=int, default=melody_defaults()[1],
+                    help="milliseconds in one Morse unit "
+                         f"(default {melody_defaults()[1]})")
+    me.add_argument("--out", "-o", default="results/melody.etp")
+    me.set_defaults(func=cmd_melody)
 
     return p
 

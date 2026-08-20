@@ -216,6 +216,27 @@ PLATEN_STEPS = 0xA6  #: next byte is a signed count of 1/240" platen steps
 WHEEL_STEPS = 0xA7  #: next byte is a signed count of 3.6 deg wheel steps
 RIBBON_STEPS = 0xA8  #: next byte is a count of 10 deg ribbon steps
 
+# 0xAA is the one code on this interface that makes a sound instead of a mark,
+# and the only output the machine has that does not cost paper or ribbon. The
+# next byte is a length, "etwa 20 ms je Einheit".
+#
+# What the table does *not* contain anywhere is a frequency. The signal
+# generator has one pitch and one parameter, so the only musical dimension it
+# has is time -- see erika/melody.py, which is the whole instrument.
+BELL = 0xAA
+
+#: The table's own "etwa 20 ms je Einheit". "Etwa" is the table's word, not a
+#: hedge added here: nothing has timed a beep on this machine.
+BELL_UNIT_MS = 20
+
+#: The longest length a melody will ask for. Not a limit the table gives -- it
+#: calls the byte a length code and stops -- but every neighbour of 0xAA in the
+#: operand block reads the high bit as a sign, so a length of 200 is as likely
+#: to come out short as long. Staying below the bit costs 2.5 seconds of beep
+#: nobody wants and removes the question. `erika.pipeline melody --probe`
+#: deliberately goes past it, which is how the question gets answered.
+MAX_BELL_UNITS = 127
+
 #: One inch, in each mechanism's own steps.
 CARRIAGE_STEPS_PER_INCH = 120
 PLATEN_STEPS_PER_INCH = 240
@@ -508,7 +529,7 @@ CONTROL_CODE_NAMES = {
     0xA7: "WHEEL_STEPS",
     0xA8: "RIBBON_STEPS",
     0xA9: "NO_ADVANCE",
-    0xAA: "BELL",
+    BELL: "BELL",
 }
 
 

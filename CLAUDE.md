@@ -31,7 +31,7 @@ project is also driven through `uv run python`. Substitute whichever applies;
 
 ```bash
 cd src
-PY -m pytest tests -q                                   # 228 tests
+PY -m pytest tests -q                                   # 238 tests
 PY -m erika.pipeline charset --pitch 10                 # build the Sigma charset
 PY -m erika.pipeline print -t images/mwdog_crop.png -r 48
 PY -m erika.pipeline print -t photo.jpg -r 48 --grey c2g   # STRESS, not luma
@@ -41,12 +41,15 @@ PY -m erika.pipeline forces                             # what strike forces exi
 PY -m erika.pipeline calibrate                          # machine test pattern
 PY -m erika.pipeline area                               # corners of the print area
 PY -m erika.pipeline verify                             # plan vs. optimizer mockup
+PY -m erika.pipeline melody --list                      # tunes for the beeper
+PY -m erika.pipeline melody --morse "READY"             # ...or spell something
 PY -m erika.etp results/photo.etp -n 30                 # disassemble a job
 PY -m erika.send results/photo.etp --port COM6 --print --watch
 PY -m erika.send --port COM6 --diagnose                 # when uploads fail
 ```
 
-Subcommands: `charset print plan verify calibrate area sheet forces`.
+Subcommands: `charset print plan verify calibrate area sheet forces codes
+melody`. The last one makes no marks: see `src/erika/melody.py`.
 
 No lint, typecheck or CI configured. `.vscode/settings.json` (upstream)
 declares **black** with format-on-save, but black is not in
@@ -72,6 +75,7 @@ src/
     emulate.py             virtual typewriter; mirrors erika_image.cpp
     align.py               optional pre-pass: crop search against the cell grid
     softmatch.py           optional loss term: local tone, not only pixels
+    melody.py              the beeper: one pitch, so tunes are rhythm only
     pipeline.py send.py    CLIs
     README.md              the detailed guide — read this first
 ```

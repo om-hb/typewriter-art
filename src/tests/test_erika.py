@@ -3129,3 +3129,186 @@ def test_the_pitch_is_restored_after_every_section_that_changes_it(tmp_path):
     # Strictly alternating, so nothing is left at 15.
     assert switches[0::2] == [0x89, 0x89]
     assert switches[1::2] == [0x87, 0x87]
+
+
+# ---------------------------------------------------------------------------
+# the beeper (erika.melody)
+# ---------------------------------------------------------------------------
+
+
+def _device_timeline(body: bytes) -> list[int]:
+    """When each byte actually leaves the device, by the firmware's own rules.
+
+    The model `erika.melody` computes its delays against, written out
+    independently here so that the two have to agree: a byte cannot go out
+    until a character delay has passed since the last one *and* until any
+    standing ETP_DELAY has expired, and a delay begins when its opcode is
+    decoded -- which is as soon as the interpreter is free, not when the next
+    byte is due. The two overlap rather than add, and that is exactly the
+    assumption `compile_to` subtracts a character delay on.
+    """
+    from erika import melody as mel
+
+    sent: list[int] = []
+    last, until = None, 0
+    for _, op, operand in etp.iter_ops(body):
+        if op == etp.OP_RAW:
+            at = max(0 if last is None else last + mel.RAW_BYTE_COST_MS, until)
+            sent.append(at)
+            last = at
+        elif op == etp.OP_DELAY:
+            until = max(0 if last is None else last, until) + operand * 10
+    return sent
+
+
+def test_the_beeper_plays_the_rhythm_it_was_asked_for():
+    """The load-bearing claim of the whole module: onset to onset on the wire
+    is the slot the melody asked for.
+
+    Nothing else in this pipeline can be checked after the fact -- a print job
+    has a mockup to diff against and a tune leaves no trace -- so the timing
+    model is only as good as this test.
+    """
+    from erika import melody as mel
+
+    melody = mel.parse("q e e h -q q", tempo=100)
+    enc = etp.Encoder()
+    mel.compile_to(enc, melody)
+    onsets = _device_timeline(enc.body())
+    # Two bytes per beep, and the first of each pair is where a slot begins.
+    starts = onsets[::2]
+    intended, t = [], 0
+    for e in melody.events:
+        if not e.is_rest:
+            intended.append(t)
+        t += e.slot_ms
+    assert len(starts) == len(intended) == melody.beeps
+    for got, want in zip(starts, intended):
+        # One rounding of one delay to the encoder's 10 ms grid, per note.
+        assert abs(got - want) <= 5 * len(intended), (got, want)
+    gaps = [b - a for a, b in zip(starts, starts[1:])]
+    assert all(g >= mel.MIN_SLOT_MS for g in gaps), gaps
+
+
+def test_a_note_the_device_cannot_deliver_is_refused_rather_than_stretched():
+    """Rounding a too-short note up to the floor would keep the job playable
+    and silently change the rhythm, which is the one failure a tune cannot
+    survive -- every note after it lands somewhere else."""
+    from erika import melody as mel
+
+    with pytest.raises(mel.MelodyError) as exc:
+        mel.to_job(mel.parse("s s s s", tempo=120))
+    assert "200" in str(exc.value) and "150" in str(exc.value)
+    # And the same rhythm slowed down is fine.
+    assert mel.to_job(mel.parse("s s s s", tempo=70)).body
+
+
+def test_every_built_in_tune_is_playable_as_written():
+    from erika import melody as mel
+
+    for name in mel.TUNES:
+        melody = mel.tune(name)
+        assert mel.check(melody) == [], f"{name}: {mel.check(melody)}"
+        assert mel.to_job(melody).body
+
+
+def test_notes_are_separated_by_silence_because_nothing_else_separates_them():
+    """One pitch means two adjacent notes of the same length are one long note
+    unless there is a gap. The gate is what leaves it, so a tune shipped with a
+    gate that closes it would be a bug nobody could see in the score."""
+    from erika import melody as mel
+
+    for name in mel.TUNES:
+        for e in mel.tune(name).events:
+            if not e.is_rest:
+                assert e.gap_ms >= mel.MIN_GAP_MS, (name, e)
+
+
+def test_a_melody_reaches_the_paper_not_at_all():
+    from erika import melody as mel
+
+    machine = emulate.type_job(mel.to_job(mel.tune("shave")))
+    assert machine.impressions == []
+    assert machine.overruns == 0
+    assert {code for code, _ in machine.probes} == {ec.BELL}
+
+
+def test_the_bell_operand_stays_below_the_high_bit():
+    """Every neighbour of 0xAA in the operand block reads the top bit as a
+    sign. Until a sheet says the bell does not, a long note is clamped rather
+    than allowed to wrap into a short one."""
+    from erika import melody as mel
+
+    assert mel.units_for(10_000) == ec.MAX_BELL_UNITS <= 127
+    assert mel.units_for(1) == 1  # and never quantised out of existence
+    long_note = mel.parse("w", tempo=30)  # 8 s, well past the cap
+    operands = [operand for _, op, operand in etp.iter_ops(mel.to_job(long_note).body)
+                if op == etp.OP_RAW]
+    assert max(operands[1::2]) <= ec.MAX_BELL_UNITS
+    assert any("goes quiet early" in p for p in mel.check(long_note))
+
+
+def test_the_probe_asks_what_happens_past_the_cap():
+    """The sweep exists for its second half, so a clamp applied to it would
+    remove the only reason to send it."""
+    from erika import melody as mel
+
+    operands = [operand for _, op, operand in etp.iter_ops(mel.probe_job().body)
+                if op == etp.OP_RAW]
+    assert [n for n in operands[1::2] if n > ec.MAX_BELL_UNITS]
+
+
+def test_morse_survives_the_round_trip():
+    """Decoding the compiled rhythm back to dots and dashes, which is the only
+    way to check that the gaps land between the right symbols."""
+    from erika import melody as mel
+
+    melody = mel.morse("SOS ERIKA")
+    unit = mel.DEFAULT_MORSE_UNIT_MS
+    text = ""
+    for e in melody.events:
+        if e.is_rest:
+            text += " " if e.slot_ms >= 4 * unit else "/"
+        else:
+            text += "-" if e.sound_ms == 3 * unit else "."
+            if e.gap_ms > unit:
+                text += "/"
+    letters = ["".join(sym for sym in word.split("/") if sym)
+               for word in text.split(" ")]
+    assert " ".join(letters) == "".join(
+        mel.MORSE[c] for c in "SOS"
+    ) + " " + "".join(mel.MORSE[c] for c in "ERIKA")
+
+
+def test_morse_refuses_a_unit_the_device_cannot_key():
+    from erika import melody as mel
+
+    with pytest.raises(mel.MelodyError):
+        mel.morse("E", unit_ms=40)
+
+
+def test_the_notation_says_what_it_could_not_read():
+    from erika import melody as mel
+
+    with pytest.raises(mel.MelodyError) as exc:
+        mel.parse("q x q")
+    assert "'x'" in str(exc.value) or "x" in str(exc.value)
+    # A dot is one and a half, two dots one and three quarters -- not two.
+    quarter = mel.quarter_ms(100)
+    assert mel.parse("q.", tempo=100).events[0].slot_ms == round(quarter * 1.5)
+    assert mel.parse("q..", tempo=100).events[0].slot_ms == round(quarter * 1.75)
+
+
+@pytest.mark.skipif(NO_FIRMWARE, reason=NO_FIRMWARE_REASON)
+def test_firmware_character_delay_matches_the_melody_timing_model():
+    """`melody.RAW_BYTE_COST_MS` is a hand-copy of the firmware's own pacing,
+    and the whole tempo ceiling rests on it.
+
+    A drift here is quiet in the way this workspace warns about: the job still
+    plays, every byte is still legal, and the rhythm is simply wrong -- slower
+    if the firmware's delay grew, and running its notes together if it shrank.
+    """
+    from erika import melody as mel
+
+    defines = _parse_cpp_defines(os.path.join(FIRMWARE_SRC, "erika_image.h"))
+    assert defines.get("ERIKA_CHAR_DELAY_MS") == mel.RAW_BYTE_COST_MS
