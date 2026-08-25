@@ -199,6 +199,18 @@ downstream can recover. Hence defaults that lean light.
 mapped the 1st percentile to 0, taking the darkest ink on the sheet and making
 it black. It now normalises the *paper* and leaves the ink where it lies.
 
+**`sheet` and `charset --from-scan` are one number and both have to be told it.**
+`--sheet-cols` is the grid the glyphs are typed on and the grid the scan is sliced
+back up on, and for one commit only the first of the two took the flag: `charset`
+did not have it and `_build_charset` did not forward one, so a sheet typed at
+anything but 20 was sliced on a grid of 20 regardless. That failure has no
+symptom. Every tile comes back a blend of two neighbouring glyphs, the count is
+still right, so `_verify_mapping` passes, the charset loads, the plan verifies and
+the print comes out — with every tonal decision in it made against ink no key
+produces. Two tests in `test_erika.py` guard it: one that both subcommands take
+the flag and default alike, and one that `_build_charset` actually forwards it,
+because a flag accepted and dropped looks identical from the command line.
+
 ## Typing right to left: `0x8E`
 
 A serpentine plan (`--no-home`) sweeps alternate passes backwards, and the

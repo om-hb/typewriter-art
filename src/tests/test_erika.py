@@ -3505,3 +3505,58 @@ def test_the_crop_to_ink_the_marks_replaced_really_was_off(tmp_path):
         "the crop-to-ink grid was supposed to be the worse of the two; it came "
         f"out at {worst_cropped:.3f} cells against {worst_marked:.3f}"
     )
+
+
+def test_the_sheet_and_the_charset_builder_agree_on_the_grid():
+    """`sheet --sheet-cols` and `charset --sheet-cols` are one number.
+
+    The sheet types its glyphs `sheet_cols` to a line and the builder slices the
+    scan on that same grid, so the two subcommands have to be tellable the same
+    value. For one commit `charset` could not be told at all: it took no
+    `--sheet-cols` and `_build_charset` did not forward one, so a sheet typed at
+    anything but the default was sliced on a grid of 20 regardless.
+
+    That failure is invisible downstream, which is why it is worth a test. Every
+    tile comes back a blend of two neighbouring glyphs -- still a plausible tile,
+    still the right count, so `_verify_mapping` passes and the charset loads. The
+    only symptom is that every tonal decision in every picture is made against
+    ink that no key on the machine produces.
+    """
+    from erika.pipeline import build_parser
+
+    parser = build_parser()
+    subs = next(
+        action.choices
+        for action in parser._actions
+        if isinstance(getattr(action, "choices", None), dict)
+    )
+    for command in ("sheet", "charset"):
+        defaults = {a.dest: a.default for a in subs[command]._actions}
+        assert "sheet_cols" in defaults, f"`{command}` takes no --sheet-cols"
+
+    assert (
+        {a.dest: a.default for a in subs["sheet"]._actions}["sheet_cols"]
+        == {a.dest: a.default for a in subs["charset"]._actions}["sheet_cols"]
+    ), "the two default to different grids, so an untouched pair disagrees"
+
+
+def test_the_charset_builder_forwards_the_grid_it_was_given():
+    """And the flag reaches ``make_charset``, not just the parser.
+
+    Separate from the test above because they fail for different reasons: that
+    one catches a flag nobody can pass, this one catches a flag that is accepted
+    and then dropped -- which looks identical from the command line.
+    """
+    from erika.pipeline import _build_charset, build_parser
+
+    args = build_parser().parse_args(
+        ["charset", "--from-scan", "scan.png", "--sheet-cols", "26"]
+    )
+    seen = {}
+
+    def spy(**kwargs):
+        seen.update(kwargs)
+
+    _build_charset(args, spy, lambda text: (), lambda text: None)
+    assert seen["sheet_cols"] == 26
+    assert seen["scan"] == "scan.png"

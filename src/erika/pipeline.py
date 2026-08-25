@@ -172,6 +172,7 @@ def _build_charset(args, make_charset, parse_forces, parse_densities) -> int:
         font=args.font,
         bleed=args.bleed,
         dead_keys=args.dead_keys,
+        sheet_cols=args.sheet_cols,
         scan=args.from_scan,
         base_path=SRC_DIR,
         ink=args.ink,
@@ -1504,6 +1505,15 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--bleed", "-b", type=float, default=0.2)
     c.add_argument("--dead-keys", action="store_true")
     c.add_argument("--from-scan", default=None)
+    # The grid the sheet was typed at, which is what identifies a tile when the
+    # scan is sliced back up. It has to be given here because `sheet` takes it
+    # too and the two are one number: a sheet typed at anything but the default
+    # and rebuilt without saying so is sliced on the wrong grid, and every tile
+    # is then a blend of two glyphs -- which nothing downstream can detect,
+    # because a blend is still a plausible tile.
+    c.add_argument("--sheet-cols", type=int, default=20,
+                   help="glyphs per line the sheet was typed at; pass the same "
+                        "value `sheet --sheet-cols` was given")
     _add_ink_args(c)
     c.set_defaults(func=cmd_charset)
 
