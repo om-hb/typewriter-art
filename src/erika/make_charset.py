@@ -874,8 +874,84 @@ def _mark_rows(im, left_c, right_c, cell, rows):
     if pitch <= 0:
         return None
 
-    middle = float(np.mean([np.mean(c) for c in found]))
-    return middle - (rows - 1) / 2.0 * pitch - pitch / 2.0, pitch
+    # Each row's own position, not the straight line through them. The platen
+    # advances a line at a time and does not do it to the pixel: the marks on
+    # these sheets sit up to 3.5px off a fitted line, which is 3% of a row. Most
+    # glyphs never notice. The underscore does -- it is typed hard against the
+    # bottom of the type body, so it occupies the last three pixels of its cell,
+    # and 3% of a row is the difference between the whole bar and two thirds of
+    # it, with the rest landing at the top of the tile below. Which on this sheet
+    # is a 'D', twenty cells further on, wearing a bar it never printed.
+    per_row = np.mean([np.array(c) for c in found], axis=0)
+    return per_row - pitch / 2.0, pitch
+
+
+#: How far the cut may be nudged from where the marks put it, as a fraction of a
+#: row. The marks fix the pitch and very nearly fix the phase; this is a
+#: correction, and a search wide enough to find a different row would be a search
+#: wide enough to be wrong by one.
+PHASE_SEARCH = 0.2
+
+
+def _cut_risk(im, tops, pitch, cols, cell_w, cell_h, n_tiles, offset):
+    """How much ink a boundary at ``offset`` cuts *through*.
+
+    Not how much ink lands near it. A glyph may legitimately reach the floor of
+    its cell -- the underscore is a bar typed hard against it, and an accent sits
+    against the ceiling -- so scoring ink at the edge would score the type's own
+    design and prefer a cut that shoves the underscore wholly into the cell
+    below. Which is not an improvement: it is the same error, complete.
+
+    A mark that is *severed* leaves ink on both sides of the line in the same
+    column. One that merely ends there leaves ink on one side. So the score is
+    the per-column minimum of the ink above and below, which is zero for
+    everything but a glyph the boundary passes through.
+    """
+    stack = []
+    for top in tops:
+        y0 = max(0, int(round(top + offset)))
+        y1 = min(im.shape[0], int(round(top + offset + pitch)))
+        if y1 - y0 < 2:
+            return None
+        stack.append(cv2.resize(im[y0:y1], (cols * cell_w, cell_h),
+                                interpolation=cv2.INTER_AREA))
+    ink = 1.0 - _normalise(np.vstack(stack))
+    risk = 0.0
+    for boundary in range(1, len(tops)):
+        above = ink[boundary * cell_h - 1]
+        below = ink[boundary * cell_h]
+        risk += float(np.minimum(above, below).sum())
+    return risk
+
+
+def _row_phase(im, tops, pitch, cols, cell_w, cell_h, n_tiles):
+    """Where to cut between one row and the next, to the pixel.
+
+    The marks give the pitch exactly and the phase only nearly: a mark's ink runs
+    from its cap height to its baseline, which is not centred in its cell -- there
+    is an accent zone above and a descender zone below, and they are not the same
+    depth. On these two wheels that left the cut some three or four hundredths of
+    a row too high, which is invisible on every glyph except the one it is not.
+
+    The type fills the whole line height, so there is no empty line to cut along
+    and the phase cannot be found by looking for a gap: on both sheets every
+    position within the cell has ink somewhere on the page. What can be found is
+    the position that cuts the least *glyph*, which is what ``_cut_risk`` scores
+    and this minimises.
+    """
+    span = int(round(PHASE_SEARCH * pitch))
+    # Nearest first, and ties keep the earlier one, so an offset only wins by
+    # being strictly better than every smaller one. On a sheet with slack between
+    # the rows a whole band of offsets cuts nothing at all, and the honest answer
+    # there is to leave the marks' own phase alone rather than to slide to
+    # whichever end of the band the loop happened to reach last.
+    order = sorted(range(-span, span + 1), key=lambda o: (abs(o), o))
+    best = (None, 0)
+    for offset in order:
+        risk = _cut_risk(im, tops, pitch, cols, cell_w, cell_h, n_tiles, offset)
+        if risk is not None and (best[0] is None or risk < best[0]):
+            best = (risk, offset)
+    return best[1]
 
 
 def _sheet_from_scan(scan_path, n_tiles, cols, cell_w, cell_h, deskew_scan=True):
@@ -953,10 +1029,27 @@ def _sheet_from_scan(scan_path, n_tiles, cols, cell_w, cell_h, deskew_scan=True)
         band = _mark_rows(im, left_c, right_c, cell, rows)
         im = im[:, x0:x1]
         if band is not None:
-            top, pitch = band
-            y0 = int(round(top))
-            y1 = int(round(top + rows * pitch))
-            im = im[max(0, y0): min(im.shape[0], y1)]
+            tops, pitch = band
+            nudge = _row_phase(im, tops, pitch, cols, cell_w, cell_h, n_tiles)
+            if nudge:
+                print(f"cut moved {nudge:+d}px within the row "
+                      f"({nudge / pitch * 100:+.1f}% of one) to cut the least glyph")
+                tops = tops + nudge
+            # Row by row, each resampled from its own measured band. A single
+            # resize of the whole block would put every row back on an even
+            # pitch, which is the thing the marks just said it is not.
+            width = cols * cell_w
+            stack = []
+            for top in tops:
+                y0 = max(0, int(round(top)))
+                y1 = min(im.shape[0], int(round(top + pitch)))
+                if y1 - y0 < 2:
+                    stack = []
+                    break
+                stack.append(cv2.resize(im[y0:y1], (width, cell_h),
+                                        interpolation=cv2.INTER_AREA))
+            if len(stack) == rows:
+                return _normalise(np.vstack(stack)), cols, rows
         else:
             paper = float(np.percentile(im, 95))
             rows_of = _ink_extent(im < paper * 0.75, axis=1)
@@ -964,10 +1057,17 @@ def _sheet_from_scan(scan_path, n_tiles, cols, cell_w, cell_h, deskew_scan=True)
                 im = im[rows_of[0]: rows_of[1] + 1]
 
     im = cv2.resize(im, (cols * cell_w, rows * cell_h), interpolation=cv2.INTER_AREA)
-    # The sheet is mostly paper, so a high percentile *is* the paper -- a robust
-    # white point that a stray bright speck cannot drag around.
+    return _normalise(im), cols, rows
+
+
+def _normalise(im: np.ndarray) -> np.ndarray:
+    """Paper to white, ink left where it lies.
+
+    The sheet is mostly paper, so a high percentile *is* the paper -- a robust
+    white point that a stray bright speck cannot drag around.
+    """
     paper = float(np.percentile(im, 95))
-    return np.clip(im.astype(np.float32) / max(paper, 1e-6), 0, 1), cols, rows
+    return np.clip(im.astype(np.float32) / max(paper, 1e-6), 0, 1)
 
 
 def parse_forces(text: str | None) -> tuple[int, ...]:

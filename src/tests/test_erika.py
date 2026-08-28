@@ -4183,3 +4183,87 @@ def test_the_montage_shows_the_lightest_marks_the_wheel_makes():
         r, c = divmod(i, cols)
         ink.append(1.0 - float(sheet[r * 40: (r + 1) * 40, c * 24: (c + 1) * 24].mean()))
     assert ink[0] < ink[-1], "the spread should run from least ink to most"
+
+
+def _phase_sheet(path, rows=5, cols=6, pitch=100, top=30.0, offset=0):
+    """Rows of type that fill the line height, sitting ``offset`` px low.
+
+    An accent against the ceiling of the cell, a body, and an underscore against
+    the floor -- which is what leaves no gap to cut along, and is the reason the
+    phase has to be found rather than assumed. Ink from the very top of the cell
+    to the very bottom means any boundary in the wrong place passes through
+    something.
+    """
+    import cv2
+
+    im = np.full((int(top + rows * pitch + 60), cols * 40), 250, np.uint8)
+    for r in range(rows):
+        y = int(top + r * pitch) + offset
+        for c in range(cols):
+            x = c * 40 + 6
+            if c == 2:
+                im[y + 1: y + 9, x: x + 20] = 60        # an accent, at the ceiling
+            im[y + 13: y + 87, x: x + 26] = 70          # the body of the type
+            if c == 1:
+                im[y + 92: y + 99, x: x + 30] = 60      # an underscore, at the floor
+            if c == 3:
+                # A stroke running nearly the whole cell, like the '|' the wheel
+                # has. Without one there are gaps for a boundary to slip into and
+                # several phases cut nothing; the machine leaves no such gaps,
+                # which is what folding a real sheet onto one cell shows.
+                im[y: y + 96, x + 8: x + 14] = 65
+    cv2.imwrite(str(path), im)
+    return cv2.imread(str(path), cv2.IMREAD_GRAYSCALE), np.array(
+        [top + r * pitch for r in range(rows)]
+    )
+
+
+def test_the_cut_is_placed_where_it_severs_the_least_glyph(tmp_path):
+    """The marks fix the pitch and only nearly fix the phase.
+
+    A mark's ink runs cap height to baseline, which is not centred in its cell --
+    there is an accent zone above it and a descender zone below, and they are not
+    the same depth. What that leaves is a cut a few percent of a row too high,
+    invisible on every glyph except the one it is not: the underscore is a bar at
+    the very bottom of the type body, so a few percent of a row is half of it,
+    and the half that goes missing turns up at the top of the tile below.
+    """
+    from erika.make_charset import _cut_risk, _row_phase
+
+    im, tops = _phase_sheet(tmp_path / "phase.png", offset=7)
+    nudge = _row_phase(im, tops, 100, 6, 24, 40, 30)
+    assert nudge == pytest.approx(7, abs=3), (
+        f"the cut moved {nudge}px where the sheet sits 7px lower"
+    )
+    args = (im, tops, 100, 6, 24, 40, 30)
+    assert _cut_risk(*args, nudge) < _cut_risk(*args, 0), "not a minimum at all"
+
+
+def test_the_cut_is_not_moved_when_the_marks_already_had_it_right(tmp_path):
+    """A correction, not a search. Nudging a good phase costs a resample."""
+    from erika.make_charset import _row_phase
+
+    im, tops = _phase_sheet(tmp_path / "square.png", offset=0)
+    assert _row_phase(im, tops, 100, 6, 24, 40, 30) == 0
+
+
+def test_a_glyph_that_ends_at_the_cell_floor_is_not_pushed_out_of_it(tmp_path):
+    """The trap in scoring this by ink near the boundary rather than across it.
+
+    The underscore is *meant* to reach the floor of its cell; so is an accent the
+    ceiling. Score a cut by how much ink lies beside it and the best answer
+    becomes one that shoves the underscore wholly into the cell below -- the same
+    error as before, carried to completion, and now with nothing left at the
+    boundary to give it away. Ink on *both* sides of the line, in one column, is
+    what a severed glyph looks like and a well-placed one does not.
+    """
+    from erika.make_charset import _cut_risk
+
+    im, tops = _phase_sheet(tmp_path / "floor.png", offset=0)
+    args = (im, tops, 100, 6, 24, 40, 30)
+    assert _cut_risk(*args, 0) == pytest.approx(0.0, abs=0.5), (
+        "type that fits its cell exactly is not being cut by anything"
+    )
+    # Displacing the underscore into the next cell must not look like an
+    # improvement on leaving it where it belongs.
+    assert _cut_risk(*args, -8) > _cut_risk(*args, 0)

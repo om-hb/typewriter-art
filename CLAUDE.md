@@ -180,7 +180,7 @@ because each produced a *plausible* charset rather than an error:
 | the vertical extent | any ink at all, so three pixels of dust put the grid a quarter too tall and three rows too high | a line must carry `INK_LINE_FLOOR` of the heaviest line's ink |
 | a column of the sheet | any column with ink on two rows, so one overhanging glyph welded twenty columns into four | a column must carry `COLUMN_INK_FLOOR` of the heaviest column |
 | the registration marks | assumed to be the outermost ink runs, so one speck outside the right-hand mark hid both | the best-fitting *pair*, by width, isolation and the cell width they imply |
-| the row grid | the ink extent divided by the row count, which is short by an ascender and a descender — 1.4% on the first sheet, compounding to a quarter of a cell by row 21 | pitch from a straight line through the marks down each edge, phase from centring the block on its ink |
+| the row grid | the ink extent divided by the row count, which is short by an ascender and a descender — 1.4% on the first sheet, compounding to a quarter of a cell by row 21 | each row cut at its own mark, and the cut placed where it severs the least glyph |
 
 Each threshold sits in the middle of a plateau measured on both sheets, with an
 order of magnitude between what it must keep and what it must ignore.
@@ -192,7 +192,28 @@ that survives a block typed too light to read — which is exactly the block the
 drift damaged most, since the lightest force is typed last and the error
 accumulates down the sheet. Measured between the two darkest force blocks, where
 every glyph is fully formed and any offset is registration rather than missing
-ink, this took the median from 2.80px to 1.03px of a 40px cell. And when
+ink, this took the median from 2.80px to 0.45px of a 40px cell — 1.03px with a
+straight line through the marks, and the rest by cutting each row at its *own*
+mark instead. The platen does not feed to the pixel: the marks sit up to 3.5px
+off a fitted line, which is 3% of a row, which most glyphs never notice.
+
+The phase is the other half and is not the marks' to give: a mark's ink runs cap
+height to baseline, and the accent zone above it is not as deep as the descender
+zone below, so centring on the marks puts the cut a few percent of a row too
+high. Nothing shows it except the glyph it ruins — the underscore is a bar typed
+against the floor of the cell, so a few percent is *half of it*, and the half
+that goes missing reappears at the top of the tile below, which on this sheet is
+a `D` wearing a bar it never printed. `_row_phase` nudges the cut to where it
+severs the least ink, scored as the per-column minimum of the ink above and
+below the line — a glyph that merely *ends* at the boundary leaves ink on one
+side, and only one the boundary passes through leaves it on both. That
+distinction is the whole of it: score ink lying *near* the cut instead and the
+best answer becomes shoving the underscore wholly into the cell below, which is
+the same error carried to completion. On these sheets the nudge is +6px and +9px
+of a 100px row, and it takes the underscore from 41.5 units of ink to 93.0 and
+the `D` below it from 43.5 to 0.7.
+
+And when
 the marks are not found, the fallback now crops to the ink — it used to resize
 the whole page, margins included, which read the sheet as almost entirely blank.
 
