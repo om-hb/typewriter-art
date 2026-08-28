@@ -164,9 +164,30 @@ re-run the sheet for another.
 ```bash
 PY -m erika.pipeline forces                 # sweeps both readings, on paper
 PY -m erika.pipeline forces --from 35 --to 103 --step 1    # the pass worth typing on a known-good command
+PY -m erika.pipeline forces --from 35 --to 103 --step 1 --from-scan scan.png   # and read it back
 PY -m erika.pipeline sheet --forces 0,60,50,43   # then type the set at each
 PY -m erika.pipeline charset --forces 0,60,50,43 --from-scan scan.png
 ```
+
+`forces --from-scan` is the second half of the sheet, and the reason it exists is
+that reading the sheet by eye answers a different question than the charset asks.
+By eye you get which values marked and which did not; what a multi-force charset
+wants is three or four values spaced evenly *in tone*, and the force value is a
+lever position rather than a quantity of ink — between 43 and 55 is as much of
+the range as everything above 55. Every row of the sheet is the same glyph struck
+the same number of times, so the ink per row is the transfer curve, and the scan
+turns choosing forces into arithmetic. It prints a `--forces` list and the
+matching `--force-density` for the modelled path.
+
+Two things about that reader. It needs **the same sweep the sheet was typed
+with** — the `charset --sheet-cols` failure again, and for the same reason: the
+grid is the only thing that says which row is which, and a row misidentified
+reads as a plausible curve rather than as an error. And the grid is *computed
+from the title line, not detected*: a force below the ink threshold prints
+nothing, and its label prints nothing either because the label is typed at the
+row's own force, so a reader that looked for rows would skip the blank ones and
+renumber every row after. `force_scan.probe_lines` is the one list of rows, and
+`cmd_forces` walks it to type the sheet so the two cannot drift.
 
 `--step` is what makes a wide sweep answerable: every value from `0x00` to `0xFF`
 is 245 rows and several sheets of paper, and at `--step 16` it is sixteen rows and

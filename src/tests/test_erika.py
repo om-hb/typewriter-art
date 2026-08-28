@@ -3560,3 +3560,200 @@ def test_the_charset_builder_forwards_the_grid_it_was_given():
     _build_charset(args, spy, lambda text: (), lambda text: None)
     assert seen["sheet_cols"] == 26
     assert seen["scan"] == "scan.png"
+
+
+# ---------------------------------------------------------------------------
+# Reading the strike-force probe sheet back
+#
+# The sheet is typed to be read by eye, and `forces --from-scan` reads it by
+# arithmetic instead: every row is the same glyph struck the same number of
+# times, so the ink per row is the transfer curve of the force command. What
+# these tests defend is the geometry, because the failure mode is silent -- a
+# misidentified row reads as a machine with a strange force curve, not as a bug.
+# ---------------------------------------------------------------------------
+
+
+def _draw_probe_scan(tmp_path, blocks, run, ink_for, pitch=10, cell_px=24,
+                     bearing=0.125, margin=37):
+    """A synthetic scan of the sheet ``probe_lines`` describes.
+
+    Labels are drawn at *full* ink on every row, whatever the row's own force
+    did. That is not what the machine types -- a row below the threshold is
+    blank end to end -- and it is deliberate: it makes a reader whose window has
+    slipped left onto the label measure black instead of the ink it was after.
+    """
+    import cv2
+
+    from erika.force_scan import PROBE_TITLE, probe_lines
+
+    lines = probe_lines(blocks, run)
+    line_px = cell_px * ec.cell_aspect(pitch)
+    cols = max(l.run_col + l.run_cells for l in lines if l.kind == "sample")
+    width = int(margin * 2 + cols * cell_px)
+    height = int(margin * 2 + len(lines) * line_px)
+    im = np.full((height, width), 255, dtype="uint8")
+
+    def box(index, first_cell, cells, value):
+        top = int(round(margin + (index + 0.2) * line_px))
+        bottom = int(round(margin + (index + 0.8) * line_px))
+        left = int(round(margin + (first_cell + bearing) * cell_px))
+        right = int(round(margin + (first_cell + cells - bearing) * cell_px))
+        im[top:bottom, left:right] = value
+
+    for index, line in enumerate(lines):
+        if line.kind == "title":
+            box(index, 0, len(PROBE_TITLE), 0)
+        elif line.kind == "sample":
+            box(index, 0, len(line.text), 0)  # the label, always black
+            ink = ink_for(line.value)
+            if ink > 0:
+                box(index, line.run_col, line.run_cells,
+                    int(round(255 * (1 - ink))))
+
+    path = str(tmp_path / "probe.png")
+    cv2.imwrite(path, im)
+    return path
+
+
+def test_the_probe_sheet_is_typed_from_the_list_the_reader_counts():
+    """One layout, walked twice. The reader cannot count rows for itself."""
+    from erika.force_scan import probe_lines
+
+    blocks = {"custom": [0, 5, 10]}
+    lines = probe_lines(blocks, 20)
+    samples = [l for l in lines if l.kind == "sample"]
+
+    assert [l.value for l in samples] == [None, 0, 5, 10], (
+        "the reference row typed before any force command has to be first, and "
+        "carry no force"
+    )
+    assert len({len(l.text) for l in samples if l.value is not None}) == 1, (
+        "value labels must be one width, or the runs do not line up"
+    )
+    assert all(l.run_col > len(l.text) for l in samples), (
+        "the run has to start clear of the label it is measured beside"
+    )
+
+
+def test_a_scanned_probe_sheet_reads_back_as_the_curve_that_drew_it(tmp_path):
+    from erika.force_scan import read_scan
+
+    blocks = {"custom": list(range(0, 101, 10))}
+    # A plausible shape: solid at 0, nothing until the threshold, then a ramp
+    # that saturates -- the machine's own answer, in miniature.
+    curve = {0: 1.0, 10: 0.0, 20: 0.0, 30: 0.0, 40: 0.08, 50: 0.35,
+             60: 0.62, 70: 0.82, 80: 0.94, 90: 1.0, 100: 1.0}
+    scan = _draw_probe_scan(tmp_path, blocks, 20,
+                            lambda v: 1.0 if v is None else curve[v])
+    readings = read_scan(scan, blocks, 20)
+
+    assert [r.value for r in readings] == [None] + list(curve), (
+        "the rows that printed nothing still have to occupy their place, or "
+        "every row after them is read as a different force"
+    )
+    by_value = {r.value: r for r in readings}
+    for value, wanted in curve.items():
+        assert by_value[value].ink == pytest.approx(wanted, abs=0.03), (
+            f"force {value} read back as {by_value[value].ink:.3f}, not {wanted}"
+        )
+    assert [v for v in curve if not by_value[v].marked] == [10, 20, 30]
+
+
+def test_the_suggestion_is_spaced_in_ink_and_not_in_value(tmp_path):
+    """The whole point of reading the sheet rather than eyeballing it."""
+    from erika.force_scan import read_scan, suggest
+
+    blocks = {"custom": list(range(0, 101, 10))}
+    curve = {0: 1.0, 10: 0.0, 20: 0.0, 30: 0.0, 40: 0.08, 50: 0.35,
+             60: 0.62, 70: 0.82, 80: 0.94, 90: 1.0, 100: 1.0}
+    scan = _draw_probe_scan(tmp_path, blocks, 20,
+                            lambda v: 1.0 if v is None else curve[v])
+    readings = read_scan(scan, blocks, 20)
+    picked = suggest(readings, 4)
+    ink = {r.value: r.ink for r in readings}
+
+    # Hardest first means most ink first, which is *not* descending by value:
+    # 0 is full strike, so a correct list here starts with the smallest number
+    # on it. Sorting the result numerically would put full strike last and hand
+    # the registration marks of a charset sheet to the lightest force there is.
+    assert [ink[v] for v in picked] == sorted((ink[v] for v in picked),
+                                              reverse=True)
+    assert ink[picked[0]] == 1.0, "the hardest strike has to stay; see cmd_forces"
+    assert len(set(picked)) == len(picked), "a value twice is a wasted block"
+    # Quarter, half and three quarters of full ink land at 40, 50 and 60-70 --
+    # the bottom of the value range, which is what even arithmetic would miss.
+    assert all(40 <= v <= 70 for v in picked[1:]), (
+        f"{picked} spaces the lighter forces by value rather than by ink"
+    )
+
+
+def test_a_row_below_the_ink_threshold_does_not_shift_the_rows_after_it(tmp_path):
+    """The reason the grid is computed instead of detected.
+
+    A force too weak to mark prints nothing, and its label prints nothing
+    either, because the label is typed at the row's own force. A reader that
+    found rows by looking for ink would hand every later row the wrong force
+    and produce a curve that looks entirely reasonable.
+    """
+    from erika.force_scan import read_scan
+
+    blocks = {"custom": [0, 20, 40, 60, 80]}
+    scan = _draw_probe_scan(
+        tmp_path, blocks, 20,
+        lambda v: 1.0 if v is None else {0: 1.0, 20: 0.0, 40: 0.0,
+                                         60: 0.5, 80: 0.9}[v],
+    )
+    by_value = {r.value: r.ink for r in read_scan(scan, blocks, 20)}
+    assert by_value[60] == pytest.approx(0.5, abs=0.03)
+    assert by_value[80] == pytest.approx(0.9, abs=0.03)
+
+
+def test_the_reader_tolerates_a_cell_width_it_guessed_slightly_wrong(tmp_path):
+    """The cell comes from the title's ink, so the side bearing is a guess.
+
+    Half a cell of inset at each end of the run is what buys the tolerance.
+    """
+    from erika.force_scan import read_scan
+
+    blocks = {"custom": [0, 50]}
+    for bearing in (0.05, 0.3):
+        scan = _draw_probe_scan(
+            tmp_path, blocks, 20,
+            lambda v: 1.0 if v is None else {0: 1.0, 50: 0.5}[v],
+            bearing=bearing,
+        )
+        by_value = {r.value: r.ink for r in read_scan(scan, blocks, 20)}
+        assert by_value[50] == pytest.approx(0.5, abs=0.05), (
+            f"a side bearing of {bearing} cells threw the measurement off"
+        )
+
+
+def test_reading_a_sheet_with_the_wrong_sweep_is_refused_not_guessed(tmp_path):
+    """A sweep that does not match the sheet is the sheet_cols failure again."""
+    from erika.force_scan import read_scan
+
+    typed = {"custom": [0, 50]}
+    scan = _draw_probe_scan(tmp_path, typed, 20,
+                            lambda v: 1.0 if v is None else 0.5)
+    with pytest.raises(ValueError, match="outside the scan"):
+        read_scan(scan, {"custom": list(range(0, 104))}, 20)
+
+
+def test_full_strike_is_not_reported_as_the_ink_threshold(tmp_path):
+    """0 marks because it is the hardest strike, not because it is the floor.
+
+    Reading the sheet naively -- "the lowest value that took ink" -- names the
+    top of the scale as the bottom of it, which is the one thing a reader of
+    this report must not be told.
+    """
+    from erika.force_scan import read_scan, report
+
+    blocks = {"custom": [0, 20, 40, 60, 95, 100]}
+    curve = {0: 1.0, 20: 0.0, 40: 0.1, 60: 0.6, 95: 1.0, 100: 1.0}
+    scan = _draw_probe_scan(tmp_path, blocks, 20,
+                            lambda v: 1.0 if v is None else curve[v])
+    text = report(read_scan(scan, blocks, 20), 3)
+
+    assert "ink begins at 40" in text
+    assert "stops changing from 95" in text
+    assert "top of this scale" in text

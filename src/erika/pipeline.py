@@ -796,6 +796,29 @@ def cmd_sheet(args) -> int:
     return 0
 
 
+def _read_force_scan(args, blocks: dict[str, list[int]], run: int) -> int:
+    """Read a typed probe sheet back as a density curve.
+
+    The sweep has to be the one the sheet was typed with -- the same
+    `--from/--to/--step/--run` -- which is why this lives inside `forces` rather
+    than beside it: the command that typed the sheet, with `--from-scan` added,
+    is the command that reads it, and there is no second place to get the
+    arguments wrong.
+    """
+    from erika import force_scan  # noqa: PLC0415
+
+    try:
+        readings = force_scan.read_scan(args.scan, blocks, run, args.pitch)
+    except (ValueError, FileNotFoundError) as exc:
+        raise PlanError(str(exc)) from exc
+
+    print(f"strike-force probe <- {force_scan.relative_path(args.scan)}")
+    total = sum(len(v) for v in blocks.values())
+    print(f"  {total} force(s) swept, {run} glyphs per row, pitch {args.pitch}")
+    print(force_scan.report(readings, args.levels))
+    return 0
+
+
 def cmd_forces(args) -> int:
     """Sweep the strike-force command, so the machine can say what it accepts.
 
@@ -828,32 +851,40 @@ def cmd_forces(args) -> int:
     different wheel, a different ribbon or a different Sigma moves the threshold
     and the saturation point, and both are what a charset gets built against.
     """
+    from erika import force_scan  # noqa: PLC0415 -- also the scan reader
+
     blocks = _force_probe_blocks(args)
     run = args.run
+    if args.scan:
+        return _read_force_scan(args, blocks, run)
+
     glyph = ec.glyph_for_char(args.char)
     if glyph is None:
         raise PlanError(f"the Sigma has no key for {args.char!r}")
 
     enc = etp.Encoder()
-    type_line(enc, "STRIKE FORCE PROBE")
-    enc.newline(1)
 
-    def sample(label: str) -> None:
-        type_row(enc, [(0, label)])
-        enc.right(2 * (len(label) + 1))
-        for _ in range(run):
-            enc.strike(glyph.code, glyph.advances)
-        enc.newline(1)
-
-    # Before any force command: what the machine does on its own.
-    sample("AS FOUND ")
-
-    for name, values in blocks.items():
-        enc.newline(1)
-        type_line(enc, f"{name.upper()}:")
-        for value in values:
-            enc.set_force(value)
-            sample(f"{value:>3} 0x{value:02X}")
+    # Walked rather than written out, because force_scan reads the sheet back
+    # off the same list: a row's index in it is the row's y on the paper, and
+    # the reader counts rows it cannot see (a force below the ink threshold
+    # prints nothing, not even its own label) rather than looking for them.
+    for line in force_scan.probe_lines(blocks, run):
+        if line.kind == "blank":
+            enc.newline(1)
+        elif line.kind in ("title", "heading"):
+            type_line(enc, line.text)
+        else:
+            # The label is typed at the row's own force, so a row that printed
+            # nothing is blank end to end. That is deliberate: it is the same
+            # answer either way, and a label at full force on a row that took no
+            # ink would read as a force the machine accepted and then ignored.
+            if line.value is not None:
+                enc.set_force(line.value)
+            type_row(enc, [(0, line.text)])
+            enc.right(2 * (len(line.text) + 1))
+            for _ in range(line.run_cells):
+                enc.strike(glyph.code, glyph.advances)
+            enc.newline(1)
 
     enc.newline(2)
     enc.carriage_return()
@@ -907,9 +938,11 @@ def cmd_forces(args) -> int:
     print("      --name sigma-forces --from-scan /path/to/scan.png")
     print("\nPick those by how the ink looks on this sheet, not by even")
     print("arithmetic: the values are a lever position, and the ramp between the")
-    print("floor and saturation is not linear in them. A value that only just")
-    print("marks is the most valuable tonally and the least repeatable, so look")
-    print("at its tiles on the charset scan before trusting the charset.")
+    print("floor and saturation is not linear in them. Or scan the sheet and let")
+    print("it say so itself -- every row is the same glyph struck the same number")
+    print("of times, so the ink per row is the curve:")
+    print("  python -m erika.pipeline forces --from-scan /path/to/scan.png \\")
+    print("      --levels 4        # plus the same sweep this sheet was typed with")
     print("\nOne piece of advice from the paper that does NOT transfer: its")
     print("figure 20 found medium plus light beat dark plus medium, because its")
     print("typewriter could already reach black. This one cannot, so keep the")
@@ -1649,6 +1682,14 @@ def build_parser() -> argparse.ArgumentParser:
                          f"the usable space is {ec.MAX_FORCE + 1} values and more "
                          "than one sheet of paper, and at --step 16 it is seven "
                          "lines. Find the neighbourhood coarsely, then sweep it")
+    fo.add_argument("--from-scan", dest="scan", default=None,
+                    help="read a scan of this sheet instead of typing one: the "
+                         "ink per row is the transfer curve of the force "
+                         "command, which is what says where to put three or four "
+                         "forces so they land evenly in tone rather than evenly "
+                         "in number. Give the same sweep the sheet was typed with")
+    fo.add_argument("--levels", type=int, default=4,
+                    help="how many forces --from-scan should suggest (default 4)")
     fo.set_defaults(func=cmd_forces)
 
     me = sub.add_parser("melody", help="play a rhythm on the machine's beeper")

@@ -281,7 +281,8 @@ erika.pipeline verify     diff a plan render against optimize.py's mockup
 erika.pipeline calibrate  motion-code test pattern
 erika.pipeline area       bracket the corners of the printable area (--rows, --columns)
 erika.pipeline sheet      type the charset, for scanning back in (--forces)
-erika.pipeline forces     sweep the strike-force command to see what it takes
+erika.pipeline forces     sweep the strike-force command to see what it takes,
+                          and --from-scan to read the sheet back as a curve
                           (--from/--to/--step to widen it and keep it to a sheet)
 erika.pipeline codes      probe the control codes the pipeline does not use yet
 
@@ -364,6 +365,30 @@ charset scan before believing the charset.
 None of that is a property of the protocol. It is one wheel and one ribbon, and
 another of either moves both ends of the ladder.
 
+### Choosing the forces, from the sheet rather than from the eye
+
+Reading the sheet by eye says which values marked the paper. What a charset
+needs is three or four values spaced evenly *in tone*, and those are not the
+same question: the value is a lever position, and on this machine the twelve
+between the first legible character and a fully formed one hold as much of the
+range as the forty above them. Pick by even arithmetic and three of four samples
+land in the same place.
+
+So scan the sheet and let it answer. Every row is the same glyph struck the same
+number of times, which makes the ink per row the transfer curve of the force
+command:
+
+```bash
+python -m erika.pipeline forces --from 35 --to 103 --step 1 \
+    --from-scan /path/to/probe-scan.png --levels 4
+```
+
+It prints the curve as a bar chart, where the ink begins and where it stops
+changing, a `--forces` list spaced evenly in ink, and the `--force-density`
+figures to match if you want a modelled charset to agree with a measured one.
+Give it the same sweep the sheet was typed with — the grid is what says which row
+is which, exactly as with `--sheet-cols` on a charset sheet.
+
 With the answer, hardest first:
 
 ```bash
@@ -371,6 +396,11 @@ python -m erika.pipeline sheet --forces 0,60,50,43        # type the set at each
 python -m erika.pipeline charset --forces 0,60,50,43 \
     --name sigma-forces --from-scan /path/to/scan.png
 ```
+
+Note that "hardest first" is not "descending", because `0` is full strike: a
+correct list usually opens with the smallest number on it. The order matters —
+`forces[0]` is what the charset sheet strikes its registration marks at, and
+light registration marks are marks the slicer may not find.
 
 The `--forces` lists must match and be in the same order: the scan is sliced to a
 grid, and the grid is the only thing that says which tile is which.
