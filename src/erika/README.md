@@ -305,12 +305,10 @@ force", which is this.
 This machine has a command for it: `A3H`, *Anschlagstärke*, followed by one byte
 naming the force. It is carried end to end now -- `SET_STRIKE_FORCE` in
 `erika_codes.py`, `OP_SET_FORCE` in the `.etp` stream, `ETP_SET_FORCE` in the
-firmware, a `force` per glyph in `glyphs.json`. **What no part of it knows is
-which forces this machine accepts.** The manual gives the code and says the next
-character is the strength; it does not say what strengths exist, nor whether
-"character" means a small integer or the ASCII digit for one.
-
-So the first step is a sheet, not a setting:
+firmware, a `force` per glyph in `glyphs.json`. The manual gives the code and
+says the next character is the strength; it does not say what strengths exist,
+nor whether "character" means a small integer or the ASCII digit for one. So the
+first step is a sheet, not a setting:
 
 ```bash
 python -m erika.pipeline forces
@@ -335,11 +333,42 @@ above the wheel's own codes there is no ordinary character: only a *motion*,
 which would shift the rest of the line and ruin the sheet exactly where it has
 to be read, or a command that swallows the byte after it.
 
+### What this machine answered
+
+The sheet has been typed, on a Sigma SM 8200i with a Courier 10 wheel:
+
+| value | what prints |
+|---|---|
+| `0` | solid — full strike, and nothing prints darker |
+| `1`–`39` | no ink at all |
+| `40` | first ink: isolated dots, not a character |
+| `43` | first legible character — the practical floor |
+| `55` | fully formed characters |
+| `95`–`103` | saturated; indistinguishable from each other |
+
+So the operand is a **raw count**, not the ASCII digit for one: the `ascii`
+reading would have marked only at `0x30`–`0x39` and typed strays everywhere else,
+and what came out is one continuous ramp across the whole swept range. Larger is
+harder, with `0` the exception at the top. The scale saturates at `0x5F`, below
+the `0x67` ceiling `is_usable_force` imposes for an unrelated reason, so that
+guard costs no tonal range here.
+
+Two things follow for the charset. The usable ladder is **43 to 95** and it is
+compressed at the bottom — 43 to 55 covers barely-there to fully formed, and
+everything above 55 is the top of the range — so pick forces from the bottom of
+it, spaced by how the ink looks rather than by even arithmetic. And the value
+that only just marks is the one worth most tonally and trusted least: it is a
+threshold, so ribbon wear and wheel position move it. Look at its tiles on the
+charset scan before believing the charset.
+
+None of that is a property of the protocol. It is one wheel and one ribbon, and
+another of either moves both ends of the ladder.
+
 With the answer, hardest first:
 
 ```bash
-python -m erika.pipeline sheet --forces 0,3,6        # type the set at each
-python -m erika.pipeline charset --forces 0,3,6 \
+python -m erika.pipeline sheet --forces 0,60,50,43        # type the set at each
+python -m erika.pipeline charset --forces 0,60,50,43 \
     --name sigma-forces --from-scan /path/to/scan.png
 ```
 

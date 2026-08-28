@@ -134,16 +134,38 @@ force — and until recently nothing here knew about it.
 
 It is now carried end to end: `erika_codes.SET_STRIKE_FORCE`, the `.etp` opcode
 `OP_SET_FORCE`, a `force` per glyph in `glyphs.json`, `Charset.forces` and
-`force_order`, and `ETP_SET_FORCE` in the firmware. **None of it is confirmed on
-hardware.** The manual gives the code and says the next character is the
-strength; it does not say which strengths exist, nor whether "character" means a
-small integer or the ASCII digit for one.
+`force_order`, and `ETP_SET_FORCE` in the firmware.
+
+**The probe sheet has now been typed, and the command works.** On the Sigma SM
+8200i with a Courier 10 wheel:
+
+| value | what prints |
+|---|---|
+| `0` | solid — full strike, and nothing prints darker |
+| `1`–`39` | no ink at all |
+| `40` | first ink: isolated dots, not a character |
+| `43` | first legible character — the practical floor |
+| `55` | fully formed characters |
+| `95`–`103` | saturated; indistinguishable from each other |
+
+Which settles the question the sheet existed for: the operand is a **raw count**,
+not the ASCII digit for one — an ASCII scale would mark only at `0x30`–`0x39` and
+type strays everywhere else, and the sheet is one continuous ramp. Larger is
+harder, with `0` the exception at the top. `erika_codes` carries the full note.
+
+Two things to carry forward. The usable ladder is **43 to 95** and it is
+compressed at the bottom — 43 to 55 spans barely-there to fully formed — so
+charset forces want picking from the bottom of it, by how the ink looks rather
+than by even arithmetic. And the scale saturates at `0x5F`, *below* the `0x67`
+that `MAX_FORCE` imposes for an unrelated reason, so that guard costs this
+machine no tonal range. All of it is a measurement of one wheel and one ribbon;
+re-run the sheet for another.
 
 ```bash
 PY -m erika.pipeline forces                 # sweeps both readings, on paper
-PY -m erika.pipeline forces --from 0 --to 0xFF --step 16   # or the whole byte, coarsely
-PY -m erika.pipeline sheet --forces 0,3,6   # then type the set at each
-PY -m erika.pipeline charset --forces 0,3,6 --from-scan scan.png
+PY -m erika.pipeline forces --from 35 --to 103 --step 1    # the pass worth typing on a known-good command
+PY -m erika.pipeline sheet --forces 0,60,50,43   # then type the set at each
+PY -m erika.pipeline charset --forces 0,60,50,43 --from-scan scan.png
 ```
 
 `--step` is what makes a wide sweep answerable: every value from `0x00` to `0xFF`

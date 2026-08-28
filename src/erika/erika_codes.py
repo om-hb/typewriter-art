@@ -45,18 +45,23 @@ MICRO_LINE_BACK = 0x82  # Mikrozeilenschaltung rückwärts
 # factor in obtaining a good tonal range in the midtones and highlights" --
 # so it is the single most valuable code in this table.
 #
-# It is also the least confirmed. The manual gives the code and says the next
-# character is the strength; it does not say what strengths exist or how they
-# are spelled. Both readings of "Zeichen" are plausible -- a small integer, or
-# the ASCII digit for it -- and neither can be settled from here.
+# The manual gives the code and says the next character is the strength; it does
+# not say what strengths exist or how they are spelled. Both readings of
+# "Zeichen" were plausible -- a small integer, or the ASCII digit for it -- and
+# neither could be settled from here, so
 #
 #     python -m erika.pipeline forces
 #
-# types a sheet that sweeps both, and its printout says what to do with the
-# answer. Until that has been on paper, treat every number below as a guess.
+# types a sheet that sweeps both and lets the paper answer. That sheet has now
+# been typed; what it said is below, and it settles the spelling. On a different
+# machine or a different wheel, type it again -- everything below the command is
+# a measurement of one machine, not a property of the protocol.
 SET_STRIKE_FORCE = 0xA3  # Anschlagstärke - next byte is the force
 
-#: Values `pipeline forces` sweeps, as {label: (first, last)}. Both blocks stay
+#: Values `pipeline forces` sweeps by default, as {label: (first, last)}: the
+#: two readings of the manual, before either had been on paper. The `raw` one
+#: turned out to be right (see below), which leaves these as a first pass on an
+#: unknown machine rather than the sweep to run on this one. Both blocks stay
 #: inside the wheel's own range (see MAX_FORCE): if this machine does not
 #: honour SET_STRIKE_FORCE, the force byte arrives as an ordinary character,
 #: and a character the wheel can type is a visible stray mark rather than a
@@ -67,8 +72,43 @@ FORCE_PROBE_BLOCKS = {
     "ascii": (0x30, 0x39),
 }
 
-#: The force a job asks for when it wants everything the machine has. Nothing
-#: verifies this yet; see FORCE_PROBE_BLOCKS.
+# What the sheet said, on the Sigma SM 8200i this was written for, with a
+# Courier 10 wheel: swept 0x00..0x64 in steps of 5, then again in steps of 1 at
+# both ends.
+#
+#   0          solid. Full strike; nothing was seen to print darker.
+#   1..39      no ink at all. The command is honoured -- the strike is simply
+#              too weak to reach the paper.
+#   40 (0x28)  first ink: isolated dots, not a character.
+#   43 (0x2B)  first legible character. The practical floor.
+#   55 (0x37)  fully formed characters.
+#   95..103    saturated; 0x5F to 0x67 are indistinguishable from each other.
+#
+# Three things follow, and the first is the one the sheet existed to settle.
+#
+# **The operand is a raw count, not the ASCII digit for one.** Under the `ascii`
+# reading only 0x30..0x39 would set a force and every other value would be typed
+# as a stray character; what the paper shows instead is one continuous ramp
+# across the whole swept range, 0x32 and 0x37 sitting on it like any other
+# value. Harder is a larger number, with 0 the exception at the top.
+#
+# **The usable ladder is 43..95, and it is compressed.** 43 to 55 spans
+# barely-there to fully formed and everything above 55 is the top of the range,
+# so charset forces want picking from the bottom of it -- and by how the ink
+# looks, not by even arithmetic. Note that FORCE_PROBE_BLOCKS' own two blocks
+# undersample exactly there: on a new wheel, `--from 35 --to 103 --step 1` is
+# the pass worth the paper.
+#
+# **The scale saturates below MAX_FORCE.** 0x5F is already the top and the
+# ceiling is 0x67, so the bound MAX_FORCE imposes for an unrelated reason (a
+# force byte has to be inert if it is typed) costs this machine no tonal range
+# at all. That was luck, not design.
+#
+# One thing the sheet did not resolve: whether 0 is exactly the top of the ramp
+# or a shade darker still. By eye it is the same. Nothing depends on it.
+
+#: The force a job asks for when it wants everything the machine has. The probe
+#: sheet confirms it: 0 prints solid, level with the top of the scale.
 FULL_STRIKE_FORCE = 0x00
 
 
@@ -170,6 +210,12 @@ MAX_GLYPH_CODE = 0x67
 #: wheel's own range. Above it lies the motion block and then the commands, and
 #: seven of those would eat the byte after the force and take the rest of the
 #: job with them.
+#:
+#: This machine does honour the command, so on it the bound is belt-and-braces
+#: -- and it turns out to cost nothing anyway, because the force scale saturates
+#: at 0x5F, below this. It stays because it is the only thing standing between a
+#: mistyped force and half an hour of arbitrary motion on a machine, or a wheel,
+#: that answers differently.
 MAX_FORCE = MAX_GLYPH_CODE
 
 
@@ -193,8 +239,10 @@ def is_usable_force(value: int) -> bool:
     (the probe sheet is built to be readable either way). Outside it, the value
     is a motion at best and a command that eats the following byte at worst.
 
-    0 is allowed although it is below the wheel: nothing on the machine answers
-    to it, which is what FULL_STRIKE_FORCE is counting on.
+    0 is allowed although it is below the wheel: no key has that code, so a
+    machine ignoring the command types nothing rather than a stray character.
+    On this one it is a force like any other, and the hardest -- see
+    FULL_STRIKE_FORCE.
     """
     return 0 <= value <= MAX_FORCE
 

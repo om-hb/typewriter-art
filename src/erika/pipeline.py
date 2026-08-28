@@ -817,10 +817,16 @@ def cmd_forces(args) -> int:
       sheet unreadable exactly where it needs reading, or worse a command that
       eats the byte after it and takes the rest of the sheet with it.
 
-    The published control code table (erika_ai/ressources/steuercodes.md) gives
-    a weak steer on which hypothesis to read first: 0xA5, 0xA6 and 0xA7 all
-    spell their operand out as a raw count, and 0xA3 uses the same phrasing for
-    the force. That points at the `raw` block rather than the `ascii` one.
+    The published control code table (erika_ai/ressources/steuercodes.md) gave a
+    weak steer on which hypothesis to read first: 0xA5, 0xA6 and 0xA7 all spell
+    their operand out as a raw count, and 0xA3 uses the same phrasing for the
+    force. That pointed at the `raw` block, and the paper agreed -- the sheet
+    types one continuous ramp across the value space rather than marking only at
+    0x30..0x39. erika_codes.SET_STRIKE_FORCE carries the measured scale.
+
+    The command survives that answer because the answer is one machine's. A
+    different wheel, a different ribbon or a different Sigma moves the threshold
+    and the saturation point, and both are what a charset gets built against.
     """
     blocks = _force_probe_blocks(args)
     run = args.run
@@ -884,10 +890,26 @@ def cmd_forces(args) -> int:
           "the force spelled")
     print("    some other way. Try another range with --from/--to, and --step to")
     print("    keep a wide one down to a sheet of paper.")
+    print("\nFor reference, what this sheet said on a Sigma SM 8200i with a")
+    print("Courier 10 wheel -- the machine the pipeline was written for:")
+    print("  0          solid; full strike")
+    print("  1..39      no ink at all")
+    print("  40         first ink, isolated dots, not a character")
+    print("  43         first legible character -- the practical floor")
+    print("  55         fully formed characters")
+    print("  95..103    saturated, indistinguishable from each other")
+    print("So: a raw count, harder for larger, and a usable ladder of 43..95")
+    print("that is compressed at the bottom. Your wheel and ribbon will differ;")
+    print("that is what this sheet is for.")
     print("\nThen, with the values that worked, hardest first:")
-    print("  python -m erika.pipeline sheet --forces 0,3,6      # type it")
-    print("  python -m erika.pipeline charset --forces 0,3,6 \\")
+    print("  python -m erika.pipeline sheet --forces 0,60,50,43      # type it")
+    print("  python -m erika.pipeline charset --forces 0,60,50,43 \\")
     print("      --name sigma-forces --from-scan /path/to/scan.png")
+    print("\nPick those by how the ink looks on this sheet, not by even")
+    print("arithmetic: the values are a lever position, and the ramp between the")
+    print("floor and saturation is not linear in them. A value that only just")
+    print("marks is the most valuable tonally and the least repeatable, so look")
+    print("at its tiles on the charset scan before trusting the charset.")
     print("\nOne piece of advice from the paper that does NOT transfer: its")
     print("figure 20 found medium plus light beat dark plus medium, because its")
     print("typewriter could already reach black. This one cannot, so keep the")
@@ -1598,7 +1620,7 @@ def build_parser() -> argparse.ArgumentParser:
     sh.add_argument("--dead-keys", action="store_true")
     sh.add_argument("--forces", default=None,
                     help="type the whole set once per strike force, hardest first "
-                         "(e.g. 0,3,6). Pass the same list to `charset "
+                         "(e.g. 0,60,50,43). Pass the same list to `charset "
                          "--from-scan` -- the grid is what identifies the tiles")
     sh.set_defaults(func=cmd_sheet)
 

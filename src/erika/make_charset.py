@@ -701,9 +701,10 @@ def add_ink_args(p) -> None:
                    help=f"ink point spread in cell pixels (default {DEFAULT_SPREAD})")
     p.add_argument("--forces", default=None,
                    help="strike forces to repeat the glyph set at, hardest first, "
-                        "e.g. 0,3,6. Empty (the default) builds a single-force "
-                        "charset. Run `pipeline forces` first: nothing here is "
-                        "confirmed on hardware yet")
+                        "e.g. 0,60,50,43. Empty (the default) builds a "
+                        "single-force charset. Run `pipeline forces` first: the "
+                        "usable range is a property of the wheel and the ribbon, "
+                        "not of the protocol")
     p.add_argument("--force-density", default=None,
                    help="ink each lighter force transfers, as a fraction of the "
                         "first, e.g. 0.55,0.3. Font path only -- a scan measures "
