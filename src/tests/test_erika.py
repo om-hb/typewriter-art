@@ -4102,3 +4102,84 @@ def test_the_rows_come_from_the_marks_and_not_from_the_ink(tmp_path):
     assert abs(found - pitch) < abs(from_ink - pitch) / 3, (
         f"marks {found:.2f} are no better than ink {from_ink:.2f} against {pitch}"
     )
+
+
+def _force_sheet(cols, rows, entries_n, block, cell_w, cell_h, slip=0.0):
+    """A sheet where each force block can be drawn a little lower than the last.
+
+    ``slip`` is the fraction of a cell that block *n* is shifted down by n*slip,
+    which is what a row pitch a percent short does to a real scan.
+    """
+    sheet = np.ones((rows * cell_h, cols * cell_w), dtype="float32")
+    for i in range(entries_n):
+        r, c = divmod(i, cols)
+        drop = int(round((i // block) * slip * cell_h))
+        top = r * cell_h + 8 + drop
+        sheet[top: min(top + 12, (r + 1) * cell_h),
+              c * cell_w + 4: (c + 1) * cell_w - 4] = 1.0 - 0.2 * (i % block % 5 + 1)
+    return sheet
+
+
+def test_the_force_montage_is_only_built_when_there_is_something_to_compare():
+    from erika import erika_codes as ec, force_view
+
+    glyphs = ec.all_glyphs()[:20]
+    entries = [(g, 0) for g in glyphs]
+    sheet = _force_sheet(20, 1, 20, 20, 24, 40)
+    assert force_view.build(sheet, entries, 20, 24, 40, [0]) is None, (
+        "one force has nothing to put beside anything"
+    )
+    assert force_view.drift(sheet, entries, 20, 24, 40, [0]) is None
+
+
+def test_the_force_montage_measures_a_grid_that_slips_between_blocks():
+    """The number under the picture, and the reason both exist.
+
+    A drifting row pitch cuts each force block lower than the last. Every tile
+    still looks like its character, the count is right, the mapping verifies --
+    and the tones are measured off centre, worst in the lightest block.
+    """
+    from erika import erika_codes as ec, force_view
+
+    cols, block, forces = 20, 20, [0, 60, 45]
+    glyphs = ec.all_glyphs()[:block]
+    entries = [(g, f) for f in forces for g in glyphs]
+    rows = (len(entries) + cols - 1) // cols
+
+    steady = _force_sheet(cols, rows, len(entries), block, 24, 40, slip=0.0)
+    slipped = _force_sheet(cols, rows, len(entries), block, 24, 40, slip=0.15)
+
+    held = force_view.drift(steady, entries, cols, 24, 40, forces)
+    moved = force_view.drift(slipped, entries, cols, 24, 40, forces)
+    assert held is not None and held < 0.5, f"a steady grid measured {held}"
+    assert moved > 4.0, f"a grid slipping 15% of a 40px cell measured only {moved}"
+
+    montage = force_view.build(slipped, entries, cols, 24, 40, forces)
+    assert montage is not None
+    assert montage.shape[0] > 40 and montage.shape[1] > 3 * 24, "too small to read"
+
+
+def test_the_montage_shows_the_lightest_marks_the_wheel_makes():
+    """Chosen from the sheet, not named in the code.
+
+    The glyphs that expose a drifting grid are the small ones that sit high or
+    low in the cell -- a full stop, an accent -- and which those are differs by
+    wheel. So the spread runs from least ink to most, and the light end is where
+    the check actually happens.
+    """
+    from erika import erika_codes as ec, force_view
+
+    cols, block, forces = 20, 20, [0, 60]
+    glyphs = ec.all_glyphs()[:block]
+    entries = [(g, f) for f in forces for g in glyphs]
+    rows = (len(entries) + cols - 1) // cols
+    sheet = _force_sheet(cols, rows, len(entries), block, 24, 40)
+
+    picked = force_view._pick(sheet, entries, cols, 24, 40, block,  # noqa: SLF001
+                              force_view.ROWS_SHOWN)
+    assert len(picked) == force_view.ROWS_SHOWN
+    ink = []
+    for i in picked:
+        r, c = divmod(i, cols)
+        ink.append(1.0 - float(sheet[r * 40: (r + 1) * 40, c * 24: (c + 1) * 24].mean()))
+    assert ink[0] < ink[-1], "the spread should run from least ink to most"

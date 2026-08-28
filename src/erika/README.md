@@ -388,6 +388,32 @@ charset scan before believing the charset.
 None of that is a property of the protocol. It is one wheel and one ribbon, and
 another of either moves both ends of the ladder.
 
+### Looking at what came back
+
+`make_charset` writes two pictures beside every charset it builds, and they
+answer different questions.
+
+`preview.png` is the labelled contact sheet: every tile with the character it
+types and the force it was struck at. It shows a grid recovered a whole cell out
+of step, because then every glyph sits against its neighbour's label.
+
+`forces.png` is written only for a charset with more than one strike force, and
+it shows what the contact sheet cannot: one glyph per row, its strike at every
+force beside it, chosen automatically from the lightest mark on the wheel to the
+heaviest. Force blocks are typed in order down the sheet, so a row pitch that is
+a fraction short cuts each block a little lower than the last — every tile still
+looks like its character, the count is right, the mapping verifies, and the tones
+are measured off centre. Side by side it reads as a full stop sinking across the
+row. The same measurement comes out as a number when the charset is built:
+
+```
+  force blocks register to 1.03px of a 40px cell (see forces.png)
+```
+
+taken between the two heaviest blocks, where every glyph is fully formed and
+anything left is registration rather than a light strike losing part of a letter.
+`erika-studio`'s Type wheels page serves both as tabs.
+
 ### Choosing the forces, from the sheet rather than from the eye
 
 Reading the sheet by eye says which values marked the paper. What a charset

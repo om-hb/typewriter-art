@@ -501,6 +501,16 @@ seconds into a `calibrate` run. `test_stress.py` compares the two copies.
   paper's quarters sample it twice over, and `--align-steps 2` probes almost
   nothing but the scale and the border. What is left over at a half-cell shift is
   a border effect, which is why it is not exactly a no-op on a photograph.
+- **`forces.png` is the check `preview.png` cannot make.** The contact sheet
+  shows a grid a *whole* cell out of step, because every glyph then sits against
+  its neighbour's label. It does not show one that is slightly out: force blocks
+  are typed in order down the sheet, so a row pitch a percent short cuts each
+  block lower than the last, and every tile still looks like its character. The
+  montage puts one glyph's strikes side by side, where that reads as a full stop
+  sinking across the row. Written for multi-force charsets only, and the build
+  prints the same thing as a number — `force blocks register to 1.03px of a 40px
+  cell`, measured between the two heaviest blocks, where any offset left is
+  registration rather than a light strike losing part of a letter.
 - **Force blocks in a charset sheet run contiguously, not row-aligned.** A blank
   tile *between* two glyphs is dropped by `chop_charset()` and shifts every index
   after it, so a force block starts wherever the last one ended, part-way through

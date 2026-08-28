@@ -62,7 +62,7 @@ from PIL import Image, ImageDraw, ImageFont
 if __package__ in (None, ""):  # allow `python erika/make_charset.py`
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from erika import SRC_DIR, deskew, erika_codes as ec
+from erika import SRC_DIR, deskew, erika_codes as ec, force_view
 
 DEFAULT_FONT_CANDIDATES = (
     "/System/Library/Fonts/Supplemental/Courier New.ttf",
@@ -581,6 +581,9 @@ def make_charset(
         os.path.join(charset_dir, "preview.png"),
         _labelled_preview(sheet, entries, cell_w, cell_h, cols),
     )
+    montage = force_view.build(sheet, entries, cols, cell_w, cell_h, force_list)
+    if montage is not None:
+        cv2.imwrite(os.path.join(charset_dir, "forces.png"), montage)
 
     config = {
         "charset_name": f"Sigma SM 8200i (pitch {pitch})",
@@ -644,6 +647,10 @@ def make_charset(
     print(f"  glyph source: {font_used}")
     if scan:
         print("  ink measured from the scan")
+        moved = force_view.drift(sheet, entries, cols, cell_w, cell_h, force_list)
+        if moved is not None:
+            print(f"  force blocks register to {moved:.2f}px of a {cell_h}px cell "
+                  f"(see forces.png)")
     else:
         print(f"  ink modelled: densest grey {ink * 255:.0f}, spread {spread} px"
               + (f", lighter forces at {densities[1:]} of full" if forces else ""))
