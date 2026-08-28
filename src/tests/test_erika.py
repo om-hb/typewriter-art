@@ -4047,3 +4047,58 @@ def test_a_glyph_missing_from_a_lighter_force_is_not_refused(tmp_path):
         sheet[r * 40: (r + 1) * 40, c * 24: (c + 1) * 24] = 1.0
     chars = [chr(65 + i % 26) for i in range(n_tiles)]
     assert check_scan_hardest_block(sheet, cols, rows, n_tiles, block, chars) is None
+
+
+def test_the_rows_come_from_the_marks_and_not_from_the_ink(tmp_path):
+    """Ink runs from the tallest glyph's top to the lowest one's bottom.
+
+    Which is inside the block by an ascender at one end and a descender at the
+    other, so dividing it by the row count gives a pitch that is short. Nothing
+    in one row, a quarter of a cell by the twenty-first -- and the twenty-first
+    row is where the lightest strike force was typed, so the tiles it damages
+    most are the ones with least ink to spare. On the first real sheet the ink
+    extent implied 98.5px where the marks say 99.9.
+    """
+    import cv2
+
+    from erika.make_charset import _ink_extent, _mark_rows, sheet_mark_cells
+
+    cols, rows = 20, 21
+    left_cell, first_cell, right_cell = sheet_mark_cells(cols)
+    cell, pitch, margin = 40, 100, 60
+    im = np.full((margin * 2 + rows * pitch, margin * 2 + (right_cell + 1) * cell),
+                 250, np.uint8)
+    for row in range(rows):
+        y = margin + row * pitch
+        # The marks: a stem and a dot under it, like the '!' the sheet types.
+        for c in (left_cell, right_cell):
+            x = margin + c * cell + int(cell * 0.45)
+            im[y + 20: y + 62, x: x + 5] = 30
+            im[y + 70: y + 78, x: x + 5] = 30
+        # Glyphs that sit well inside their cells, which is what misleads the
+        # ink extent: 22 pixels of clearance at the top, 14 at the bottom.
+        for column in range(cols):
+            x = margin + (first_cell + column) * cell + 6
+            im[y + 22: y + pitch - 14, x: x + cell - 12] = 60
+    path = str(tmp_path / "rows.png")
+    cv2.imwrite(path, im)
+
+    read = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    left_c = margin + left_cell * cell + int(cell * 0.45) + 2
+    right_c = margin + right_cell * cell + int(cell * 0.45) + 2
+    band = _mark_rows(read, left_c, right_c, cell, rows)
+    assert band is not None, "twenty-one marks down each edge and none were found"
+    top, found = band
+    assert found == pytest.approx(pitch, abs=0.5), (
+        f"the marks say {found:.2f}px where the sheet was drawn at {pitch}"
+    )
+
+    # And what the ink alone would have said, which is the bug this replaces.
+    block = read[:, margin + first_cell * cell:
+                 margin + (first_cell + cols) * cell]
+    extent = _ink_extent(block < 250 * 0.75, axis=1)
+    from_ink = (extent[1] - extent[0] + 1) / rows
+    assert from_ink < pitch - 1, "the fixture no longer reproduces the bug"
+    assert abs(found - pitch) < abs(from_ink - pitch) / 3, (
+        f"marks {found:.2f} are no better than ink {from_ink:.2f} against {pitch}"
+    )

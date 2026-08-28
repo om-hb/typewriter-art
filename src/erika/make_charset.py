@@ -815,6 +815,62 @@ def _find_sheet_marks(im: np.ndarray, cols: int) -> tuple[float, float] | None:
     return best[1], best[2]
 
 
+#: Two ink bands in a mark's column belong to the same mark if they are closer
+#: than this much of a row. The sheet's mark is an exclamation point, which is a
+#: stem and then a dot with a clear gap between them; the gap between one row and
+#: the next is several times larger. Anywhere from a tenth to three tenths gives
+#: exactly one band per row on both sheets measured.
+MARK_BAND_MERGE = 0.2
+
+
+def _mark_rows(im, left_c, right_c, cell, rows):
+    """Row origin and pitch, read off the registration marks. None if unclear.
+
+    Every row of the sheet carries a mark at each end, struck at the hardest
+    force whatever the row itself was typed at -- so on a sheet whose last block
+    is barely visible, the marks are still there to be measured. Twenty-one of
+    them down each edge is a ruler with twenty-one graduations, and a straight
+    line through it gives a pitch that does not drift.
+
+    The phase is a separate question, and the marks cannot answer it alone: a
+    mark's ink runs from its cap height to its baseline, not from the top of its
+    cell to the bottom. So the pitch comes from the marks and the *offset* comes
+    from centring the whole block of rows on the ink it contains, which splits
+    the ascender gap at the top against the descender gap at the bottom rather
+    than charging both to one end.
+    """
+    def centres(x):
+        lo, hi = int(round(x - cell * 0.35)), int(round(x + cell * 0.35))
+        strip = im[:, max(0, lo): min(im.shape[1], hi)]
+        if strip.size == 0:
+            return []
+        paper = float(np.percentile(im, 95))
+        profile = (strip < paper * 0.75).sum(axis=1)
+        if profile.max() <= 0:
+            return []
+        runs = _ink_runs(profile > profile.max() * 0.15)
+        rough = (runs[-1][1] - runs[0][0]) / rows if runs else 0.0
+        merged: list[list[int]] = []
+        for a, b in runs:
+            if merged and a - merged[-1][1] < rough * MARK_BAND_MERGE:
+                merged[-1][1] = b
+            else:
+                merged.append([a, b])
+        return [(a + b) / 2.0 for a, b in merged]
+
+    found = [c for c in (centres(left_c), centres(right_c)) if len(c) == rows]
+    if not found:
+        return None
+
+    index = np.arange(rows, dtype=float)
+    pitch = float(np.mean([np.polyfit(index, np.array(c), 1)[0] for c in found]))
+    if pitch <= 0:
+        return None
+
+    middle = float(np.mean([np.mean(c) for c in found]))
+    return middle - (rows - 1) / 2.0 * pitch - pitch / 2.0, pitch
+
+
 def _sheet_from_scan(scan_path, n_tiles, cols, cell_w, cell_h, deskew_scan=True):
     """Slice a scanned charset sheet into the same cell grid.
 
@@ -875,15 +931,30 @@ def _sheet_from_scan(scan_path, n_tiles, cols, cell_w, cell_h, deskew_scan=True)
         block_left = left_c + (first_cell - 0.5) * cell
         x0 = int(round(max(0.0, block_left)))
         x1 = int(round(min(float(im.shape[1]), block_left + cols * cell)))
+        # The rows, from the marks, before the marks are cropped away. The ink
+        # extent used to serve here on the reasoning that the outer rows are
+        # full of glyphs where the outer columns are not -- true, and not the
+        # problem. The problem is that ink extends from the tallest glyph's top
+        # to the lowest one's bottom, which is *inside* the block by an ascender
+        # at one end and a descender at the other. Dividing that by the row
+        # count gives a pitch a percent or so short, which is nothing in one row
+        # and a quarter of a cell by the twenty-first: on the first two real
+        # sheets it came out 1.4% and 1.1% short, drifting 29% and 23% of a row
+        # over the sheet. Every tile below the first few then carries a slice of
+        # the row above it, worst at the bottom, which is exactly where the
+        # lightest strike force was typed.
+        band = _mark_rows(im, left_c, right_c, cell, rows)
         im = im[:, x0:x1]
-        # Vertically the ink extent is the honest crop and always was: every
-        # outer row has `cols` glyphs defining its extreme where an outer column
-        # has only `rows`, so this is the axis that did not need marks. Taken
-        # from the block alone, with the marks now cropped away.
-        paper = float(np.percentile(im, 95))
-        rows_of = _ink_extent(im < paper * 0.75, axis=1)
-        if rows_of is not None:
-            im = im[rows_of[0]: rows_of[1] + 1]
+        if band is not None:
+            top, pitch = band
+            y0 = int(round(top))
+            y1 = int(round(top + rows * pitch))
+            im = im[max(0, y0): min(im.shape[0], y1)]
+        else:
+            paper = float(np.percentile(im, 95))
+            rows_of = _ink_extent(im < paper * 0.75, axis=1)
+            if rows_of is not None:
+                im = im[rows_of[0]: rows_of[1] + 1]
 
     im = cv2.resize(im, (cols * cell_w, rows * cell_h), interpolation=cv2.INTER_AREA)
     # The sheet is mostly paper, so a high percentile *is* the paper -- a robust

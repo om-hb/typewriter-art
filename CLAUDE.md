@@ -180,9 +180,19 @@ because each produced a *plausible* charset rather than an error:
 | the vertical extent | any ink at all, so three pixels of dust put the grid a quarter too tall and three rows too high | a line must carry `INK_LINE_FLOOR` of the heaviest line's ink |
 | a column of the sheet | any column with ink on two rows, so one overhanging glyph welded twenty columns into four | a column must carry `COLUMN_INK_FLOOR` of the heaviest column |
 | the registration marks | assumed to be the outermost ink runs, so one speck outside the right-hand mark hid both | the best-fitting *pair*, by width, isolation and the cell width they imply |
+| the row grid | the ink extent divided by the row count, which is short by an ascender and a descender — 1.4% on the first sheet, compounding to a quarter of a cell by row 21 | pitch from a straight line through the marks down each edge, phase from centring the block on its ink |
 
 Each threshold sits in the middle of a plateau measured on both sheets, with an
-order of magnitude between what it must keep and what it must ignore. And when
+order of magnitude between what it must keep and what it must ignore.
+
+The row grid is the one to understand, because it is the only one that produced a
+charset good enough to look right. The marks are struck at the hardest force
+whatever their row was typed at, so twenty-one of them down each edge is a ruler
+that survives a block typed too light to read — which is exactly the block the
+drift damaged most, since the lightest force is typed last and the error
+accumulates down the sheet. Measured between the two darkest force blocks, where
+every glyph is fully formed and any offset is registration rather than missing
+ink, this took the median from 2.80px to 1.03px of a 40px cell. And when
 the marks are not found, the fallback now crops to the ink — it used to resize
 the whole page, margins included, which read the sheet as almost entirely blank.
 
