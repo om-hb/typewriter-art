@@ -86,47 +86,21 @@ DEFAULT_FONT_CANDIDATES = (
 WHITE_THRESHOLD = 0.999
 
 
-def scan_white_threshold(sheet: np.ndarray, cols: int, rows: int, n_tiles: int):
-    """Where to put the blank/not-blank line for *this* scan. None if moot.
+#: What a scanned sheet's ``whiteThreshold`` is set to: above 1, so that
+#: ``chop_charset`` keeps every cell and drops none.
+#:
+#: Because on a scan the question it asks cannot be answered. "Is this cell
+#: blank" is a question about ink, and at the lightest strike force some glyphs
+#: put down no ink at all -- that is what a lightest strike force is for. Such a
+#: cell is not a mistake to be dropped; it is the measurement, and it says this
+#: glyph makes no mark at this force. Drop it and every index after it shifts,
+#: which mistypes the rest of the picture.
+#:
+#: The cells that really must go are the ones past the last glyph, and those are
+#: known from the sheet's own layout rather than from its ink. So everything is
+#: kept and the tail is excluded by position -- see ``scan_exclusions``.
+SCAN_WHITE_THRESHOLD = 1.01
 
-    The constant above cannot serve here, and no other constant can either: the
-    right answer depends on the paper, the scanner and the exposure. But it does
-    not have to be guessed, because the sheet is typed in a known order and the
-    cells past the last glyph are the ones that must come back blank. That makes
-    this a two-cluster separation with known labels -- glyph cells on one side,
-    trailing paper on the other -- and the threshold goes in the gap between
-    them.
-
-    Returns None when there is no gap to find: a sheet with no trailing cells
-    needs every cell kept, which is what happens anyway when nothing is dropped.
-
-    The separation doubles as a check on the grid. If the faintest glyph cell is
-    no darker than the palest blank one, the tiles are not where this thinks they
-    are -- a wrong ``--sheet-cols``, or a sheet cropped so hard the grid slid off
-    it -- and that is worth saying out loud, because every later stage would
-    accept the result.
-    """
-    blanks = cols * rows - n_tiles
-    if blanks <= 0:
-        return None, None
-
-    means = (
-        sheet[: rows * (sheet.shape[0] // rows), : cols * (sheet.shape[1] // cols)]
-        .reshape(rows, sheet.shape[0] // rows, cols, sheet.shape[1] // cols)
-        .mean(axis=(1, 3))
-        .reshape(-1)
-    )
-    darkest_glyph = float(means[:n_tiles].max())
-    palest_blank = float(means[n_tiles:].min())
-    if darkest_glyph >= palest_blank:
-        return None, (
-            f"the faintest glyph cell on this scan ({darkest_glyph:.4f}) is no "
-            f"darker than the palest cell that should be blank "
-            f"({palest_blank:.4f}), so the two cannot be told apart. The grid is "
-            f"probably not where the glyphs are: check --sheet-cols against the "
-            f"sheet, and that the scan was not cropped into the block."
-        )
-    return (darkest_glyph + palest_blank) / 2.0, None
 
 SUPERSAMPLE = 8
 
@@ -149,6 +123,105 @@ DEFAULT_SPREAD = 0.6
 #: evenly. Only consulted when --forces names more than one force and the
 #: glyphs come from a font.
 DEFAULT_FORCE_DENSITY = (0.55, 0.30, 0.18)
+
+
+def scan_exclusions(cols: int, rows: int, n_tiles: int) -> list[int]:
+    """Which tiles ``chop_charset`` should drop from a scanned sheet, by index.
+
+    The cells after the last glyph, and only those. ``chop_charset`` prepends a
+    blank tile and then filters on ``i + 1``, so a cell's exclusion number is its
+    position in that list plus one: cell *k* is ``chars[k + 1]``, excluded by
+    ``k + 2``.
+    """
+    return [k + 2 for k in range(n_tiles, cols * rows)]
+
+
+#: A cell in the hardest force block must carry this many times the ink of the
+#: sheet's bare paper, or it did not print. On the two sheets this was measured
+#: against, the weakest cell in that block carried 49 and 86 times paper -- the
+#: accents, which are the least ink any key puts down -- so ten is comfortably
+#: below anything that printed and far above anything that did not.
+GLYPH_INK_OVER_PAPER = 10.0
+
+#: And a floor under that, for a scan clean enough that its paper is nearly
+#: nothing and a multiple of it would be nearly nothing too.
+GLYPH_INK_FLOOR = 0.005
+
+
+def _cell_means(sheet: np.ndarray, cols: int, rows: int) -> np.ndarray:
+    cell_h, cell_w = sheet.shape[0] // rows, sheet.shape[1] // cols
+    return (
+        sheet[: rows * cell_h, : cols * cell_w]
+        .reshape(rows, cell_h, cols, cell_w)
+        .mean(axis=(1, 3))
+        .reshape(-1)
+    )
+
+
+def check_scan_hardest_block(sheet, cols, rows, n_tiles, block, chars):
+    """Which glyphs of the hardest strike force failed to print, if any.
+
+    Every glyph is expected to mark the paper at the hardest force the sheet was
+    typed at. One that did not means the sheet is faulty rather than light -- a
+    ribbon that skipped, a key that did not reach -- and a charset built from it
+    would carry a blank tile that the optimizer is free to choose for a midtone.
+
+    Only the hardest block, because the lighter ones are a different matter
+    entirely: a strike force below the ink threshold *not* marking is the
+    measurement working, and on both sheets measured here the underscore and the
+    accents drop out two forces down. Refusing those would refuse the whole
+    point of a multi-force charset.
+    """
+    means = _cell_means(sheet, cols, rows)
+    ink = 1.0 - means
+    spare = cols * rows - n_tiles
+    paper = float(np.median(ink[n_tiles:])) if spare > 0 else 0.0
+    floor = max(paper * GLYPH_INK_OVER_PAPER, GLYPH_INK_FLOOR)
+
+    missing = [i for i in range(min(block, n_tiles)) if ink[i] < floor]
+    if not missing:
+        return None
+    named = ", ".join(f"{chars[i]!r} (tile {i + 1})" for i in missing[:8])
+    more = f" and {len(missing) - 8} more" if len(missing) > 8 else ""
+    return (
+        f"{len(missing)} glyph(s) left no mark at the hardest strike force on "
+        f"this sheet: {named}{more}. At the hardest force every key should "
+        f"print, so this is a sheet to re-type rather than a charset to build "
+        f"-- a blank tile is one the optimizer may choose for a midtone. "
+        f"(A lighter force leaving no mark is expected and is not checked.)"
+    )
+
+
+def check_scan_grid(sheet: np.ndarray, cols: int, rows: int, n_tiles: int):
+    """Complain if the grid does not look like it is on the glyphs.
+
+    Nothing downstream can fail on this any more -- the tiles are taken by
+    position now, so a grid half a row out still produces a full charset of
+    plausible-looking tiles, prints, and is wrong. So it has to be looked at
+    here, and the sheet's own layout is what makes that possible: the cells past
+    the last glyph are paper, and every cell before it should be darker than
+    paper by more than the paper varies.
+
+    Compared at the median rather than at the extremes. At the lightest force a
+    few glyphs legitimately make no mark, so the palest glyph cell and the
+    darkest blank one overlap on a real sheet; the two *populations* do not.
+    """
+    blanks = cols * rows - n_tiles
+    if blanks <= 0:
+        return None
+
+    means = _cell_means(sheet, cols, rows)
+    glyph_ink = 1.0 - float(np.median(means[:n_tiles]))
+    paper_ink = 1.0 - float(np.median(means[n_tiles:]))
+    if glyph_ink > paper_ink * 3 + 1e-4:
+        return None
+    return (
+        f"the typical glyph cell on this scan carries {glyph_ink:.4f} of ink "
+        f"and the cells that should be bare paper carry {paper_ink:.4f}. The "
+        f"grid is probably not on the glyphs: check --sheet-cols and --forces "
+        f"against how the sheet was typed, and that the scan was not cropped "
+        f"into the block."
+    )
 
 
 def find_font(explicit: str | None = None) -> str:
@@ -488,13 +561,19 @@ def make_charset(
             ink=ink, spread=spread, densities=densities,
         )
 
-    white_threshold = WHITE_THRESHOLD
+    white_threshold, exclusions = WHITE_THRESHOLD, []
     if scan:
-        measured, complaint = scan_white_threshold(sheet, cols, rows, len(entries))
+        white_threshold = SCAN_WHITE_THRESHOLD
+        exclusions = scan_exclusions(cols, rows, len(entries))
+        complaint = check_scan_grid(sheet, cols, rows, len(entries))
         if complaint:
             print(f"WARNING: {complaint}")
-        elif measured is not None:
-            white_threshold = measured
+        fault = check_scan_hardest_block(
+            sheet, cols, rows, len(entries), len(glyphs),
+            [g.char for g, _ in entries],
+        )
+        if fault:
+            raise AssertionError(fault)
 
     image_name = "sigma.png"
     cv2.imwrite(os.path.join(charset_dir, image_name), (sheet * 255).astype(np.uint8))
@@ -508,7 +587,7 @@ def make_charset(
         "image_path": image_name,
         "slicesX": cols,
         "slicesY": rows,
-        "excludeChars": [],
+        "excludeChars": exclusions,
         "whiteThreshold": white_threshold,
         "blankSpace": True,
     }
@@ -627,6 +706,39 @@ def _ink_runs(has_ink: np.ndarray) -> list[tuple[int, int]]:
     return list(zip(edges[0::2], edges[1::2]))
 
 
+#: A line of the sheet has to carry this much of the ink of the heaviest line
+#: before it counts as a line at all.
+#:
+#: The extent used to be taken from any ink whatsoever, and a scan does not
+#: oblige: on the first real sheet this read, three pixels of dust near the top
+#: edge and three more near the bottom put the extent at 1..2615 where the type
+#: runs 278..2346. The grid was then a quarter too tall and started nearly three
+#: rows above the sheet, which is not a subtle failure -- but it presents as one,
+#: because what comes out is a charset whose cells are full of the wrong thing
+#: rather than an error.
+#:
+#: One percent of the heaviest line is the bottom of a wide plateau: between one
+#: and five percent the answer moves by three pixels on both sheets measured, and
+#: the faintest line on either -- twelve glyphs at the lightest strike force --
+#: still peaks at twenty-nine percent. So there is more than an order of
+#: magnitude between what this must keep and what it must ignore.
+INK_LINE_FLOOR = 0.02
+
+
+#: How much of the heaviest column a column must carry to count as one of the
+#: sheet's columns of glyphs, rather than as the gap between two of them.
+COLUMN_INK_FLOOR = 0.08
+
+
+def _ink_extent(mask: np.ndarray, axis: int) -> tuple[int, int] | None:
+    """First and last index along `axis` that carries a real line of ink."""
+    profile = mask.sum(axis=axis)
+    if not profile.size or profile.max() <= 0:
+        return None
+    lit = np.flatnonzero(profile > profile.max() * INK_LINE_FLOOR)
+    return (int(lit[0]), int(lit[-1])) if lit.size else None
+
+
 def _find_sheet_marks(im: np.ndarray, cols: int) -> tuple[float, float] | None:
     """Ink centroids of the two registration marks, or None if there are none.
 
@@ -646,7 +758,19 @@ def _find_sheet_marks(im: np.ndarray, cols: int) -> tuple[float, float] | None:
     paper = float(np.percentile(im, 95))
     ink = np.clip(paper - im.astype(np.float32), 0, None)
     mask = im < paper * 0.75
-    runs = _ink_runs(mask.sum(axis=0) >= 2)  # two rows, so a speck is not a run
+    # A column belongs to a column of glyphs only if it carries ink down a good
+    # part of the sheet. This used to ask for two rows, on the reasoning that a
+    # speck is not a run -- but a speck is not what closes the gap between two
+    # columns. A single overhanging glyph is, once anywhere in twenty-one rows,
+    # and then the two columns are one run and the spacing they were there to
+    # measure is gone. On the first two real sheets read here, one resolved its
+    # columns and the other collapsed twenty of them into four.
+    #
+    # A twelfth of the heaviest column is the middle of a plateau: anywhere from
+    # a twentieth to a seventh gives exactly the twenty columns and two marks on
+    # both sheets, at the same spacing.
+    counts = mask.sum(axis=0)
+    runs = _ink_runs(counts >= counts.max() * COLUMN_INK_FLOOR)
     if len(runs) < 4:
         return None
 
@@ -655,30 +779,40 @@ def _find_sheet_marks(im: np.ndarray, cols: int) -> tuple[float, float] | None:
     if period <= 0:
         return None
 
-    gaps = [runs[i + 1][0] - runs[i][1] for i in range(len(runs) - 1)]
-    inner = gaps[1:-1]
-    if not inner:
-        return None
-    inner_median = max(float(np.median(inner)), 1.0)
-    if gaps[0] < 1.5 * inner_median or gaps[-1] < 1.5 * inner_median:
-        return None  # nothing is set apart from the block; no marks
-    for run in (runs[0], runs[-1]):
-        if (run[1] - run[0]) > 0.8 * period:
-            return None  # too wide to be one mark
-
     def centroid(run):
         a, b = run
         w = ink[:, a:b].sum(axis=0)
         return float((np.arange(a, b) * w).sum() / max(w.sum(), 1e-9))
 
-    left, right = centroid(runs[0]), centroid(runs[-1])
+    # Not "the outermost two runs". A scan has specks on it, and one speck
+    # outside the right-hand mark is enough to make the outermost run a piece of
+    # dirt five pixels wide -- which then fails every test the mark would have
+    # passed, and the whole sheet falls back to being measured from its crop. So
+    # every pair of candidates is considered and the best-fitting one wins.
+    #
+    # Three things identify the pair, and the third is the one that cannot be
+    # faked by two glyphs: they are each narrow enough to be one mark, they each
+    # stand a good part of a cell clear of whatever is inside them (the sheet
+    # types them one blank cell out from the block), and the cell width their
+    # separation implies is the width the glyph columns are actually spaced at.
     _, _, right_cell = sheet_mark_cells(cols)
-    implied = (right - left) / right_cell
-    if abs(implied - period) > 0.15 * period:
-        # The two candidates are the right distance apart for marks only if the
-        # cell they imply is the cell the glyph columns are actually spaced at.
+    narrow = [i for i, r in enumerate(runs) if (r[1] - r[0]) <= 0.8 * period]
+    best = None
+    for a in narrow:
+        if a + 1 >= len(runs) or runs[a + 1][0] - runs[a][1] < 0.5 * period:
+            continue  # nothing set apart from it on the inside
+        for b in reversed(narrow):
+            if b <= a or runs[b][0] - runs[b - 1][1] < 0.5 * period:
+                continue
+            left, right = centroid(runs[a]), centroid(runs[b])
+            error = abs((right - left) / right_cell - period)
+            if error > 0.15 * period:
+                continue
+            if best is None or error < best[0]:
+                best = (error, left, right)
+    if best is None:
         return None
-    return left, right
+    return best[1], best[2]
 
 
 def _sheet_from_scan(scan_path, n_tiles, cols, cell_w, cell_h, deskew_scan=True):
@@ -719,11 +853,19 @@ def _sheet_from_scan(scan_path, n_tiles, cols, cell_w, cell_h, deskew_scan=True)
     if marks is None:
         print(
             "WARNING: no registration marks found on the scan, so the grid is "
-            "being taken from the crop itself. That is only right if the crop "
-            "is exactly the glyph block, and a crop to the outermost ink is "
-            "inside it by one side bearing -- an eighth of a cell on this "
+            "being taken from the ink itself. That is only right if the ink is "
+            "exactly the glyph block, and its outermost edge is inside the "
+            "block by one side bearing -- an eighth of a cell on this "
             "machine. Re-type the sheet with `pipeline sheet` if you can."
         )
+        # Crop to the ink even so. Without this the page's margins are part of
+        # the grid, which stretches every cell off its glyph and reads the sheet
+        # as almost entirely blank -- a failure that looks like a bad sheet
+        # rather than like a bad crop.
+        edge = im < float(np.percentile(im, 95)) * 0.75
+        ys, xs = _ink_extent(edge, axis=1), _ink_extent(edge, axis=0)
+        if ys and xs:
+            im = im[ys[0]: ys[1] + 1, xs[0]: xs[1] + 1]
     else:
         left_c, right_c = marks
         _, first_cell, right_cell = sheet_mark_cells(cols)
@@ -739,9 +881,9 @@ def _sheet_from_scan(scan_path, n_tiles, cols, cell_w, cell_h, deskew_scan=True)
         # has only `rows`, so this is the axis that did not need marks. Taken
         # from the block alone, with the marks now cropped away.
         paper = float(np.percentile(im, 95))
-        inked = np.flatnonzero((im < paper * 0.75).any(axis=1))
-        if inked.size:
-            im = im[inked[0] : inked[-1] + 1]
+        rows_of = _ink_extent(im < paper * 0.75, axis=1)
+        if rows_of is not None:
+            im = im[rows_of[0]: rows_of[1] + 1]
 
     im = cv2.resize(im, (cols * cell_w, rows * cell_h), interpolation=cv2.INTER_AREA)
     # The sheet is mostly paper, so a high percentile *is* the paper -- a robust

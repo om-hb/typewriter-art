@@ -1555,8 +1555,12 @@ def test_a_scan_is_normalised_for_paper_but_not_for_ink(tmp_path):
     from erika.make_charset import _sheet_from_scan
 
     # A sheet of slightly-grey "paper" with ink at 60/255 -- dark, not black.
+    # Two marks rather than one, at opposite corners: a scan with no
+    # registration marks on it is cropped to its ink, and a single mark would
+    # leave no paper inside that crop for the assertions below to look at.
     sheet = np.full((80, 96), 240, dtype=np.uint8)
     sheet[10:30, 10:30] = 60
+    sheet[50:70, 60:80] = 60
     path = os.path.join(tmp_path, "scan.png")
     cv2.imwrite(path, sheet)
 
@@ -3874,56 +3878,55 @@ def test_a_crooked_scan_builds_the_same_charset_as_a_straight_one(tmp_path):
     assert worst < 3.0, f"straightening left {worst:.1f} grey levels on the worst tile"
 
 
-def test_a_scanned_sheet_gets_a_blank_threshold_measured_from_its_own_paper(tmp_path):
-    """0.999 is a font's answer, and paper is not a font.
+def test_a_scanned_sheet_takes_its_tiles_by_position_not_by_ink(tmp_path):
+    """On a scan, "is this cell blank" is not an answerable question.
 
-    A tenth of a percent of mean ink is less than paper texture, so on a real
-    scan every trailing blank cell reads as a glyph and the mapping check
-    refuses the build. The sheet is typed in a known order, so which cells must
-    be blank is known too, and the line goes in the gap between the two groups.
+    At the lightest strike force some glyphs put down no ink at all -- that is
+    what a lightest strike force is *for* -- and dropping those cells shifts
+    every index after them. The cells that must go are the ones past the last
+    glyph, which the sheet's layout names without looking at the paper.
     """
-    from erika.make_charset import WHITE_THRESHOLD, scan_white_threshold
+    from erika.make_charset import SCAN_WHITE_THRESHOLD, scan_exclusions
 
-    glyphs = 103
-    cols, rows = 20, 6
-    sheet = np.full((rows * 40, cols * 24), 1.0, dtype="float32")
-    rng = np.random.default_rng(3)
-    sheet -= rng.normal(0.006, 0.002, sheet.shape)  # paper, a little grey
-    for index in range(glyphs):
-        r, c = divmod(index, cols)
-        sheet[r * 40 + 2: (r + 1) * 40 - 2, c * 24 + 3: (c + 1) * 24 - 3] = 0.4
-
-    threshold, complaint = scan_white_threshold(sheet, cols, rows, glyphs)
-    assert complaint is None
-    assert threshold is not None and threshold < WHITE_THRESHOLD, (
-        "a scanned sheet must not be judged by the font path's threshold"
+    assert SCAN_WHITE_THRESHOLD > 1.0, (
+        "a scanned sheet must keep every cell, and a cell of bare paper has a "
+        "mean of exactly 1.0"
     )
-    means = sheet.reshape(rows, 40, cols, 24).mean(axis=(1, 3)).reshape(-1)
-    assert (means[:glyphs] < threshold).all(), "a glyph cell would be dropped"
-    assert (means[glyphs:] >= threshold).all(), "a blank cell would be kept"
+    # 103 glyphs at 4 forces is 412 tiles in a 20x21 grid: 8 cells spare.
+    excluded = scan_exclusions(20, 21, 412)
+    assert len(excluded) == 8
+    # chop_charset prepends a blank and filters on i+1, so cell k is number k+2.
+    assert excluded == list(range(414, 422))
+    assert 413 not in excluded, "that is the last glyph, not a spare cell"
 
 
-def test_a_sheet_with_no_trailing_blanks_keeps_the_font_threshold(tmp_path):
-    """Nothing to separate, so nothing to measure -- and every cell is a glyph."""
-    from erika.make_charset import scan_white_threshold
+def test_a_scanned_grid_that_is_not_on_the_glyphs_is_complained_about(tmp_path):
+    """Nothing downstream can fail on this now, so it has to be caught here.
 
-    sheet = np.full((5 * 40, 20 * 24), 0.5, dtype="float32")
-    assert scan_white_threshold(sheet, 20, 5, 100) == (None, None)
-
-
-def test_an_unseparable_scan_is_complained_about_rather_than_built(tmp_path):
-    """A glyph cell no darker than a blank one means the grid is not on the glyphs.
-
-    Which is the `--sheet-cols` failure wearing another hat, and the one failure
-    mode of this whole path that every later stage would accept in silence.
+    Taking tiles by position means a grid half a row out still yields a full
+    charset of plausible tiles that prints and is wrong. The populations are
+    compared at the median, not at the extremes: on a real sheet the palest
+    glyph and the darkest blank do overlap, because a few glyphs make no mark at
+    the lightest force.
     """
-    from erika.make_charset import scan_white_threshold
+    from erika.make_charset import check_scan_grid
 
-    sheet = np.full((6 * 40, 20 * 24), 1.0, dtype="float32")
-    sheet[:40, :24] = 0.99  # one faint "glyph", everything else bare paper
-    threshold, complaint = scan_white_threshold(sheet, 20, 6, 103)
-    assert threshold is None
-    assert "not where this thinks they are" in complaint or "sheet-cols" in complaint
+    cols, rows, tiles = 20, 21, 412
+    good = np.full((rows * 40, cols * 24), 1.0, dtype="float32")
+    for index in range(tiles):
+        r, c = divmod(index, cols)
+        good[r * 40 + 4: (r + 1) * 40 - 4, c * 24 + 4: (c + 1) * 24 - 4] = 0.55
+    assert check_scan_grid(good, cols, rows, tiles) is None
+
+    # A few faint glyphs among the trailing paper is still fine: the medians
+    # separate even when the extremes do not.
+    for index in range(tiles - 5, tiles):
+        r, c = divmod(index, cols)
+        good[r * 40: (r + 1) * 40, c * 24: (c + 1) * 24] = 1.0
+    assert check_scan_grid(good, cols, rows, tiles) is None
+
+    blank = np.full((rows * 40, cols * 24), 1.0, dtype="float32")
+    assert "not on the glyphs" in (check_scan_grid(blank, cols, rows, tiles) or "")
 
 
 def test_the_charset_builder_can_be_told_not_to_straighten():
@@ -3936,3 +3939,111 @@ def test_the_charset_builder_can_be_told_not_to_straighten():
         args = build_parser().parse_args(argv)
         _build_charset(args, lambda **kw: seen.update(kw), lambda t: (), lambda t: None)
         assert seen["deskew_scan"] is wanted
+
+
+def test_one_overhanging_glyph_does_not_merge_two_columns(tmp_path):
+    """What broke on the second real sheet this ever read.
+
+    The column projection runs down the whole sheet, so a single glyph that
+    reaches into the gap beside it -- once, anywhere in twenty-one rows -- welds
+    its column to the next one for the entire projection. Twenty columns became
+    four, the spacing they exist to measure was lost with them, and the marks
+    could not be told from the block. Asking for a share of the heaviest column
+    rather than for two rows of ink is what fixes it.
+    """
+    import cv2
+
+    from erika.make_charset import _find_sheet_marks, sheet_mark_cells
+
+    cols = 20
+    left_cell, first_cell, right_cell = sheet_mark_cells(cols)
+    cell, line, margin, rows = 40, 60, 50, 21
+    im = np.full((margin * 2 + rows * line, margin * 2 + (right_cell + 1) * cell),
+                 250, np.uint8)
+    for row in range(rows):
+        for c in (left_cell, right_cell):
+            x = margin + c * cell + int(cell * 0.45)
+            im[margin + row * line + 8: margin + (row + 1) * line - 8,
+               x: x + int(cell * 0.12)] = 30
+        for column in range(cols):
+            x = margin + (first_cell + column) * cell + int(cell * 0.15)
+            im[margin + row * line + 6: margin + (row + 1) * line - 6,
+               x: x + int(cell * 0.7)] = 60
+    # One glyph, on one row, reaching across the gap into its neighbour.
+    x = margin + (first_cell + 5) * cell + int(cell * 0.15)
+    im[margin + 3 * line + 20: margin + 3 * line + 30, x: x + int(cell * 1.1)] = 60
+    path = str(tmp_path / "overhang.png")
+    cv2.imwrite(path, im)
+
+    marks = _find_sheet_marks(cv2.imread(path, cv2.IMREAD_GRAYSCALE), cols)
+    assert marks is not None, "one overhanging glyph hid the registration marks"
+    left, right = marks
+    assert (right - left) / right_cell == pytest.approx(cell, abs=cell * 0.05)
+
+
+def test_a_speck_of_dust_does_not_set_the_vertical_extent(tmp_path):
+    """Also from the first real sheet: three pixels of dirt near the page edge.
+
+    The extent was taken from any ink at all, so the grid became a quarter
+    taller than the type and started nearly three rows above it. Every cell then
+    held the wrong thing, and a charset full of the wrong thing is not an error
+    anywhere downstream.
+    """
+    import cv2
+
+    from erika.make_charset import _ink_extent
+
+    im = np.full((2600, 1900), 250, np.uint8)
+    im[300:2350, 300:1700] = 60          # the type
+    im[2:5, 900:903] = 40                # dust near the top edge
+    im[2590:2593, 1000:1003] = 40        # and near the bottom
+    extent = _ink_extent(im < 250 * 0.75, axis=1)
+    assert extent == (300, 2349), f"dust moved the extent to {extent}"
+
+
+def test_a_glyph_that_did_not_print_at_the_hardest_force_is_refused(tmp_path):
+    """A blank tile is one the optimizer may choose for a midtone.
+
+    Taking a scan's tiles by position means a blank cell no longer shifts the
+    count, which is what makes a light strike force usable -- so the check that
+    a sheet actually printed has to be made deliberately, and only where it is
+    true. At the hardest force every key should mark the paper.
+    """
+    from erika.make_charset import check_scan_hardest_block
+
+    cols, rows, block = 20, 6, 103
+    n_tiles = block
+    sheet = np.full((rows * 40, cols * 24), 1.0, dtype="float32")
+    for index in range(n_tiles):
+        r, c = divmod(index, cols)
+        sheet[r * 40 + 4: (r + 1) * 40 - 4, c * 24 + 4: (c + 1) * 24 - 4] = 0.5
+    chars = [chr(65 + i % 26) for i in range(n_tiles)]
+    assert check_scan_hardest_block(sheet, cols, rows, n_tiles, block, chars) is None
+
+    r, c = divmod(7, cols)
+    sheet[r * 40: (r + 1) * 40, c * 24: (c + 1) * 24] = 1.0
+    fault = check_scan_hardest_block(sheet, cols, rows, n_tiles, block, chars)
+    assert fault is not None and "tile 8" in fault and repr(chars[7]) in fault
+
+
+def test_a_glyph_missing_from_a_lighter_force_is_not_refused(tmp_path):
+    """Which is the whole point of typing the sheet at more than one force.
+
+    The underscore and the accents stop marking two forces down on both sheets
+    this was built against. Refusing that would refuse every multi-force charset
+    worth having.
+    """
+    from erika.make_charset import check_scan_hardest_block
+
+    cols, rows, block = 20, 11, 103
+    n_tiles = block * 2
+    sheet = np.full((rows * 40, cols * 24), 1.0, dtype="float32")
+    for index in range(n_tiles):
+        r, c = divmod(index, cols)
+        grey = 0.5 if index < block else 0.93
+        sheet[r * 40 + 4: (r + 1) * 40 - 4, c * 24 + 4: (c + 1) * 24 - 4] = grey
+    for index in (block + 5, block + 40, n_tiles - 1):  # light force, no mark
+        r, c = divmod(index, cols)
+        sheet[r * 40: (r + 1) * 40, c * 24: (c + 1) * 24] = 1.0
+    chars = [chr(65 + i % 26) for i in range(n_tiles)]
+    assert check_scan_hardest_block(sheet, cols, rows, n_tiles, block, chars) is None

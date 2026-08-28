@@ -144,19 +144,47 @@ smears that. Below a twentieth of a degree it does nothing, deliberately — a
 resample blurs every edge by half a pixel whatever the angle, which on a sheet
 whose rows are two dozen pixels tall costs more than the skew did.
 
-**Its blank-cell threshold is measured rather than assumed.** `WHITE_THRESHOLD`
-is 0.999 — a tile is blank if its mean brightness is within a tenth of a percent
-of white. That is right for a sheet drawn from a font and hopeless for a scan,
-where a blank cell is paper: photographic noise of one and a half grey levels is
-already several times that, and so is the trace of the row above that any
-resampling smears in. Every trailing cell of a sheet that does not end on a full
-row then reads as a glyph and `_verify_mapping` refuses the build — and a
-`--dead-keys` sheet has seventeen trailing cells. So `scan_white_threshold` puts
-the line in the gap between the darkest glyph cell and the palest cell that must
-be blank, which the sheet's known typing order identifies for free. If those two
-groups do not separate, the grid is not on the glyphs — a wrong `--sheet-cols`,
-or a scan cropped into the block — and that is said out loud, because it is the
-one failure here that every later stage would accept in silence.
+**Its tiles are taken by position, not by ink.** `chop_charset` drops a cell
+whose mean brightness is within `whiteThreshold` of white, which on a font-drawn
+sheet identifies the cells past the last glyph and on a scan asks a question with
+no answer: at the lightest strike force some glyphs put down no ink at all, and
+that is what a lightest strike force is *for*. Dropping such a cell shifts every
+index after it. So a scanned sheet is given a `whiteThreshold` above 1 — keep
+everything — and the cells past the last glyph are excluded by number instead,
+from the sheet's own layout (`scan_exclusions`).
+
+Two checks replace what the count check used to catch by accident, because
+nothing downstream can fail on a misplaced grid now:
+
+- `check_scan_grid` compares the *median* glyph cell against the median trailing
+  cell. At the medians, not the extremes — on a real sheet the palest glyph and
+  the darkest blank do overlap, and the populations still do not.
+- `check_scan_hardest_block` refuses a sheet where any glyph left no mark **at
+  the hardest force**, naming it. Only that block: on both sheets measured here
+  the underscore and the accents stop marking two forces down, and refusing that
+  would refuse every multi-force charset worth having. The margin is wide — the
+  weakest cell at the hardest force carried 49 and 86 times the paper's own ink.
+
+**The obsolete threshold note.** `WHITE_THRESHOLD` is 0.999, and it is a font's
+answer: a tile is blank if its mean brightness is within a tenth of a percent of
+white. On a scan a blank cell is paper, and paper noise of one and a half grey
+levels is already several times that. It survives for the font path and nothing
+else.
+
+**Three things the first two real scans broke, all of them the same mistake —
+reading a photograph as though it were a drawing.** They are worth knowing
+because each produced a *plausible* charset rather than an error:
+
+| what | was | is |
+|---|---|---|
+| the vertical extent | any ink at all, so three pixels of dust put the grid a quarter too tall and three rows too high | a line must carry `INK_LINE_FLOOR` of the heaviest line's ink |
+| a column of the sheet | any column with ink on two rows, so one overhanging glyph welded twenty columns into four | a column must carry `COLUMN_INK_FLOOR` of the heaviest column |
+| the registration marks | assumed to be the outermost ink runs, so one speck outside the right-hand mark hid both | the best-fitting *pair*, by width, isolation and the cell width they imply |
+
+Each threshold sits in the middle of a plateau measured on both sheets, with an
+order of magnitude between what it must keep and what it must ignore. And when
+the marks are not found, the fallback now crops to the ink — it used to resize
+the whole page, margins included, which read the sheet as almost entirely blank.
 
 ## Strike force, and what the charset models
 
