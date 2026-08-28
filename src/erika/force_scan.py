@@ -36,7 +36,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from erika import erika_codes as ec
+from erika import deskew, erika_codes as ec
 
 #: The title, and the reference row typed before any force command. The title
 #: doubles as the scan's ruler, so its width is load-bearing: it is measured in
@@ -156,6 +156,7 @@ def read_scan(
     blocks: dict[str, list[int]],
     run: int,
     pitch: int = 10,
+    deskew_scan: bool = True,
 ) -> list[Reading]:
     """Measure the ink on every sample row of a scanned probe sheet.
 
@@ -170,6 +171,16 @@ def read_scan(
     im = cv2.imread(scan_path, cv2.IMREAD_GRAYSCALE)
     if im is None:
         raise FileNotFoundError(scan_path)
+
+    # Square the sheet up first. This grid is computed rather than detected, so
+    # rotation does not blur a measurement here -- it silently reads each row a
+    # little further along the one below it, which is worse.
+    if deskew_scan:
+        im, angle, note = deskew.straighten(im)
+        if angle:
+            print(f"deskewed the scan by {angle:+.2f} deg")
+        if note:
+            print(f"WARNING: {note}")
 
     # Only the paper is normalised, and only for scanner exposure. The ink is
     # the measurement -- stretching the darkest row to black here would be

@@ -3757,3 +3757,182 @@ def test_full_strike_is_not_reported_as_the_ink_threshold(tmp_path):
     assert "ink begins at 40" in text
     assert "stops changing from 95" in text
     assert "top of this scale" in text
+
+
+# ---------------------------------------------------------------------------
+# Squaring a scan up before its grid is sliced
+# ---------------------------------------------------------------------------
+
+
+def _charset_scan(path, angle=0.0, noise=0.0, dead_keys=False, cols=20, seed=11):
+    """A synthetic scan of a charset sheet, optionally crooked and grainy.
+
+    Bars rather than type, but with type's extents: the full line height and
+    three quarters of the cell, which is what makes rotation contaminate a tile
+    with its neighbour. The noise is paper, and it is not decoration -- it is
+    what a scan has and a font-drawn sheet does not, and it broke the blank-cell
+    test long before any of this rotated anything.
+    """
+    import cv2
+
+    from erika.make_charset import sheet_mark_cells
+
+    rng = np.random.default_rng(seed)
+    glyphs = len(ec.all_glyphs(dead_keys=dead_keys))
+    rows = (glyphs + cols - 1) // cols
+    left_cell, first_cell, right_cell = sheet_mark_cells(cols)
+    cell, line, margin = 36, 60, 60
+    im = np.full((margin * 2 + rows * line, margin * 2 + (right_cell + 1) * cell),
+                 250, np.uint8)
+
+    def bar(cell_x, row, start, width, grey):
+        x = margin + int((cell_x + start) * cell)
+        y = margin + row * line
+        im[y + 1: y + line - 1, x: x + max(1, int(width * cell))] = grey
+
+    for row in range(rows):
+        bar(left_cell, row, 0.45, 0.10, 30)
+        bar(right_cell, row, 0.45, 0.10, 30)
+        for column in range(cols):
+            index = row * cols + column
+            if index >= glyphs:
+                break
+            bar(first_cell + column, row, 0.125, 0.75, 40 + (index % 7) * 18)
+
+    if angle:
+        height, width = im.shape
+        matrix = cv2.getRotationMatrix2D((width / 2, height / 2), angle, 1.0)
+        im = cv2.warpAffine(im, matrix, (width, height), flags=cv2.INTER_LINEAR,
+                            borderMode=cv2.BORDER_CONSTANT, borderValue=250)
+    if noise:
+        im = np.clip(im.astype(np.int16) + rng.normal(0, noise, im.shape),
+                     0, 255).astype(np.uint8)
+    cv2.imwrite(str(path), im)
+    return str(path)
+
+
+def test_the_skew_of_a_scan_is_found_to_a_fraction_of_a_degree(tmp_path):
+    from erika import deskew
+
+    import cv2
+
+    for typed in (-2.0, -0.75, 0.5, 1.5):
+        path = _charset_scan(tmp_path / f"s{typed}.png", angle=typed, noise=1.0)
+        found = deskew.find_angle(cv2.imread(path, cv2.IMREAD_GRAYSCALE))
+        assert found == pytest.approx(-typed, abs=0.06), (
+            f"a sheet {typed} deg off was measured at {found}"
+        )
+
+
+def test_a_square_scan_is_handed_on_without_being_resampled(tmp_path):
+    """The correction has to be worth more than the resample that applies it.
+
+    A hundredth of a degree is inside the noise of the search, and rotating for
+    it blurs every edge in the image by half a pixel -- several percent of a
+    row's ink on a sheet whose rows are a couple of dozen pixels tall. That is a
+    loss taken to remove nothing.
+    """
+    from erika import deskew
+
+    import cv2
+
+    path = _charset_scan(tmp_path / "square.png", angle=0.0, noise=1.0)
+    im = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    out, angle, note = deskew.straighten(im)
+    assert angle == 0.0 and note is None
+    assert out is im, "a scan already square must come back untouched, not re-rendered"
+
+
+def test_a_crooked_scan_builds_the_same_charset_as_a_straight_one(tmp_path):
+    """The point of the whole exercise, end to end.
+
+    Without straightening, a degree moves the worst tile of this sheet by some
+    26 grey levels out of 255 and two degrees fails the build outright. The grid
+    is sliced axis-aligned, so the error grows toward the corners -- which is the
+    half of the sheet a spot check does not look at.
+    """
+    from erika.make_charset import make_charset
+    from utils import prep_charset
+
+    base = str(tmp_path)
+    os.makedirs(base, exist_ok=True)
+    import shutil
+    shutil.copy(os.path.join(SRC, "layers.json"), base)
+
+    def build(name, angle, deskew_scan):
+        scan = _charset_scan(tmp_path / f"{name}.png", angle=angle, noise=1.5,
+                             dead_keys=True)
+        make_charset(name=name, pitch=10, scan=scan, sheet_cols=20,
+                     dead_keys=True, base_path=base, deskew_scan=deskew_scan)
+        tiles, _, _ = prep_charset(name, base)
+        return np.asarray(tiles, dtype="float32").mean(axis=(1, 2))
+
+    straight = build("straight", 0.0, True)
+    crooked = build("crooked", 1.5, True)
+    assert len(crooked) == len(straight)
+    worst = float(np.abs(crooked - straight).max()) * 255
+    assert worst < 3.0, f"straightening left {worst:.1f} grey levels on the worst tile"
+
+
+def test_a_scanned_sheet_gets_a_blank_threshold_measured_from_its_own_paper(tmp_path):
+    """0.999 is a font's answer, and paper is not a font.
+
+    A tenth of a percent of mean ink is less than paper texture, so on a real
+    scan every trailing blank cell reads as a glyph and the mapping check
+    refuses the build. The sheet is typed in a known order, so which cells must
+    be blank is known too, and the line goes in the gap between the two groups.
+    """
+    from erika.make_charset import WHITE_THRESHOLD, scan_white_threshold
+
+    glyphs = 103
+    cols, rows = 20, 6
+    sheet = np.full((rows * 40, cols * 24), 1.0, dtype="float32")
+    rng = np.random.default_rng(3)
+    sheet -= rng.normal(0.006, 0.002, sheet.shape)  # paper, a little grey
+    for index in range(glyphs):
+        r, c = divmod(index, cols)
+        sheet[r * 40 + 2: (r + 1) * 40 - 2, c * 24 + 3: (c + 1) * 24 - 3] = 0.4
+
+    threshold, complaint = scan_white_threshold(sheet, cols, rows, glyphs)
+    assert complaint is None
+    assert threshold is not None and threshold < WHITE_THRESHOLD, (
+        "a scanned sheet must not be judged by the font path's threshold"
+    )
+    means = sheet.reshape(rows, 40, cols, 24).mean(axis=(1, 3)).reshape(-1)
+    assert (means[:glyphs] < threshold).all(), "a glyph cell would be dropped"
+    assert (means[glyphs:] >= threshold).all(), "a blank cell would be kept"
+
+
+def test_a_sheet_with_no_trailing_blanks_keeps_the_font_threshold(tmp_path):
+    """Nothing to separate, so nothing to measure -- and every cell is a glyph."""
+    from erika.make_charset import scan_white_threshold
+
+    sheet = np.full((5 * 40, 20 * 24), 0.5, dtype="float32")
+    assert scan_white_threshold(sheet, 20, 5, 100) == (None, None)
+
+
+def test_an_unseparable_scan_is_complained_about_rather_than_built(tmp_path):
+    """A glyph cell no darker than a blank one means the grid is not on the glyphs.
+
+    Which is the `--sheet-cols` failure wearing another hat, and the one failure
+    mode of this whole path that every later stage would accept in silence.
+    """
+    from erika.make_charset import scan_white_threshold
+
+    sheet = np.full((6 * 40, 20 * 24), 1.0, dtype="float32")
+    sheet[:40, :24] = 0.99  # one faint "glyph", everything else bare paper
+    threshold, complaint = scan_white_threshold(sheet, 20, 6, 103)
+    assert threshold is None
+    assert "not where this thinks they are" in complaint or "sheet-cols" in complaint
+
+
+def test_the_charset_builder_can_be_told_not_to_straighten():
+    """A flag that is accepted and dropped looks identical from the command line."""
+    from erika.pipeline import _build_charset, build_parser
+
+    seen = {}
+    for argv, wanted in ((["charset", "--from-scan", "s.png"], True),
+                         (["charset", "--from-scan", "s.png", "--no-deskew"], False)):
+        args = build_parser().parse_args(argv)
+        _build_charset(args, lambda **kw: seen.update(kw), lambda t: (), lambda t: None)
+        assert seen["deskew_scan"] is wanted

@@ -107,6 +107,29 @@ cell, and which glyph sits in that column depends on `--sheet-cols`, so the erro
 was neither small nor predictable. A scan with no marks on it still works and
 says out loud that it is guessing.
 
+**The angle used to matter too, and matters less.** The marks say where the grid
+starts, not which way it points, and the grid is sliced axis-aligned either way:
+a scan a degree off contaminates every tile with its neighbour, worst at the
+corners of the sheet, and two degrees fails the build outright. So a scan is
+squared up before anything measures a grid on it — see `deskew.py`, which finds
+the angle by maximising the sharpness of the ink's own projections rather than
+from the marks, because finding a mark on a crooked sheet means first solving the
+problem the marks are there to solve. It reports what it corrected, leaves a scan
+already square untouched rather than resampling it for nothing, and `--no-deskew`
+turns it off when a charset comes back odd and the question is which step did it.
+
+That is a floor, not a licence. Square the sheet up on the platen anyway: what is
+corrected is a slip, and the correction is a resample, which is never free.
+
+One thing that changed with it. A blank cell on a *scan* is paper, and paper is
+not white — the 0.999 mean-brightness test that decides a tile is blank is a
+font's answer, and less than the texture of a scan. Every trailing cell of a
+sheet that does not end on a full row would read as a glyph, and the mapping
+check would refuse the build; a `--dead-keys` sheet has seventeen of them. So a
+scanned charset gets its threshold measured from its own paper, in the gap
+between the darkest glyph cell and the palest cell that ought to be blank. When
+those two do not separate, the grid is not on the glyphs, and it says so.
+
 ## What the planner does
 
 The optimizer's coordinates are `(layer, row, col)`. The machine's are "how

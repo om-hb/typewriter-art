@@ -174,6 +174,7 @@ def _build_charset(args, make_charset, parse_forces, parse_densities) -> int:
         dead_keys=args.dead_keys,
         sheet_cols=args.sheet_cols,
         scan=args.from_scan,
+        deskew_scan=args.deskew,
         base_path=SRC_DIR,
         ink=args.ink,
         spread=args.spread,
@@ -786,6 +787,11 @@ def cmd_sheet(args) -> int:
     print("the edge inside the outer cell by one side bearing, which on this")
     print("machine is about an eighth of a cell and depends on which glyph")
     print("happens to sit in that column.")
+    print("\nA small skew is corrected when the scan is read, so square-on means")
+    print("close rather than perfect -- but square it up on the platen anyway.")
+    print("The grid is sliced axis-aligned, and every degree left in the scan is")
+    print("a tile contaminated by its neighbour, worst at the corners of the")
+    print("sheet, which is the part a spot check does not look at.")
     print("\nThen build a charset from the real type:")
     print(f"  python -m erika.pipeline charset --pitch {args.pitch} "
           f"--name sigma-scanned --from-scan /path/to/scan.png"
@@ -808,7 +814,8 @@ def _read_force_scan(args, blocks: dict[str, list[int]], run: int) -> int:
     from erika import force_scan  # noqa: PLC0415
 
     try:
-        readings = force_scan.read_scan(args.scan, blocks, run, args.pitch)
+        readings = force_scan.read_scan(args.scan, blocks, run, args.pitch,
+                                        args.deskew)
     except (ValueError, FileNotFoundError) as exc:
         raise PlanError(str(exc)) from exc
 
@@ -1559,6 +1566,15 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--font", "-f", default=None)
     c.add_argument("--bleed", "-b", type=float, default=0.2)
     c.add_argument("--dead-keys", action="store_true")
+    # On, like the mechanisms above: a scan that needs it and does not get it
+    # produces a charset that builds, verifies and prints with every tone
+    # slightly wrong. Named for turning off so a suspect straightening can be
+    # ruled out when a charset comes back odd -- not because it is optional.
+    c.add_argument("--no-deskew", dest="deskew", action="store_false",
+                   help="use the scan exactly as it was given, rather than "
+                        "squaring it up first. The grid is sliced axis-aligned, "
+                        "so a scan a degree off contaminates every tile with its "
+                        "neighbour, worst at the corners of the sheet")
     c.add_argument("--from-scan", default=None)
     # The grid the sheet was typed at, which is what identifies a tile when the
     # scan is sliced back up. It has to be given here because `sheet` takes it
@@ -1688,6 +1704,9 @@ def build_parser() -> argparse.ArgumentParser:
                          "command, which is what says where to put three or four "
                          "forces so they land evenly in tone rather than evenly "
                          "in number. Give the same sweep the sheet was typed with")
+    fo.add_argument("--no-deskew", dest="deskew", action="store_false",
+                    help="read the scan exactly as it was given; see the same "
+                         "flag on `charset`")
     fo.add_argument("--levels", type=int, default=4,
                     help="how many forces --from-scan should suggest (default 4)")
     fo.set_defaults(func=cmd_forces)

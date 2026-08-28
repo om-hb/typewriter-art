@@ -62,7 +62,7 @@ from PIL import Image, ImageDraw, ImageFont
 if __package__ in (None, ""):  # allow `python erika/make_charset.py`
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from erika import SRC_DIR, erika_codes as ec
+from erika import SRC_DIR, deskew, erika_codes as ec
 
 DEFAULT_FONT_CANDIDATES = (
     "/System/Library/Fonts/Supplemental/Courier New.ttf",
@@ -75,7 +75,58 @@ DEFAULT_FONT_CANDIDATES = (
 #: Tiles whose mean brightness is >= this are treated as blank by
 #: chop_charset() and silently dropped. Keep it high enough that even '´'
 #: survives; _verify_mapping() asserts that nothing was actually dropped.
+#:
+#: Right for a sheet drawn from a font, where a blank cell is mathematically
+#: white, and hopeless for a scanned one, where it is paper. A tenth of a
+#: percent of mean ink is less than the texture of paper: at a photographic
+#: noise of 1.5 grey levels every trailing blank cell on a scanned sheet reads
+#: as a glyph, and resampling the scan -- to straighten it, say -- does the same
+#: by smearing a trace of the row above into it. ``scan_white_threshold`` is
+#: what a scanned sheet gets instead.
 WHITE_THRESHOLD = 0.999
+
+
+def scan_white_threshold(sheet: np.ndarray, cols: int, rows: int, n_tiles: int):
+    """Where to put the blank/not-blank line for *this* scan. None if moot.
+
+    The constant above cannot serve here, and no other constant can either: the
+    right answer depends on the paper, the scanner and the exposure. But it does
+    not have to be guessed, because the sheet is typed in a known order and the
+    cells past the last glyph are the ones that must come back blank. That makes
+    this a two-cluster separation with known labels -- glyph cells on one side,
+    trailing paper on the other -- and the threshold goes in the gap between
+    them.
+
+    Returns None when there is no gap to find: a sheet with no trailing cells
+    needs every cell kept, which is what happens anyway when nothing is dropped.
+
+    The separation doubles as a check on the grid. If the faintest glyph cell is
+    no darker than the palest blank one, the tiles are not where this thinks they
+    are -- a wrong ``--sheet-cols``, or a sheet cropped so hard the grid slid off
+    it -- and that is worth saying out loud, because every later stage would
+    accept the result.
+    """
+    blanks = cols * rows - n_tiles
+    if blanks <= 0:
+        return None, None
+
+    means = (
+        sheet[: rows * (sheet.shape[0] // rows), : cols * (sheet.shape[1] // cols)]
+        .reshape(rows, sheet.shape[0] // rows, cols, sheet.shape[1] // cols)
+        .mean(axis=(1, 3))
+        .reshape(-1)
+    )
+    darkest_glyph = float(means[:n_tiles].max())
+    palest_blank = float(means[n_tiles:].min())
+    if darkest_glyph >= palest_blank:
+        return None, (
+            f"the faintest glyph cell on this scan ({darkest_glyph:.4f}) is no "
+            f"darker than the palest cell that should be blank "
+            f"({palest_blank:.4f}), so the two cannot be told apart. The grid is "
+            f"probably not where the glyphs are: check --sheet-cols against the "
+            f"sheet, and that the scan was not cropped into the block."
+        )
+    return (darkest_glyph + palest_blank) / 2.0, None
 
 SUPERSAMPLE = 8
 
@@ -384,6 +435,7 @@ def make_charset(
     sheet_cols: int = 20,
     base_path: str | None = None,
     scan: str | None = None,
+    deskew_scan: bool = True,
     ink: float = DEFAULT_INK,
     spread: float = DEFAULT_SPREAD,
     forces: tuple[int, ...] = (),
@@ -425,7 +477,7 @@ def make_charset(
     layout = None
     if scan:
         sheet, cols, rows = _sheet_from_scan(
-            scan, len(entries), sheet_cols, cell_w, cell_h
+            scan, len(entries), sheet_cols, cell_w, cell_h, deskew_scan
         )
         spills = [0.0] * len(entries)
         font_used = f"scan:{os.path.basename(scan)}"
@@ -435,6 +487,14 @@ def make_charset(
             glyphs, font_used, cell_w, cell_h, bleed, sheet_cols,
             ink=ink, spread=spread, densities=densities,
         )
+
+    white_threshold = WHITE_THRESHOLD
+    if scan:
+        measured, complaint = scan_white_threshold(sheet, cols, rows, len(entries))
+        if complaint:
+            print(f"WARNING: {complaint}")
+        elif measured is not None:
+            white_threshold = measured
 
     image_name = "sigma.png"
     cv2.imwrite(os.path.join(charset_dir, image_name), (sheet * 255).astype(np.uint8))
@@ -449,7 +509,7 @@ def make_charset(
         "slicesX": cols,
         "slicesY": rows,
         "excludeChars": [],
-        "whiteThreshold": WHITE_THRESHOLD,
+        "whiteThreshold": white_threshold,
         "blankSpace": True,
     }
     with open(os.path.join(charset_dir, "config.json"), "w", encoding="utf-8") as f:
@@ -621,7 +681,7 @@ def _find_sheet_marks(im: np.ndarray, cols: int) -> tuple[float, float] | None:
     return left, right
 
 
-def _sheet_from_scan(scan_path, n_tiles, cols, cell_w, cell_h):
+def _sheet_from_scan(scan_path, n_tiles, cols, cell_w, cell_h, deskew_scan=True):
     """Slice a scanned charset sheet into the same cell grid.
 
     The charset sheet (see pipeline.py sheet) types the glyphs in GLYPHS order,
@@ -641,6 +701,18 @@ def _sheet_from_scan(scan_path, n_tiles, cols, cell_w, cell_h):
     im = cv2.imread(scan_path, cv2.IMREAD_GRAYSCALE)
     if im is None:
         raise FileNotFoundError(scan_path)
+
+    # Before the marks, because the marks are found by projecting the whole
+    # image onto one axis and rotation is what smears that projection -- and
+    # before the grid, because the grid is sliced square whatever the sheet
+    # does. See deskew.py for what a shallow angle costs.
+    if deskew_scan:
+        im, angle, note = deskew.straighten(im)
+        if angle:
+            print(f"deskewed the scan by {angle:+.2f} deg")
+        if note:
+            print(f"WARNING: {note}")
+
     rows = (n_tiles + cols - 1) // cols
 
     marks = _find_sheet_marks(im, cols)

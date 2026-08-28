@@ -124,6 +124,40 @@ Every later opcode is then read from an operand and every operand from an
 opcode. The device cannot notice — each byte is individually legal — and the CRC
 passes, because the file is intact. Nothing but the comparison catches it.
 
+## Reading a scanned sheet
+
+Two things happen to a scan before its grid is sliced, and both exist because the
+grid is sliced *axis-aligned* whatever the sheet does.
+
+**It is squared up first** (`deskew.py`). The registration marks say where the
+grid starts, which is a different question from which way it points, and nothing
+was answering the second one. Measured on a synthetic sheet with type's ink
+extents: a degree of skew moves the worst tile by 26 grey levels out of 255, one
+and a half by 42, and two degrees fails the build. The dangerous band is the
+shallow one, where the charset comes out looking reasonable and every tone in it
+is wrong — and the error grows toward the corners, which a spot check of the
+middle does not see. The angle is found by maximising the sharpness of the ink's
+row and column projections, not from the marks: finding a mark on a crooked sheet
+means first solving what the marks are for, since `_find_sheet_marks` identifies
+them by projecting the whole image onto one axis and rotation is exactly what
+smears that. Below a twentieth of a degree it does nothing, deliberately — a
+resample blurs every edge by half a pixel whatever the angle, which on a sheet
+whose rows are two dozen pixels tall costs more than the skew did.
+
+**Its blank-cell threshold is measured rather than assumed.** `WHITE_THRESHOLD`
+is 0.999 — a tile is blank if its mean brightness is within a tenth of a percent
+of white. That is right for a sheet drawn from a font and hopeless for a scan,
+where a blank cell is paper: photographic noise of one and a half grey levels is
+already several times that, and so is the trace of the row above that any
+resampling smears in. Every trailing cell of a sheet that does not end on a full
+row then reads as a glyph and `_verify_mapping` refuses the build — and a
+`--dead-keys` sheet has seventeen trailing cells. So `scan_white_threshold` puts
+the line in the gap between the darkest glyph cell and the palest cell that must
+be blank, which the sheet's known typing order identifies for free. If those two
+groups do not separate, the grid is not on the glyphs — a wrong `--sheet-cols`,
+or a scan cropped into the block — and that is said out loud, because it is the
+one failure here that every later stage would accept in silence.
+
 ## Strike force, and what the charset models
 
 The paper's section 5.5 is unambiguous about what matters most: "using a
