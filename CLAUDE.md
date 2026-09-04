@@ -108,12 +108,13 @@ half an hour of typing to discover:
 
 ## Shared tables with erika_ai
 
-The Erika motion codes, the `.etp` opcodes and the upload chunk size each exist
-twice — here in Python, and in C++ in `erika_ai/src/`. Thirteen tests parse
-those headers and compare. **They only run with `erika_ai` checked out**: beside
-this repository by default, or wherever `ERIKA_FIRMWARE_SRC` points. If it is
-missing the suite prints a loud `drift guards did not run` banner — do not
-ignore it, those thirteen tests are the only protection the tables have.
+The Erika motion codes, the `.etp` opcodes, the upload chunk size and the six
+slide-switch codes each exist twice — here in Python, and in C++ in
+`erika_ai/src/`. Seventeen tests parse those headers and compare. **They only
+run with `erika_ai` checked out**: beside this repository by default, or wherever
+`ERIKA_FIRMWARE_SRC` points. If it is missing the suite prints a loud
+`drift guards did not run` banner — do not ignore it, those seventeen tests are
+the only protection the tables have.
 
 Some of them compare the *shape* of the opcode stream rather than its
 constants, and they exist because adding `OP_SET_FORCE` showed how an opcode
@@ -392,6 +393,19 @@ It is also *state on the machine*, like strike force: a job that stops between
 the two codes leaves the typewriter typing right to left for whoever touches it
 next. The firmware's `flushBackwardPrint()` sends `0x8D` on finish, abort and
 failure, and a drift test checks all three.
+
+The pitch is the same kind of thing one step further out — state on the machine
+that no code can read back. `PITCH_FOR_CODE` and `SPACING_FOR_CODE` in
+`erika_codes.py` are the six codes `0x84`–`0x89`, which *set* a slide switch's
+setting when sent and *report* the operator having moved it when received;
+nothing in the table asks. So the firmware pins the pitch from the `.etp`
+header in front of every job (`IMG PREPARE PITCH`, its default) instead of
+trusting the switch, and three drift tests hold that up: the six codes mean the
+same on both sides, the level that pins is the one that boots, and the print
+loop still reads what the machine says. Nothing here has to send them — this
+package's part is the header bit and the table — but the failure is this
+package's shape of failure: a plan for pitch 10 typed at 12 verifies against the
+mockup perfectly and comes off the platen unreadable.
 
 The open question, and the reason it is worth another sheet: if `0x73` still
 moves *right* under `0x8E`, a half-cell scheme becomes two bytes a cell instead

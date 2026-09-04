@@ -349,9 +349,59 @@ MAX_STEPS_PER_COMMAND = 127
 
 
 # --------------------------------------------------------------------------
+# The slide switches
+# --------------------------------------------------------------------------
+# Pitch (Schriftteilung) and line spacing (Zeilenschaltung) are slide switches
+# on the machine, and every plan this package builds assumes both: the pitch
+# decides what a SPACE is worth, and LINE_HEIGHT_MM below is Zeilenschaltung 1.
+#
+# These six codes are the only ones in the table that travel in **both**
+# directions. Sent to the machine, each one sets its switch's setting; received
+# from it, each one reports that the operator has just moved that switch. What
+# does not exist anywhere in 0x71..0xAF is a code that *asks* -- so a switch's
+# position is knowable only from a report or from having been set, and at
+# power-on it is knowable not at all.
+#
+# That asymmetry is why a job pins its pitch rather than checking it, and it is
+# the firmware that does so: `IMG PREPARE PITCH`, on by default, puts the pitch
+# from the job's header and 0x84 in front of the body, and puts them back if the
+# machine reports a switch moving mid-print. See buildPreamble() and
+# watchSwitches() in erika_ai/src/erika_image.cpp. There is no operand and no
+# motion in any of the six, which is what makes them safe to put in front of a
+# plan that did not account for them -- test_erika.py checks that.
+#
+# Mirrors ERIKA_PITCH_* and ERIKA_LINE_SPACING_* in erika_ai/src/erika_image.h.
+PITCH_10 = 0x87
+PITCH_12 = 0x88
+PITCH_15 = 0x89
+LINE_SPACING_1 = 0x84
+LINE_SPACING_1_5 = 0x85
+LINE_SPACING_2 = 0x86
+
+#: Pitch a code selects, or reports the switch as being at.
+PITCH_FOR_CODE = {PITCH_10: 10, PITCH_12: 12, PITCH_15: 15}
+
+#: Line spacing a code selects, in tenths of a line so that 1,5 is an integer --
+#: which is also how the firmware reports it, for the same reason.
+SPACING_FOR_CODE = {LINE_SPACING_1: 10, LINE_SPACING_1_5: 15, LINE_SPACING_2: 20}
+
+
+def pitch_code(pitch: int) -> int:
+    """The code that pins `pitch`, whether as a command or read as a report."""
+    for code, value in PITCH_FOR_CODE.items():
+        if value == pitch:
+            return code
+    raise ValueError(f"no pitch code for {pitch} characters per inch")
+
+
+# --------------------------------------------------------------------------
 # Physical geometry
 # --------------------------------------------------------------------------
 #: Character cell width in mm, by pitch (Schriftteilung 10 / 12).
+#:
+#: 15 is deliberately absent although PITCH_FOR_CODE has it and the machine
+#: answers to it: the .etp header carries pitch as one flag bit, so a job can
+#: only ask for 10 or 12. See "What pitch 15 needs" in docs/control-codes.md.
 PITCH_WIDTH_MM = {10: 25.4 / 10, 12: 25.4 / 12}
 
 #: Line advance in mm at Zeilenschaltung 1 (6 lines per inch).
@@ -564,12 +614,12 @@ CONTROL_CODE_NAMES = {
     0x7F: "SET_RIGHT_MARGIN",
     0x80: "RELEASE_MARGINS",
     0x83: "FEED_SHEET",
-    0x84: "LINE_SPACING_1",
-    0x85: "LINE_SPACING_1_5",
-    0x86: "LINE_SPACING_2",
-    0x87: "PITCH_10",
-    0x88: "PITCH_12",
-    0x89: "PITCH_15",
+    LINE_SPACING_1: "LINE_SPACING_1",
+    LINE_SPACING_1_5: "LINE_SPACING_1_5",
+    LINE_SPACING_2: "LINE_SPACING_2",
+    PITCH_10: "PITCH_10",
+    PITCH_12: "PITCH_12",
+    PITCH_15: "PITCH_15",
     0x8B: "CORRECTION_OFF",
     0x8C: "CORRECTION_ON",
     BACKWARD_PRINT_OFF: "BACKWARD_PRINT_OFF",

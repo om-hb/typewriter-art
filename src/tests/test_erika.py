@@ -2307,8 +2307,10 @@ def test_nothing_the_preamble_sends_could_move_the_head_or_eat_a_byte():
     text = open(os.path.join(FIRMWARE_SRC, "erika_image.h"), encoding="utf-8").read()
     defines = _parse_cpp_defines(os.path.join(FIRMWARE_SRC, "erika_image.h"))
     names = [
-        "ERIKA_RESET", "ERIKA_LINE_SPACING_1", "ERIKA_PITCH_10", "ERIKA_PITCH_12",
-        "ERIKA_KEYBOARD_OFF", "ERIKA_KEYBOARD_ON", "ERIKA_REPORT_WHEN_PRINTED",
+        "ERIKA_RESET", "ERIKA_LINE_SPACING_1", "ERIKA_LINE_SPACING_1_5",
+        "ERIKA_LINE_SPACING_2", "ERIKA_PITCH_10", "ERIKA_PITCH_12",
+        "ERIKA_PITCH_15", "ERIKA_KEYBOARD_OFF", "ERIKA_KEYBOARD_ON",
+        "ERIKA_REPORT_WHEN_PRINTED",
     ]
     for name in names:
         code = defines.get(name)
@@ -2344,6 +2346,107 @@ def test_the_postamble_runs_on_every_exit_from_a_job():
         )
     # finish() is reached only after the postamble has drained through tick().
     assert re.search(r"_bodyEnded = true;\s*\n\s*if \(nextPostambleByte\(\)\)", text)
+
+
+@pytest.mark.skipif(NO_FIRMWARE, reason=NO_FIRMWARE_REASON)
+def test_the_switch_codes_mean_the_same_thing_on_both_sides():
+    """The six codes that name a slide-switch position, mirrored.
+
+    These travel in both directions -- sent they set the switch's setting,
+    received they report the operator moving it -- so the firmware reads its own
+    pinning bytes back through the same table it decodes the machine's reports
+    with. A code that meant 10 on one side and 12 on the other would pin a job to
+    the wrong pitch *and* report that it had succeeded.
+    """
+    defines = _parse_cpp_defines(os.path.join(FIRMWARE_SRC, "erika_image.h"))
+    assert {defines["ERIKA_PITCH_10"]: 10,
+            defines["ERIKA_PITCH_12"]: 12,
+            defines["ERIKA_PITCH_15"]: 15} == ec.PITCH_FOR_CODE
+    assert {defines["ERIKA_LINE_SPACING_1"]: 10,
+            defines["ERIKA_LINE_SPACING_1_5"]: 15,
+            defines["ERIKA_LINE_SPACING_2"]: 20} == ec.SPACING_FOR_CODE
+    # And the pitches a job may actually be planned for are the ones the header
+    # flag can express, which is fewer than the machine answers to.
+    assert set(ec.PITCH_WIDTH_MM) < set(ec.PITCH_FOR_CODE.values())
+    for pitch in ec.PITCH_WIDTH_MM:
+        assert ec.PITCH_FOR_CODE[ec.pitch_code(pitch)] == pitch
+
+
+@pytest.mark.skipif(NO_FIRMWARE, reason=NO_FIRMWARE_REASON)
+def test_a_job_pins_its_pitch_unless_the_operator_says_not_to():
+    """`IMG PREPARE` is three levels, and which one is the default is the whole
+    point of the split.
+
+    Nothing can ask the machine where its slide switches are, so a job that does
+    not pin its pitch is a job that hopes. What it costs to pin is a switch that
+    reads wrong until it is next moved; what it costs not to is a sheet typed at
+    12 characters per inch from a plan laid out for 10, which loads, verifies,
+    prints and comes out with every glyph overlapping its neighbour. So the
+    pinning level is on at boot -- and separate from the keyboard codes, which
+    are off at boot because 0x92 going missing leaves a typewriter that cannot
+    type.
+    """
+    header = open(os.path.join(FIRMWARE_SRC, "erika_image.h"), encoding="utf-8").read()
+    match = re.search(r"enum Prepare\s*:\s*uint8_t\s*\{(.*?)\}", header, re.S)
+    assert match, "could not find the Prepare enum"
+    assert set(re.findall(r"Prepare(\w+)\s*=", match.group(1))) == {
+        "Off", "Pitch", "All"
+    }
+    assert re.search(r"Prepare _prepare = PreparePitch;", header), (
+        "the default is no longer the level that pins the pitch"
+    )
+
+    source = open(os.path.join(FIRMWARE_SRC, "erika_image.cpp"), encoding="utf-8").read()
+    body = re.search(r"void ErikaImagePrinter::buildPreamble\(\).*?\n}", source, re.S)
+    assert body, "could not find buildPreamble()"
+    # The keyboard pair -- the half that can leave the machine unable to type --
+    # is reached only at the level that is off by default.
+    for byte in ("ERIKA_KEYBOARD_OFF", "ERIKA_KEYBOARD_ON", "ERIKA_RESET"):
+        line = re.search(rf"^.*{byte}.*$", body.group(0), re.M)
+        assert line, f"{byte} is gone from the preamble"
+        assert "PrepareAll" in body.group(0)
+    assert body.group(0).count("PrepareAll") >= 2
+
+    # And the pitch pinned is the job's own, not a setting.
+    pins = re.search(r"void ErikaImagePrinter::queuePins\(\).*?\n}", source, re.S)
+    assert pins, "could not find queuePins()"
+    assert "_hdr.pitch12() ? ERIKA_PITCH_12 : ERIKA_PITCH_10" in pins.group(0)
+    assert "ERIKA_LINE_SPACING_1" in pins.group(0)
+
+
+@pytest.mark.skipif(NO_FIRMWARE, reason=NO_FIRMWARE_REASON)
+def test_a_switch_moved_mid_print_is_read_and_overruled():
+    """The machine reports 0x84..0x89 when a switch moves, and mid-job is when it
+    happens -- the sheet is coming out narrow, so somebody reaches for the pitch
+    switch. While a picture types, the firmware's print loop is the only reader of
+    the link, so if tick() does not look, nobody ever will: the report is dropped
+    by flushInput() at the end of the job and no code exists to ask afterwards.
+    """
+    source = open(os.path.join(FIRMWARE_SRC, "erika_image.cpp"), encoding="utf-8").read()
+    tick = re.search(r"void ErikaImagePrinter::tick\(\).*?\n}", source, re.S)
+    assert tick and "watchSwitches()" in tick.group(0), (
+        "tick() does not read what the machine says, so a switch moved mid-print "
+        "is lost"
+    )
+    watch = re.search(r"void ErikaImagePrinter::watchSwitches\(\).*?\n}", source, re.S)
+    assert watch, "could not find watchSwitches()"
+    assert "pollSettings()" in watch.group(0)
+    assert "queuePins()" in watch.group(0), "it notices but does nothing about it"
+    assert "PrepareOff" in watch.group(0), (
+        "it must not overrule a machine the operator asked it to leave alone"
+    )
+    # The reports are decoded in one place, and both directions go through it.
+    interface = open(os.path.join(FIRMWARE_SRC, "erika_interface.cpp"),
+                     encoding="utf-8").read()
+    raw = re.search(r"void ErikaInterface::writeRaw\(.*?\n}", interface, re.S)
+    assert raw and "noteSettingCode" in raw.group(0), (
+        "a pitch code this firmware sends has to update the same log a report does"
+    )
+    for name in ("ErikaInterface::readInput", "ErikaInterface::flushInput"):
+        func = re.search(rf"{name}\(.*?\n}}", interface, re.S)
+        assert func and "noteSettingCode" in func.group(0), (
+            f"{name}() drops the machine's switch reports"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -3075,11 +3178,19 @@ def test_the_opt_outs_still_work_and_name_a_mechanism():
 def test_the_firmware_defaults_to_using_the_step_commands():
     """AUTO rather than ALL: the commands are cheaper on a blank run and dearer
     on the one-cell hops a picture is mostly made of, which was measured. And
-    not the completion report, which no printed sheet can confirm."""
+    not the completion report, which no printed sheet can confirm.
+
+    The pitch pins are the other way round -- on at boot -- and the difference is
+    not how confirmed they are but what the two failures cost. An unconfirmed
+    delay model comes out as a smudged sheet; an unpinned pitch comes out as a
+    plan for 10 characters per inch typed at 12, and nothing on either side can
+    notice, because no code in the interface's table reports a slide switch.
+    See test_a_job_pins_its_pitch_unless_the_operator_says_not_to.
+    """
     text = open(os.path.join(FIRMWARE_SRC, "erika_image.h"), encoding="utf-8").read()
     assert re.search(r"DirectSteps _directSteps = StepsAuto;", text)
     assert re.search(r"bool _completionReport = false;", text)
-    assert re.search(r"bool _prepare = false;", text)
+    assert re.search(r"Prepare _prepare = PreparePitch;", text)
 
 
 def test_the_probe_sheet_asks_whether_the_type_fits_the_pitch(tmp_path):
