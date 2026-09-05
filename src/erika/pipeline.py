@@ -395,6 +395,7 @@ def plan_and_encode(args, choices_path: str) -> tuple[planner.Plan, etp.Job]:
         home_each_row=not args.no_home,
         boustrophedon=not args.no_serpentine,
         fine=args.fine,
+        indent=args.indent,
     )
     job = planner.encode(plan, settle_ms=args.settle_ms, cr_delay_ms=args.cr_delay_ms,
                          no_advance=args.no_advance, backward=args.backward)
@@ -1525,6 +1526,10 @@ def _add_plan_args(p):
                    help="do not carriage-return between passes (faster, less accurate)")
     p.add_argument("--no-serpentine", action="store_true",
                    help="always sweep left to right (only affects --no-home)")
+    p.add_argument("--indent", type=int, default=0, metavar="COLUMNS",
+                   help="blank columns left of the print, to move it right on "
+                        "the sheet. The paper cannot always be moved instead -- "
+                        "it is fed against the guides -- and the carriage can")
     p.add_argument("--settle-ms", type=int, default=0,
                    help="pause after each paper feed, in ms")
     p.add_argument("--cr-delay-ms", type=int, default=0,

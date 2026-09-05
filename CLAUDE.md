@@ -31,7 +31,7 @@ project is also driven through `uv run python`. Substitute whichever applies;
 
 ```bash
 cd src
-PY -m pytest tests -q                                   # 238 tests
+PY -m pytest tests -q                                   # 281 tests
 PY -m erika.pipeline charset --pitch 10                 # build the Sigma charset
 PY -m erika.pipeline print -t images/mwdog_crop.png -r 48
 PY -m erika.pipeline print -t photo.jpg -r 48 --grey c2g   # STRESS, not luma
@@ -92,6 +92,26 @@ Coordinates are half-cells throughout: `x` = half-steps right of the left
 margin, `y` = half-lines below the top. A layer offset of `0.5` is exactly one
 half-step or one half-line — which is why only offsets of 0 and 0.5 are
 typeable.
+
+**`--indent` is where on the paper, and it lives in exactly one place.** A print
+starts at the machine's left margin, and a sheet is fed against the guides — so
+putting the print on the right of the page cannot be done by moving the paper,
+only by sending the carriage further right before typing. `build_plan` takes an
+indent in whole columns and `encode` adds it to every head position it emits.
+
+Nothing else knows about it, and that is the design rather than an omission. A
+strike's `x` stays a position in the *picture*, so `preview.render` renders the
+same image whatever the indent, and the mockup comparison — the check the whole
+pipeline rests on — keeps comparing pictures. Fold the indent into the strikes
+instead and every shifted job reports a mismatch against `optimize.py`'s mockup
+while being perfectly correct.
+
+Two things it does cost. The carriage limit is counted in columns and the indent
+spends them: `used_cols + indent` has to fit `max_columns`, and the refusal names
+both ways out, because which one is wanted is the operator's business. And the
+encoder's right-to-left path keeps the head's position itself, in two places, so
+both carry the indent — miss one and every move *after* a backward run is out by
+the whole indent, with the picture and the mockup still agreeing.
 
 **The pipeline checks itself at every stage**, because a subtle error costs
 half an hour of typing to discover:

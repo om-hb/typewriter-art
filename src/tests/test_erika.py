@@ -847,6 +847,116 @@ def test_virtual_typewriter_reproduces_the_planned_image(tmp_path, charset):
     assert np.array_equal(intended, actual)
 
 
+# ---------------------------------------------------------------------------
+# the indent: where on the paper the print goes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("home_each_row", [True, False])
+def test_an_indent_moves_the_head_and_leaves_the_picture_alone(
+    tmp_path, charset, home_each_row
+):
+    """The one invariant the feature rests on.
+
+    An indent is a decision about where on the sheet the print sits, and the
+    machine is the only thing that should be able to tell: the strikes, the grid
+    and the rendered picture have to come out identical, because that render is
+    what the plan is verified against. Get this wrong -- by folding the indent
+    into the strike positions -- and every indented job reports a mismatch
+    against optimize.py's mockup while being perfectly correct.
+    """
+    from utils import prep_charset
+
+    tiles, _, _ = prep_charset("sigma-10", SRC)
+    path = _write_choices(tmp_path, _random_choices(charset, 6, 10, FOUR_LAYERS, seed=11))
+    plain = planner.build_plan(path, charset, home_each_row=home_each_row)
+    shifted = planner.build_plan(path, charset, home_each_row=home_each_row, indent=12)
+
+    assert [(s.y, s.x, s.index) for s in shifted.strikes] == [
+        (s.y, s.x, s.index) for s in plain.strikes
+    ]
+    assert (shifted.cols, shifted.rows) == (plain.cols, plain.rows)
+    assert np.array_equal(preview.render(plain, tiles), preview.render(shifted, tiles))
+
+    # ...and the machine does put it 12 columns further right, which is the half
+    # of it no render can show. Through the virtual typewriter rather than by
+    # reading the opcodes, because what matters is where the head ends up after
+    # every carriage return, backspace and backward run in the stream.
+    job = planner.encode(shifted)
+    machine = emulate.type_job(job, max_columns=charset.max_columns)
+    assert machine.overruns == 0
+    recovered = emulate.impressions_to_strikes(machine, charset)
+    assert len(recovered) == len(shifted.strikes)
+    for got, want in zip(recovered, shifted.strikes):
+        assert (got.y, got.x) == (want.y, want.x + 2 * 12)
+
+
+def test_an_indented_backward_run_still_lands_where_planned(tmp_path, charset):
+    """The right-to-left path keeps the head's position itself, so it needs it too.
+
+    Rückwärtsdruck moves the carriage and strikes on one byte, so inside a run the
+    encoder emits no moves and updates its own idea of where the head is -- in two
+    places. Either of them left holding a position in the picture rather than one
+    on the paper puts every move *after* the run out by the whole indent, and
+    nothing before it, which is a fault no preview can show: the plan and the
+    mockup still agree, because neither of them knows about the indent at all.
+    """
+    grid = [[5] * 12 for _ in range(3)]
+    path = _write_choices(tmp_path, {"layer0_0_0": grid})
+    plan = planner.build_plan(path, charset, home_each_row=False, indent=9)
+    job = planner.encode(plan)
+    assert any(op == etp.OP_BACKWARD_ON for _, op, _ in etp.iter_ops(job.body))
+
+    machine = emulate.type_job(job, max_columns=charset.max_columns)
+    assert machine.overruns == 0
+    recovered = emulate.impressions_to_strikes(machine, charset)
+    assert len(recovered) == len(plan.strikes)
+    for got, want in zip(recovered, plan.strikes):
+        assert (got.y, got.x) == (want.y, want.x + 2 * 9)
+
+
+def test_an_indent_costs_the_carriage_the_columns_it_uses(tmp_path, charset):
+    """A print that fits and an indent that fits can still not fit together.
+
+    Nothing downstream would notice: the plan verifies against the mockup, the
+    job uploads, and the machine types into its right-hand stop with every
+    character past it landing in the same column. So it is refused here, and the
+    refusal has to name both ways out -- narrowing the print is not obviously the
+    right one when the indent is the thing being asked for.
+    """
+    room = charset.max_columns - 4
+    path = _write_choices(tmp_path, {"layer0_0_0": [[1] * room]})
+    assert planner.build_plan(path, charset, indent=4).strikes  # exactly fits
+
+    with pytest.raises(PlanError) as raised:
+        planner.build_plan(path, charset, indent=5)
+    message = str(raised.value)
+    assert "Indent it by 4 or less" in message
+    # And the row length it suggests instead really does fit at that indent.
+    suggested = int(re.search(r"-r (\d+)", message).group(1))
+    fits = _write_choices(tmp_path, {"layer0_0_0": [[1] * (suggested + 1)]})
+    assert planner.build_plan(fits, charset, indent=5).strikes
+
+
+def test_a_negative_indent_is_refused(tmp_path, charset):
+    """There is nothing to the left of the left margin -- it is where CR goes."""
+    path = _write_choices(tmp_path, {"layer0_0_0": [[1, 2, 3]]})
+    with pytest.raises(PlanError, match="negative"):
+        planner.build_plan(path, charset, indent=-1)
+
+
+def test_an_indented_summary_says_which_columns_the_print_lands_in(tmp_path, charset):
+    path = _write_choices(tmp_path, {"layer0_0_0": [[1] * 10]})
+    plan = planner.build_plan(path, charset, indent=7)
+    text = planner.summarize(plan, planner.encode(plan))
+    assert "7 blank columns" in text
+    assert "columns 8 to 17" in text
+    # Nothing about an indent in a job that has none, so an ordinary summary
+    # reads exactly as it did.
+    plain = planner.build_plan(path, charset)
+    assert "indent" not in planner.summarize(plain, planner.encode(plain))
+
+
 def test_dead_keys_do_not_advance_the_carriage(tmp_path):
     """A dead key must leave the head where it was, or everything after shifts."""
     dead_charset = Charset(

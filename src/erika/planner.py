@@ -148,6 +148,18 @@ class Plan:
     charset: Charset
     layer_offsets: list[tuple[float, float]] = field(default_factory=list)
     home_each_row: bool = True
+    #: Blank columns of paper between the machine's left margin and the print.
+    #:
+    #: **Not part of any position in ``strikes``.** A strike's ``x`` is where it
+    #: sits in the *picture*, and every check the pipeline makes of a plan --
+    #: preview.render against optimize.py's mockup above all -- is a check of the
+    #: picture. Where that picture sits on the paper is a separate question, and
+    #: this is the whole of the answer: ``encode`` shifts every head position it
+    #: emits by this much and nothing else in the module knows about it. Keep it
+    #: that way. Folding the indent into the strikes would move the render off the
+    #: canvas it is compared against, and the verification would start reporting a
+    #: mismatch for a plan that is correct.
+    indent: int = 0
 
     @property
     def width_cells(self) -> float:
@@ -267,7 +279,24 @@ def build_plan(
     boustrophedon: bool = True,
     group_by_force: bool = True,
     fine: bool = True,
+    indent: int = 0,
 ) -> Plan:
+    """Flatten the optimizer's layers into an ordered, absolute list of strikes.
+
+    ``indent`` moves the print right on the sheet, in whole columns of blank
+    paper. It exists because the paper cannot always be moved instead: a sheet is
+    fed against the guides, so pushing it far enough left to put the print on the
+    right of the page is not something the machine allows -- but sending the
+    carriage further right before typing is. The machine's own left margin does
+    not move; the print is indented from it, exactly as typed text would be.
+
+    Whole columns rather than half-steps, and that is the unit the carriage limit
+    is counted in: an indent plus the print has to fit the columns the carriage
+    reaches, and nothing further down would catch it if it did not -- the plan
+    would verify against the mockup, the job would upload, and the machine would
+    type into its own right-hand stop with every character past it landing in one
+    column.
+    """
     strikes, cols, rows, offsets = load_choices(choices_path, charset.pitch, fine)
 
     bad = [s for s in strikes if not 0 <= s.index < len(charset)]
@@ -279,8 +308,29 @@ def build_plan(
             f"<the charset you intend to print with>."
         )
 
+    if indent < 0:
+        raise PlanError(
+            f"indent {indent} is negative. The print cannot start left of the "
+            "machine's left margin -- that is where the carriage returns to."
+        )
+
     used_cols = max((s.x for s in strikes), default=0) // 2 + 1
-    if used_cols > charset.max_columns:
+    if used_cols + indent > charset.max_columns:
+        # Two ways out of it now, and the refusal names both: narrow the print, or
+        # indent it less. Which one is wanted is the operator's business -- the
+        # indent is a decision about where on the page the print goes.
+        if indent:
+            raise PlanError(
+                f"image is {used_cols} columns wide and indented {indent}, which "
+                f"needs {used_cols + indent} of the {charset.max_columns} columns "
+                f"the carriage reaches at pitch {charset.pitch}. Indent it by "
+                f"{max(0, charset.max_columns - used_cols)} or less, or re-run "
+                f"optimize.py with -r "
+                f"{max(1, charset.max_columns - indent - 1)} or lower (a print "
+                f"takes one more column than its characters per row -- half a "
+                f"cell of margin at each side)"
+                + (", or switch to pitch 12." if charset.pitch == 10 else ".")
+            )
         # The -r to suggest is one *less* than the carriage's column count, not
         # equal to it: resizeTarget pads the target by half a cell on every side,
         # so a print of n characters per row occupies n + 1 columns of cells. The
@@ -319,7 +369,7 @@ def build_plan(
 
     if boustrophedon and not home_each_row:
         strikes = _serpentine(strikes)
-    return Plan(strikes, cols, rows, charset, offsets, home_each_row)
+    return Plan(strikes, cols, rows, charset, offsets, home_each_row, indent)
 
 
 def _pass_key(s: Strike) -> tuple[int, int]:
@@ -495,6 +545,11 @@ def encode(
     """
     enc = etp.Encoder()
     cs = plan.charset
+    # Where the print's left edge sits on the paper, in half-steps right of the
+    # machine's left margin. This is the only place a plan's indent is applied:
+    # `x` below tracks the head's real position, so it carries the indent, while
+    # every `s.x` stays a position in the picture. See Plan.indent.
+    origin = 2 * plan.indent
     x = y = 0
     # Where the head is *within* the half-cell, in the machine's motor steps.
     # Always zero unless a layer offset asked for a position the keyboard cannot
@@ -521,7 +576,7 @@ def encode(
             # feed the paper, change force, move the carriage -- is a thing
             # _continues_backwards refused, which is what makes this safe.
             enc.strike(cs.codes[s.index], cs.advances[s.index])
-            x = s.x  # it moved first, so the head stands on the mark
+            x = s.x + origin  # it moved first, so the head stands on the mark
             if i + 1 == run_stop:
                 enc.backward_off()
             continue
@@ -580,7 +635,7 @@ def encode(
         # where the escapement would stand after typing at s.x, so it is not a
         # position the carriage has to reach and could not before.
         start = runs.get(i)
-        target = s.x + 2 if start is not None else s.x
+        target = s.x + origin + (2 if start is not None else 0)
 
         # The same arithmetic across, for the same reason.
         per_half = ec.carriage_steps_per_half_step(cs.pitch)
@@ -595,7 +650,7 @@ def encode(
             enc.backward_on()
             run_stop = start
             enc.strike(cs.codes[s.index], cs.advances[s.index])
-            x = s.x
+            x = s.x + origin
             continue
 
         advances = cs.advances[s.index] and not stacked
@@ -657,7 +712,8 @@ def summarize(plan: Plan, job: etp.Job, ops_per_second: float = 10.0) -> str:
             mech_ops += 2
             force_changes += 1
 
-    w_mm = plan.width_cells * ec.PITCH_WIDTH_MM[cs.pitch]
+    col_mm = ec.PITCH_WIDTH_MM[cs.pitch]
+    w_mm = plan.width_cells * col_mm
     h_mm = plan.height_cells * ec.LINE_HEIGHT_MM
     seconds = mech_ops / ops_per_second
     cells = plan.cols * plan.rows
@@ -689,6 +745,10 @@ def summarize(plan: Plan, job: etp.Job, ops_per_second: float = 10.0) -> str:
             f"({cells * layers} slots, {job.strikes} inked)",
             f"  on paper     {plan.width_cells:.1f} x {plan.height_cells:.1f} cells "
             f"= {w_mm:.0f} x {h_mm:.0f} mm",
+            *([f"  indent       {plan.indent} blank columns "
+               f"({plan.indent * col_mm:.0f} mm) left of the print, so it spans "
+               f"columns {plan.indent + 1} to "
+               f"{plan.indent + int(plan.width_cells)}"] if plan.indent else []),
             f"  job size     {etp.HEADER_SIZE + len(job.body)} bytes",
             *force_line,
             f"  mechanics    {mech_ops} head operations, "

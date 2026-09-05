@@ -56,6 +56,11 @@ def render(
 
     ``jitter`` is the standard deviation of per-strike registration error, in
     cell widths/heights (0.05 is a realistic well-adjusted machine).
+
+    A plan's ``indent`` is deliberately not applied. This renders the *picture*,
+    which is what the mockup comparison is a comparison of; where that picture
+    sits on the paper is the encoder's business and moving it here would put the
+    render off the canvas it is diffed against.
     """
     ch, cw = plan.charset.cell_h, plan.charset.cell_w
     if tiles.shape[1:] != (ch, cw):
