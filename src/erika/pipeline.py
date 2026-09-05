@@ -482,6 +482,7 @@ def plan_and_encode(args, choices_path: str) -> tuple[planner.Plan, etp.Job]:
         boustrophedon=not args.no_serpentine,
         fine=args.fine,
         indent=args.indent,
+        offset=args.offset,
     )
     job = planner.encode(plan, settle_ms=args.settle_ms, cr_delay_ms=args.cr_delay_ms,
                          no_advance=args.no_advance, backward=args.backward)
@@ -2225,6 +2226,14 @@ def _add_plan_args(p):
                    help="blank columns left of the print, to move it right on "
                         "the sheet. The paper cannot always be moved instead -- "
                         "it is fed against the guides -- and the carriage can")
+    p.add_argument("--offset", type=int, default=0, metavar="LINES",
+                   help="blank lines above the print, to move it down the sheet. "
+                        "Down only: where the first line lands was decided when "
+                        "the sheet was clamped and the platen cannot wind back "
+                        "above it, so to move a print *up*, load the paper "
+                        "higher. Nothing refuses an offset that runs off the "
+                        "paper -- the machine has no vertical limit, only the "
+                        "sheet does; `pipeline feed` is what measures yours")
     p.add_argument("--settle-ms", type=int, default=0,
                    help="pause after each paper feed, in ms")
     p.add_argument("--cr-delay-ms", type=int, default=0,

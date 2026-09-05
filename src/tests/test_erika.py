@@ -1470,6 +1470,110 @@ def test_the_rewind_sheet_refuses_a_ladder_it_cannot_type(tmp_path, bad):
 
 
 
+
+# ---------------------------------------------------------------------------
+# --offset: where down the sheet the print goes
+# ---------------------------------------------------------------------------
+
+
+def _offset_plan(tmp_path, offset: int, indent: int = 0):
+    """A three-line plan at an offset, and the marks it makes."""
+    choices = os.path.join(tmp_path, "choices.json")
+    with open(choices, "w", encoding="utf-8") as f:
+        json.dump({"layer_0_0": [[1, 0], [0, 1], [1, 1]]}, f)
+    charset = Charset.load(os.path.join(SRC, "charsets", "sigma-10", "glyphs.json"))
+    plan = planner.build_plan(choices, charset, offset=offset, indent=indent)
+    job = planner.encode(plan)
+    machine = emulate.type_job(job, max_columns=ec.MAX_COLUMNS[job.pitch])
+    return plan, job, machine
+
+
+def test_an_offset_moves_the_print_down_the_sheet_and_nothing_else(tmp_path):
+    """The vertical twin of the indent, and the same one job it does.
+
+    Five lines of offset is five whole line feeds before the first strike and no
+    other difference: same glyphs, same columns, same rows relative to each other.
+    """
+    plain, _, plain_machine = _offset_plan(tmp_path, 0)
+    moved, _, moved_machine = _offset_plan(tmp_path, 5)
+
+    assert plain.strikes == moved.strikes, "an offset is not part of a strike"
+    assert moved.offset == 5 and plain.offset == 0
+
+    def marks(machine):
+        return sorted((imp.y, imp.x, imp.code) for imp in machine.impressions)
+
+    shifted = [(y + 2 * 5, x, code) for y, x, code in marks(plain_machine)]
+    assert marks(moved_machine) == shifted
+
+
+def test_an_offset_is_whole_lines_so_the_detented_mechanism_still_feeds(tmp_path):
+    """Half a line is a keystroke; a whole line is the line-feed mechanism, and
+    planner.encode prefers it because it is the more repeatable of the two. An
+    offset in whole lines keeps every feed an even number of half-lines, so the
+    preference is never quietly given up by moving a print down the page."""
+    _, job, _ = _offset_plan(tmp_path, 3)
+    halves = [op for _, op, _ in etp.iter_ops(job.body)
+              if op in (etp.OP_DOWN, etp.OP_UP)]
+    assert not halves, "a whole-line offset should feed by NEWLINE, not half-lines"
+
+
+def test_an_offset_does_not_change_what_the_render_is_compared_against(tmp_path):
+    """The invariant the indent has, for the same reason and with the same teeth.
+
+    `preview.render` draws the picture, and the picture is what the optimizer's
+    own mockup is diffed against. An offset that reached the strikes would slide
+    the render off that canvas, and every offset job would report a mismatch
+    while being perfectly correct.
+    """
+    from utils import prep_charset
+
+    tiles, _, _ = prep_charset("sigma-10", SRC)
+    plain, _, _ = _offset_plan(tmp_path, 0)
+    moved, _, _ = _offset_plan(tmp_path, 7)
+    assert [(s.y, s.x, s.index) for s in moved.strikes] == [
+        (s.y, s.x, s.index) for s in plain.strikes
+    ]
+    assert (moved.cols, moved.rows) == (plain.cols, plain.rows)
+    assert np.array_equal(preview.render(plain, tiles), preview.render(moved, tiles))
+
+
+def test_an_offset_and_an_indent_are_independent(tmp_path):
+    """One moves the print down and the other across, and neither is the other's
+    business -- the carriage returns to a margin every row, the paper never does."""
+    _, _, machine = _offset_plan(tmp_path, 4, indent=3)
+    ys = sorted({imp.y for imp in machine.impressions})
+    xs = sorted({imp.x for imp in machine.impressions})
+    assert min(ys) == 2 * 4
+    assert min(xs) == 2 * 3
+
+
+def test_the_print_cannot_be_offset_upwards(tmp_path):
+    """There is no negative offset, and the refusal says what to do instead.
+
+    The carriage returns to the left margin every row, so a print can be pushed
+    right from a fixed origin. The paper has no such origin: where the first line
+    lands was decided when the sheet was clamped, and every plan feeds forward. So
+    moving a print *up* is a thing you do to the paper, not to the plan.
+    """
+    choices = os.path.join(tmp_path, "choices.json")
+    with open(choices, "w", encoding="utf-8") as f:
+        json.dump({"layer_0_0": [[1]]}, f)
+    charset = Charset.load(os.path.join(SRC, "charsets", "sigma-10", "glyphs.json"))
+    with pytest.raises(PlanError) as exc:
+        planner.build_plan(choices, charset, offset=-1)
+    assert "clamp the sheet higher" in str(exc.value).lower()
+
+
+def test_nothing_refuses_an_offset_for_running_off_the_paper(tmp_path):
+    """Because the machine has no vertical limit -- only the sheet does, and how
+    much sheet there is under the print line is a measurement of how the operator
+    loaded it. The planner refuses what the *carriage* cannot do; the paper is
+    somebody else's warning to give, and `pipeline feed` is what measures it."""
+    plan, _, _ = _offset_plan(tmp_path, 400)
+    assert plan.offset == 400
+    assert plan.offset > ec.lines_on_paper()
+
 # ---------------------------------------------------------------------------
 # where the paper sits
 # ---------------------------------------------------------------------------

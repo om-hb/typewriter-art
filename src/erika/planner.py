@@ -160,6 +160,22 @@ class Plan:
     #: canvas it is compared against, and the verification would start reporting a
     #: mismatch for a plan that is correct.
     indent: int = 0
+    #: Blank lines of paper the plan feeds past before the print starts.
+    #:
+    #: The vertical twin of ``indent`` and subject to the same rule: **not part of
+    #: any position in ``strikes``**, applied by ``encode`` and by nothing else, so
+    #: that ``preview.render`` still draws the picture the optimizer's mockup is
+    #: compared against. See ``indent``.
+    #:
+    #: It only ever moves the print *down*. Where the first line lands is decided
+    #: by how the sheet was clamped, and the platen cannot wind back to reach
+    #: higher -- so a print already too tall to centre is left where the loading
+    #: put it rather than being an error. Nothing here refuses an offset for
+    #: running off the paper either: the machine has no vertical limit, only the
+    #: sheet does, and how much sheet there is under the print line is a
+    #: measurement of a loading rather than a fact about the machine. See
+    #: erika_codes' "Where the paper sits".
+    offset: int = 0
 
     @property
     def width_cells(self) -> float:
@@ -280,6 +296,7 @@ def build_plan(
     group_by_force: bool = True,
     fine: bool = True,
     indent: int = 0,
+    offset: int = 0,
 ) -> Plan:
     """Flatten the optimizer's layers into an ordered, absolute list of strikes.
 
@@ -296,6 +313,21 @@ def build_plan(
     would verify against the mockup, the job would upload, and the machine would
     type into its own right-hand stop with every character past it landing in one
     column.
+
+    ``offset`` is the same thing down the page, in whole lines of blank paper, and
+    it is asymmetric with ``indent`` in two ways worth knowing.
+
+    It only goes one way. The carriage returns to the left margin every row, so a
+    print can be pushed right from a fixed origin; the *paper* has no such origin
+    to return to -- where the first line lands was decided when the sheet was
+    clamped, and the platen cannot wind back to reach above it. So an offset moves
+    a print down and there is no negative one.
+
+    And nothing refuses it. An indent is checked against the carriage, which stops
+    where it stops; there is no equivalent below, because the platen keeps feeding
+    for as long as it grips the sheet. What a print runs off is the paper, and how
+    much paper is under the print line depends on how the operator loaded it --
+    a measurement, not a machine limit, and not this function's to enforce.
     """
     strikes, cols, rows, offsets = load_choices(choices_path, charset.pitch, fine)
 
@@ -312,6 +344,14 @@ def build_plan(
         raise PlanError(
             f"indent {indent} is negative. The print cannot start left of the "
             "machine's left margin -- that is where the carriage returns to."
+        )
+
+    if offset < 0:
+        raise PlanError(
+            f"offset {offset} is negative. The print cannot start above the first "
+            "line the paper is loaded at -- the platen would have to wind back to "
+            "get there, and every plan feeds forward. Clamp the sheet higher "
+            "instead; where its first line lands is the operator's to choose."
         )
 
     used_cols = max((s.x for s in strikes), default=0) // 2 + 1
@@ -369,7 +409,8 @@ def build_plan(
 
     if boustrophedon and not home_each_row:
         strikes = _serpentine(strikes)
-    return Plan(strikes, cols, rows, charset, offsets, home_each_row, indent)
+    return Plan(strikes, cols, rows, charset, offsets, home_each_row, indent,
+                offset)
 
 
 def _pass_key(s: Strike) -> tuple[int, int]:
@@ -550,6 +591,12 @@ def encode(
     # `x` below tracks the head's real position, so it carries the indent, while
     # every `s.x` stays a position in the picture. See Plan.indent.
     origin = 2 * plan.indent
+    # And the same down the page, in half-lines. Like the indent it is added to
+    # the position the encoder emits and to nothing else -- `s.y` stays a row in
+    # the picture, so the render and the mockup still agree. Whole lines, so the
+    # doubling keeps every feed an even number of half-lines and the detented
+    # line-feed mechanism goes on being the one that moves the paper.
+    origin_y = 2 * plan.offset
     x = y = 0
     # Where the head is *within* the half-cell, in the machine's motor steps.
     # Always zero unless a layer offset asked for a position the keyboard cannot
@@ -597,7 +644,7 @@ def encode(
             # In the platen's own steps, so that a residue which shrinks between
             # rows still comes out as one forward feed rather than a whole
             # half-line forward and a fraction back.
-            delta = ((s.y * ec.PLATEN_STEPS_PER_HALF_LINE + s.fy)
+            delta = (((s.y + origin_y) * ec.PLATEN_STEPS_PER_HALF_LINE + s.fy)
                      - (y * ec.PLATEN_STEPS_PER_HALF_LINE + y_fine))
             if delta < 0:  # build_plan sorts by (y, fy), so this cannot happen
                 raise PlanError(f"plan feeds the paper backwards to row {s.y}")
@@ -621,7 +668,7 @@ def encode(
                 enc.vertical_fine(dy_fine)
             if settle_ms:
                 enc.delay_ms(settle_ms)
-            y, y_fine = s.y, s.fy
+            y, y_fine = s.y + origin_y, s.fy
             prev_y = (s.y, s.fy)
 
         want = cs.force_for(s.index)
@@ -745,6 +792,10 @@ def summarize(plan: Plan, job: etp.Job, ops_per_second: float = 10.0) -> str:
             f"({cells * layers} slots, {job.strikes} inked)",
             f"  on paper     {plan.width_cells:.1f} x {plan.height_cells:.1f} cells "
             f"= {w_mm:.0f} x {h_mm:.0f} mm",
+            *([f"  offset       {plan.offset} blank lines "
+               f"({plan.offset * ec.LINE_HEIGHT_MM:.0f} mm) above the print, so it "
+               f"spans lines {plan.offset + 1} to "
+               f"{plan.offset + int(plan.height_cells)}"] if plan.offset else []),
             *([f"  indent       {plan.indent} blank columns "
                f"({plan.indent * col_mm:.0f} mm) left of the print, so it spans "
                f"columns {plan.indent + 1} to "

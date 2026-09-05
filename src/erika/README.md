@@ -299,6 +299,7 @@ see it again, reflash before suspecting the machine.
 ```
 erika.pipeline charset    build the Sigma charset (--pitch, --font, --from-scan)
 erika.pipeline print      photo -> optimize -> .etp   (-t, -r, -n, -l, -g, --align)
+                          --indent/--offset put it elsewhere on the sheet
 erika.pipeline plan       re-plan an existing choices.json without re-optimizing
 erika.pipeline verify     diff a plan render against optimize.py's mockup
 erika.pipeline calibrate  motion-code test pattern
@@ -404,6 +405,44 @@ back up to its rule, and the climb is the thing under test.
 What the sheet does not measure is the carriage. Its return to the left margin is
 exercised by every row of every print already; the platen coming back up a whole
 image is the motion nothing in this pipeline has ever made.
+
+## Where on the sheet: `--indent` and `--offset`
+
+Two numbers, and they are not symmetric.
+
+`--indent` is blank columns the plan types past before it starts, which moves the
+print right. It exists because the paper cannot be moved instead: a sheet is fed
+against the guides, so it cannot be pushed far enough left to put the print on the
+right of the page, while the carriage can be sent further right before it types.
+
+`--offset` is blank lines it feeds past, which moves the print down. Where the
+first line lands was decided when the sheet was clamped, and the platen cannot
+wind back above it — so there is no negative offset, and to move a print *up* you
+load the paper higher.
+
+|  | `--indent` | `--offset` |
+|---|---|---|
+| unit | whole columns | whole lines |
+| direction | right only | down only |
+| refused when | the indent plus the print is past the carriage's reach | never — the machine has no vertical limit, only the paper does |
+
+That last row is the one to keep in mind. The carriage stops where it stops, so an
+indent that will not fit is a fault the planner can name. Below, the platen keeps
+feeding for as long as it grips the sheet: what a print runs off is paper, and how
+much paper is under the print line depends on how the operator loaded it. That is
+a measurement rather than a machine limit — `deepest_printable_line` is what
+answers it and `erika-studio` is what warns with it.
+
+Both obey one invariant, and it is the same one: **they belong to the positions
+`planner.encode` emits and to nothing else.** A strike's `x` and `y` stay
+positions in the *picture*, so `preview.render` draws the same image whatever the
+print's place on the page, and the mockup comparison goes on meaning what it
+meant. Folding either into the strikes would make every placed job report a
+mismatch while being perfectly correct.
+
+There is no `--centre`. The pipeline takes a number; working out what centred
+comes to is the caller's, which for `erika-studio` is a mode that answers itself
+again whenever the print's size moves under it.
 
 ## Feeding forward: `feed`
 
