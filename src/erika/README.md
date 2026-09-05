@@ -469,17 +469,36 @@ loading they were measured against:
 
 | | |
 |---|---|
-| `DEFAULT_TOP_MARGIN_MM` | 32 mm to the first line, sheet clamped and pushed home |
+| `DEFAULT_TOP_MARGIN_MM` | 32 mm to the first line, sheet lined up against the machine's own paper mark |
 | `FEED_TAIL_MM` | 12 mm of sheet must remain below the print line to keep feeding forward |
 | `REWIND_TAIL_MM` | 50 mm must remain to be able to wind back |
 | `deepest_printable_line()` | line 59 on A4 — the ceiling on an ordinary print |
 | `deepest_rewindable_line()` | line 50 — the ceiling on a print that must be wound back, i.e. on more than one type wheel |
 
+**The top margin is a default, not a limit.** 32 mm is where a sheet comes to rest
+against the mark the machine provides, which is what anybody does without thinking
+about it — and it is the loading every sheet here was measured with, so it is the
+one to reproduce if the readings are to be compared. But the paper can be clamped
+anywhere: pushed further through, the first line lands at the very top of the
+sheet and essentially the whole height is printable. That is worth real lines,
+because both tails are measured from the *bottom* edge and do not move with the
+loading:
+
+| loading | printable to | rewindable to |
+|---|---|---|
+| against the paper mark | line 59 (60 lines) | line 50 (51 lines) |
+| clamped to the top edge | line 67 (68 lines) | line 58 (59 lines) |
+
+So every function takes `top_margin_mm`, and the number is an argument with a
+default rather than a constant folded into the arithmetic. The nine lines between
+the two ceilings is the same gap either way — it is the difference of the tails,
+which no loading changes.
+
 The millimetres are what carry: the rollers are where they are, so another paper
-length or another loading moves the line numbers and not the tails. The line
-numbers are those tails worked out for A4 pushed home. `DEFAULT_PAPER_ROWS` is now
-derived from the same geometry — it used to be 60 with a comment claiming roughly
-20 mm spare at each end, which was a guess, and wrong at both ends.
+length or another loading moves the line numbers and not the tails.
+`DEFAULT_PAPER_ROWS` is derived from the same geometry — it used to be 60 with a
+comment claiming roughly 20 mm spare at each end, which was a guess, and wrong at
+both ends.
 
 ## Strike force
 

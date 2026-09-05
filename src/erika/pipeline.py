@@ -1136,8 +1136,11 @@ def cmd_rewind(args) -> int:
     print("  paper is the first suspect rather than the platen. The bands are")
     print("  stacked down the page, so no two excursions reach the same depth --")
     print("  each is labelled on the paper with the row it winds down to. Read")
-    print(f"  against a sheet pushed home ({ec.DEFAULT_TOP_MARGIN_MM:.0f} mm to the "
-          f"first line on {ec.PAPER_HEIGHT_MM:.0f} mm paper):")
+    print(f"  against a sheet at the machine's paper mark: "
+          f"{ec.DEFAULT_TOP_MARGIN_MM:.0f} mm above the first")
+    print(f"  line, {ec.PAPER_HEIGHT_MM:.0f} mm of paper. The mark is a default "
+          "and not a limit -- clamp")
+    print("  the sheet further through and every line below moves up with it.")
     trials = [(top, lines, run) for top, lines, run in bands if lines]
     floor = max(reach(top, lines) for top, lines, _ in trials)
     for top, lines, run in trials:
@@ -1325,9 +1328,11 @@ def cmd_feed(args) -> int:
     print("     sweep stands in it, and so does one on the very last line. Every")
     print("     measurement below runs straight down that one column, so none of")
     print("     them is diagonal. Line 0 is the topmost mark and the datum.")
-    print(f"     Paper figures assume a sheet pushed home: "
+    print(f"     Paper figures assume the machine's paper mark: "
           f"{ec.DEFAULT_TOP_MARGIN_MM:.0f} mm above line 0,")
-    print(f"     {ec.PAPER_HEIGHT_MM:.0f} mm of paper.")
+    print(f"     {ec.PAPER_HEIGHT_MM:.0f} mm of paper. That is a default, not a "
+          "limit -- the sheet can be")
+    print("     clamped anywhere, up to the first line at its very top edge.")
     print("       line   from line 0   from the one above   paper under it")
     # The first ruler mark past where winding back stopped working, and only the
     # first: every mark below it is past it too, and a column of arrows says
@@ -1360,7 +1365,7 @@ def cmd_feed(args) -> int:
     print("  the pipeline would know: a taller plan verifies against the mockup,")
     print("  uploads, and types its last lines onto paper the platen is no longer")
     print("  placing.")
-    print("\n  Measured once already, on A4 pushed home:")
+    print("\n  Measured once already, on A4 loaded at the paper mark:")
     print(f"    line {ec.deepest_printable_line():>2}  the rollers let go, about "
           f"{ec.FEED_TAIL_MM} mm of sheet left. The ceiling")
     print("          on an ordinary print.")
@@ -1368,8 +1373,11 @@ def cmd_feed(args) -> int:
           f"working, about {ec.REWIND_TAIL_MM} mm left. The ceiling")
     print("          on a print that has to be wound back -- more than one wheel.")
     print("  The millimetres are what carry to another paper length or loading;")
-    print("  the line numbers are those figures on this one. See erika_codes\'")
-    print('  "Where the paper sits".')
+    print("  the line numbers are those figures on this one. Clamp the sheet")
+    print(f"  further through and both gain: at the top edge they are "
+          f"{ec.deepest_printable_line(top_margin_mm=0)} and "
+          f"{ec.deepest_rewindable_line(top_margin_mm=0)}.")
+    print("  See erika_codes\' \"Where the paper sits\".")
     return 0
 
 
@@ -2355,8 +2363,9 @@ def build_parser() -> argparse.ArgumentParser:
     ar.add_argument("--rows", type=int, default=DEFAULT_PAPER_ROWS,
                     help=f"lines to mark out; the machine has no vertical limit, "
                          f"only the paper does (default {DEFAULT_PAPER_ROWS}, "
-                         f"every line that lands on A4 below a "
-                         f"{ec.DEFAULT_TOP_MARGIN_MM:.0f} mm top margin). The "
+                         f"every line that lands on A4 below the "
+                         f"{ec.DEFAULT_TOP_MARGIN_MM:.0f} mm the paper mark "
+                         f"leaves -- clamp the sheet higher and more fit). The "
                          f"rollers let go around line "
                          f"{ec.deepest_printable_line()}, and a sheet that has "
                          f"to be wound back is done at line "

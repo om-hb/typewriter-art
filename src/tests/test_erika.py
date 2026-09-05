@@ -1508,6 +1508,28 @@ def test_a_sheet_can_be_fed_forward_far_past_where_it_can_be_wound_back():
     assert ec.deepest_printable_line() - ec.deepest_rewindable_line() == 9
 
 
+def test_the_top_margin_is_a_default_and_the_whole_sheet_can_be_used():
+    """32 mm is where the paper mark puts a sheet, not where the machine must start.
+
+    The distinction is worth a test because the constant is the kind of figure
+    that gets read as a limit, and reading it that way costs eight lines of A4 --
+    the paper can be clamped anywhere, including with the first line at the very
+    top edge. Both tails are measured from the *bottom* edge, so they do not move
+    with the loading: pushing the sheet further through gains lines at the top and
+    loses none at the bottom.
+    """
+    at_mark = ec.deepest_printable_line()
+    at_top = ec.deepest_printable_line(top_margin_mm=0)
+    assert at_top > at_mark
+    assert at_top - at_mark == round(ec.DEFAULT_TOP_MARGIN_MM / ec.LINE_HEIGHT_MM)
+
+    # And the gap between the two ceilings is the loading's business either way:
+    # it is the difference of the tails, which no loading changes.
+    for margin in (0, 10, ec.DEFAULT_TOP_MARGIN_MM, 60):
+        gap = (ec.deepest_printable_line(top_margin_mm=margin)
+               - ec.deepest_rewindable_line(top_margin_mm=margin))
+        assert gap == 9, margin
+
 def test_a_line_can_land_on_the_sheet_after_the_rollers_have_let_go():
     """`lines_on_paper` is where ink stops falling on paper; the other two are
     where it stops falling where it was asked to. The gap is the dangerous

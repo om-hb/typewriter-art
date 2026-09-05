@@ -431,21 +431,29 @@ PAPER_WIDTH_MM = 210
 
 
 #: How far below the top edge of the sheet the first line is typed, with the
-#: paper clamped and pushed home against the black cover over the platen.
+#: paper aligned against the mark on the machine and clamped there.
 #:
-#: Measured on the machine. Typing higher is perfectly possible -- this is where
-#: a sheet comes to rest when it is simply pushed home, not a limit the machine
-#: imposes -- but it is the loading every calibration sheet in `erika.pipeline`
-#: was measured with, and the one to reproduce. Those sheets all count depth from
-#: the first line they type, so a different top margin slides every reading they
-#: give up or down the paper without changing a line number.
+#: **A default, not a limit, and the difference matters.** It is where a sheet
+#: comes to rest when it is lined up against the mark the machine provides, which
+#: is what anybody does without thinking about it -- so it is the loading every
+#: calibration sheet in `erika.pipeline` was measured with, and the one to
+#: reproduce if their readings are to be compared. But the paper can be clamped
+#: anywhere. Push it further through and the first line lands at the very top of
+#: the sheet; essentially the whole height is available to print on.
+#:
+#: Which is worth real lines, because both tails below are measured from the
+#: *bottom* edge and so do not move with the loading. On A4 a print may use 60
+#: lines against the mark and 68 clamped to the top, and may be wound back over
+#: 51 against the mark and 59 clamped to the top. Every function here takes
+#: ``top_margin_mm`` for that reason: the number is an argument with a default,
+#: never a constant folded into the arithmetic.
 DEFAULT_TOP_MARGIN_MM = 32
 
 #: How much sheet has to remain below the print line for the platen to keep
 #: feeding it *forward*, and to be able to wind it *back*. They are not the same
 #: number and they are not close, which is the whole finding.
 #:
-#: Measured on one machine, one A4 sheet, pushed home:
+#: Measured on one machine and one A4 sheet, loaded against the paper mark:
 #:
 #: - `pipeline rewind` wound back exactly -- under one platen step -- with 53 mm
 #:   of paper still below the print line, fell off the ladder's whole 0.74 mm
@@ -487,6 +495,9 @@ def lines_on_paper(top_margin_mm: float = DEFAULT_TOP_MARGIN_MM,
     what the calibration sheets lay themselves out against, on purpose -- they
     exist to find where things stop coming out right, and a default that stopped
     short of the trouble would hide it.
+
+    Depends entirely on the loading, which is the argument: against the machine's
+    paper mark an A4 sheet takes 62 lines, and clamped to its top edge, 70.
     """
     return int((paper_height_mm - top_margin_mm) / LINE_HEIGHT_MM)
 
@@ -497,10 +508,14 @@ def deepest_printable_line(top_margin_mm: float = DEFAULT_TOP_MARGIN_MM,
     """The last line an ordinary print can use, counting the first as 0.
 
     Forward feed only, which is every print this pipeline has ever made. On A4
-    pushed home that is line 59 of the 62 that would fit -- so the paper running
-    out and the platen letting go happen within three lines of each other, and
-    the old assumption of 60 was right about this by luck rather than by
-    measurement.
+    against the machine's paper mark that is line 59 of the 62 that would fit --
+    so the paper running out and the platen letting go happen within three lines
+    of each other, and the old assumption of 60 was right about this by luck
+    rather than by measurement.
+
+    Pass ``top_margin_mm`` for a sheet clamped somewhere else. The mark is only a
+    default: loaded to the top of the sheet the same paper reaches line 67,
+    because the tail is measured from the bottom edge and does not move.
     """
     return int((paper_height_mm - top_margin_mm - tail_mm) / LINE_HEIGHT_MM)
 
@@ -512,9 +527,13 @@ def deepest_rewindable_line(top_margin_mm: float = DEFAULT_TOP_MARGIN_MM,
 
     Which is to say: the ceiling on a picture typed with more than one type
     wheel, since each wheel wants a pass over the whole sheet and the second can
-    only start by winding to the top. On A4 pushed home it is line 50 against the
-    59 an ordinary print may use -- nine lines, 38 mm, that a single-wheel print
-    can have and a multi-wheel one cannot.
+    only start by winding to the top. On A4 against the machine's paper mark it
+    is line 50 against the 59 an ordinary print may use -- nine lines, 38 mm,
+    that a single-wheel print can have and a multi-wheel one cannot.
+
+    The nine lines are the gap wherever the sheet is clamped: both tails are
+    measured from the bottom edge, so loading higher moves both ceilings up
+    together rather than closing the distance between them.
     """
     return int((paper_height_mm - top_margin_mm - tail_mm) / LINE_HEIGHT_MM)
 
