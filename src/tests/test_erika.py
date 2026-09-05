@@ -12,6 +12,7 @@ import json
 import os
 import re
 import struct
+import tempfile
 
 import numpy as np
 import pytest
@@ -1095,10 +1096,10 @@ def test_print_area_brackets_reach_the_carriage_limit(tmp_path, pitch):
     operator measures it against -- a bracket one column short would quietly
     shrink every print planned from it.
     """
-    from erika.pipeline import DEFAULT_AREA_ROWS
+    from erika.pipeline import DEFAULT_PAPER_ROWS
 
     cells = _area_cells(tmp_path, "-p", str(pitch))
-    _assert_corners(cells, ec.MAX_COLUMNS[pitch], DEFAULT_AREA_ROWS)
+    _assert_corners(cells, ec.MAX_COLUMNS[pitch], DEFAULT_PAPER_ROWS)
 
 
 def test_print_area_marks_the_area_asked_for(tmp_path):
@@ -1112,6 +1113,598 @@ def test_print_area_refuses_a_width_the_carriage_cannot_reach(tmp_path):
 
     out = os.path.join(tmp_path, "area.etp")
     assert pipeline.main(["area", "-o", out, "--columns", "999"]) == 2
+    assert not os.path.exists(out)
+
+
+# ---------------------------------------------------------------------------
+# rewind: what a reverse paper feed costs in registration
+# ---------------------------------------------------------------------------
+
+
+def _rewind_bands(tmp_path, *extra: str) -> tuple[list, object]:
+    """Type the rewind sheet on the virtual machine and pick the bands out of it.
+
+    A band comes back as (staircase, rule_y): where the staircase bar sits in
+    each block, and the single height of the level rule beside it. Positions are
+    absolute 1/240" platen steps below where the paper started, which is the
+    unit the sheet is read in.
+    """
+    from erika import pipeline
+
+    out = os.path.join(tmp_path, "rewind.etp")
+    assert pipeline.main(["rewind", "-o", out, *extra]) == 0
+    job = etp.load(out)
+    machine = emulate.type_job(job, max_columns=ec.MAX_COLUMNS[job.pitch])
+    assert machine.overruns == 0, "the rewind sheet ran the carriage off the end"
+
+    block = pipeline.REWIND_BLOCK_COLS
+    inset = pipeline.REWIND_LEFT_INSET
+    bar = ec.glyph_for_char(pipeline.REWIND_BAR_CHAR).code
+
+    # In typing order, not by position: a band is a staircase followed by the
+    # rule that answers it, and with a coarse --step the staircase crosses a
+    # line boundary, so grouping by row would split a band in two.
+    bands: list[tuple[dict[int, int], int]] = []
+    stair: dict[int, int] = {}
+    rule: int | None = None
+    for imp in machine.impressions:
+        if imp.code != bar:
+            continue
+        y = imp.y * ec.PLATEN_STEPS_PER_HALF_LINE + imp.fy
+        col = imp.x // 2 - inset
+        if col % block == 0:
+            if rule is not None:  # the previous band is complete
+                bands.append((stair, rule))
+                stair, rule = {}, None
+            stair[col // block] = y
+        elif col % block == pipeline.REWIND_BAR_CELLS:
+            assert rule in (None, y), "the rule is not level"
+            rule = y
+    if rule is not None:
+        bands.append((stair, rule))
+    return bands, job
+
+
+@pytest.mark.parametrize("pitch", [10, 12])
+@pytest.mark.parametrize("mechanism", ["half-line", "fine"])
+@pytest.mark.parametrize("step", ["1", "2"])
+def test_the_rewind_sheet_nulls_at_the_centre_block(tmp_path, pitch, mechanism,
+                                                    step):
+    """On a machine that returns exactly, every trial reads zero.
+
+    This is the whole calibration in one assertion. The sheet claims that the
+    block where the staircase meets the rule is the error in platen steps, and
+    the emulator is a machine whose rewind is perfect -- so the meeting has to
+    land on the middle block, the one labelled 0. Off by one and every reading
+    taken from the paper would be off by one too, with nothing on the sheet to
+    say so.
+    """
+    from erika.pipeline import REWIND_HALF_RANGE
+
+    bands, _ = _rewind_bands(tmp_path, "-p", str(pitch), "--ladder-step", step,
+                             "--mechanism", mechanism, "--no-ladder-check")
+    assert bands, "no bands on the sheet"
+    for stair, rule_y in bands:
+        assert len(stair) == 2 * REWIND_HALF_RANGE + 1
+        nulls = [j for j, y in stair.items() if y == rule_y]
+        assert nulls == [REWIND_HALF_RANGE], (
+            f"rule meets blocks {nulls}, not the centre block "
+            f"{REWIND_HALF_RANGE} -- the sheet's labels would be wrong"
+        )
+
+
+@pytest.mark.parametrize("step", [1, 2, 4])
+def test_the_rewind_sheets_staircase_steps_by_exactly_one_block(tmp_path, step):
+    """The ladder is the unit every reading is in, so it has to be even.
+
+    --step is the only way past the range the carriage allows: there is room for
+    15 blocks at pitch 10 and no more, so reaching further than +-7/240" means
+    each block being worth more than one platen step.
+    """
+    bands, _ = _rewind_bands(tmp_path, "--ladder-step", str(step), "--no-ladder-check")
+    for stair, _ in bands:
+        heights = [stair[j] for j in sorted(stair)]
+        assert all(b - a == step for a, b in zip(heights, heights[1:])), heights
+
+
+def test_the_rewind_sheet_reverses_only_where_it_says_it_does(tmp_path):
+    """One reversal per trial, of exactly the distance the trial names.
+
+    The sheet is a measurement of a single reversal per band. A stray backwards
+    feed anywhere else -- laying out a band, reaching the labels -- would be
+    indistinguishable on paper from the answer it is trying to read.
+    """
+    from erika import pipeline
+
+    out = os.path.join(tmp_path, "rewind.etp")
+    assert pipeline.main(["rewind", "-o", out, "--lines", "30,7",
+                          "--repeat", "2"]) == 0
+    job = etp.load(out)
+    per_line = 2 * ec.PLATEN_STEPS_PER_HALF_LINE
+    ups = [(op, operand) for _, op, operand in etp.iter_ops(job.body)
+           if op in (etp.OP_UP, etp.OP_UP_FINE)]
+    assert all(op == etp.OP_UP for op, _ in ups), "half-line is the default"
+    steps = [n * ec.PLATEN_STEPS_PER_HALF_LINE for _, n in ups]
+    assert steps == [30 * per_line] * 2 + [7 * per_line] * 2, (
+        "longest first, each distance run twice, nothing else reversing"
+    )
+
+
+def test_the_rewind_ladder_check_has_no_reversal_in_it(tmp_path):
+    """The band that says what the ladder is worth cannot use the ladder's own
+    suspect mechanism to get back, so it never goes back at all."""
+    from erika import pipeline
+
+    out = os.path.join(tmp_path, "rewind.etp")
+    assert pipeline.main(["rewind", "-o", out, "--lines", "10",
+                          "--repeat", "1"]) == 0
+    job = etp.load(out)
+    ups = [op for _, op, _ in etp.iter_ops(job.body)
+           if op in (etp.OP_UP, etp.OP_UP_FINE)]
+    assert len(ups) == 1, "one trial, so one reversal -- the check band adds none"
+
+
+def test_the_rewind_ladder_check_closes_one_step_per_block(tmp_path):
+    """Its rule is a whole line below its staircase, so the gap is a wedge.
+
+    A kink in that wedge is a platen step the machine did not make, and it would
+    otherwise show up as a shifted null in every trial with nothing to blame.
+    """
+    bands, _ = _rewind_bands(tmp_path, "--lines", "10", "--repeat", "1")
+    stair, rule_y = bands[0]  # the check band is typed first
+    gaps = [rule_y - stair[j] for j in sorted(stair)]
+    assert all(b - a == -1 for a, b in zip(gaps, gaps[1:])), gaps
+    assert gaps[0] == 2 * ec.PLATEN_STEPS_PER_HALF_LINE
+
+
+@pytest.mark.parametrize("bad", [
+    # Deep enough that the staircase runs into its own labels.
+    ["--ladder-step", "7", "--lines", "40", "--no-ladder-check"],
+    # Deeper than the shortest excursion, which would have to feed backwards
+    # to reach the row it starts from.
+    ["--ladder-step", "3", "--lines", "1", "--no-ladder-check"],
+    # Past where the ladder-check band puts its rule.
+    ["--ladder-step", "3"],
+])
+def test_the_rewind_sheet_refuses_a_ladder_deeper_than_it_can_walk(tmp_path, bad):
+    """Every one of these would need a second reversal to type, and a second
+    reversal on this sheet is indistinguishable from the answer."""
+    from erika import pipeline
+
+    out = os.path.join(tmp_path, "rewind.etp")
+    assert pipeline.main(["rewind", "-o", out, *bad]) == 2
+    assert not os.path.exists(out)
+
+
+
+@pytest.mark.parametrize("step", ["1", "2"])
+def test_every_rewind_label_is_centred_on_its_own_staircase_bar(tmp_path, step):
+    """The row that carries the answer, and it is read exactly once.
+
+    Measured in half-steps, because that is what the fault was made of. A
+    staircase bar is two cells wide and a lone digit one cell, so on the column
+    grid a label with no minus sign in front of it can only sit under half its
+    bar -- and every label from zero up is a lone digit, so the positive half of
+    the row read as nudged sideways against the negative half. Off by half a
+    cell is 1.27 mm at pitch 10, on a row of fifteen near-identical bars four
+    cells apart; near a null it is enough to make you read the block next door.
+
+    So the assertion is not "under the bar" but "centred on it", to nothing --
+    which needs the carriage's own half-step, and is the same half-step every
+    layer scheme in this pipeline is built on.
+    """
+    from erika import pipeline
+
+    out = os.path.join(tmp_path, "rewind.etp")
+    assert pipeline.main(["rewind", "-o", out, "--ladder-step", step,
+                          "--lines", "10", "--repeat", "1",
+                          "--no-ladder-check"]) == 0
+    job = etp.load(out)
+    machine = emulate.type_job(job, max_columns=ec.MAX_COLUMNS[job.pitch])
+    bar = ec.glyph_for_char(pipeline.REWIND_BAR_CHAR).code
+    label_row = 2 + pipeline.REWIND_LABEL_ROW
+
+    seen = 0
+    for j in range(2 * pipeline.REWIND_HALF_RANGE + 1):
+        first = pipeline.REWIND_LEFT_INSET + j * pipeline.REWIND_BLOCK_COLS
+        # A glyph's cell runs from its x to x + 2 half-steps, so the bar's ink
+        # runs 2*REWIND_BAR_CELLS half-steps from the first cell's left edge.
+        left = 2 * first
+        centre = left + pipeline.REWIND_BAR_CELLS
+        # The widest label is three cells, so its glyphs sit within three
+        # half-steps of the centre. The next block's centre is a whole block
+        # away, which is what keeps this window off its neighbours.
+        marks = sorted(
+            imp.x for imp in machine.impressions
+            if imp.code != bar and imp.y // 2 == label_row
+            and centre - pipeline.REWIND_BLOCK_COLS < imp.x < centre + pipeline.REWIND_BLOCK_COLS
+        )
+        assert marks, f"block {j} has no label"
+        assert (marks[0] + marks[-1] + 2) / 2 == centre, (
+            f"block {j}'s label is off its bar by "
+            f"{(marks[0] + marks[-1] + 2) / 2 - centre} half-steps"
+        )
+        seen += 1
+    assert seen == 2 * pipeline.REWIND_HALF_RANGE + 1
+
+
+def test_a_rewind_label_that_needs_a_half_step_gets_one(tmp_path):
+    """The lone digits are the ones that move, and they move off the grid.
+
+    Worth pinning separately: a change that quietly rounded this row back to
+    whole columns would still centre the labels that have a sign in front of
+    them, so the test above would keep passing for eight of the fifteen blocks
+    and the sheet would go back to being half a cell out exactly where it was
+    before.
+    """
+    from erika import pipeline
+
+    out = os.path.join(tmp_path, "rewind.etp")
+    assert pipeline.main(["rewind", "-o", out, "--lines", "10", "--repeat", "1",
+                          "--no-ladder-check"]) == 0
+    job = etp.load(out)
+    machine = emulate.type_job(job, max_columns=ec.MAX_COLUMNS[job.pitch])
+    bar = ec.glyph_for_char(pipeline.REWIND_BAR_CHAR).code
+    row = 2 + pipeline.REWIND_LABEL_ROW
+    marks = [imp.x for imp in machine.impressions
+             if imp.code != bar and imp.y // 2 == row]
+    assert any(x % 2 for x in marks), "no label is placed off the cell grid"
+    assert all(imp.x % 2 == 0 for imp in machine.impressions if imp.code == bar), (
+        "the bars themselves must stay on the grid -- the ladder is the picture"
+    )
+
+def _typed_rows(job) -> dict[int, str]:
+    """What the sheet says, row by row, as the emulator reads it back off paper."""
+    machine = emulate.type_job(job, max_columns=ec.MAX_COLUMNS[job.pitch])
+    chars = {g.code: g.char for g in ec.GLYPHS}
+    rows: dict[int, dict[int, str]] = {}
+    for imp in machine.impressions:
+        rows.setdefault(imp.y // 2, {})[imp.x // 2] = chars.get(imp.code, "?")
+    out = {}
+    for row, cells in rows.items():
+        line = "".join(cells.get(col, " ") for col in range(max(cells) + 1))
+        out[row] = line
+    return out
+
+
+def test_each_rewind_band_says_on_the_paper_how_deep_it_winds(tmp_path):
+    """The one thing needed to tell a bad platen from a sheet that slipped.
+
+    The bands are stacked down the page and each excursion starts from its own
+    band, so no two reach the same depth -- the last trial of the longest
+    distance goes furthest, and by more than the difference between the
+    distances. A band that reads off the end while every other band reads zero is
+    then a fact about the paper rather than about the platen, and the way to see
+    that is to know which band went deepest. Off the paper, that inference needs
+    the layout arithmetic in front of you; on it, it is a glance.
+    """
+    from erika import pipeline
+    from erika.pipeline import REWIND_BAND_ROWS, REWIND_LADDER_ROW
+
+    out = os.path.join(tmp_path, "rewind.etp")
+    assert pipeline.main(["rewind", "-o", out, "--lines", "40",
+                          "--repeat", "2", "--no-ladder-check"]) == 0
+    rows = _typed_rows(etp.load(out))
+    for run in (1, 2):
+        top = 2 + (run - 1) * REWIND_BAND_ROWS
+        assert f"TO ROW {top + REWIND_LADDER_ROW + 40}" in rows[top], rows[top]
+    # And they differ, which is the whole reason to print them.
+    assert rows[2] != rows[2 + REWIND_BAND_ROWS]
+
+
+def test_the_rewind_advice_lists_the_depths_and_names_the_deepest(capsys):
+    """The advice is what the studio shows verbatim, so the reasoning lives here.
+
+    Not in TypeScript, and not only in a commit message: this was worked out
+    from a sheet that had already been typed, and the sheet it was worked out
+    from could not say it.
+    """
+    from erika import pipeline
+    from erika.pipeline import REWIND_BAND_ROWS, REWIND_LADDER_ROW
+
+    with tempfile.TemporaryDirectory() as tmp:
+        assert pipeline.main(["rewind", "-o", os.path.join(tmp, "r.etp"),
+                              "--lines", "40,10", "--repeat", "2",
+                              "--no-ladder-check"]) == 0
+    advice = capsys.readouterr().out
+    depths = [
+        2 + i * REWIND_BAND_ROWS + REWIND_LADDER_ROW + lines
+        for i, lines in enumerate((40, 40, 10, 10))
+    ]
+    for at in depths:
+        assert f"to line {at:>3}" in advice, at
+    assert advice.count("<- deepest") == 1
+    deepest = [line for line in advice.splitlines()
+               if f"to line {max(depths):>3}" in line]
+    assert deepest and "<- deepest" in deepest[0], deepest
+    # Which is not the longest distance's first run, and that is the point.
+    assert max(depths) != depths[0]
+
+
+def test_the_rewind_sheet_stays_on_the_paper(tmp_path):
+    """An excursion reaches further down the sheet than anything typed on it.
+
+    The bands are short and the rewind is long, so the sheet's height is set by
+    how far the first trial's excursion travels below its own band -- not by the
+    rows it marks. Getting that wrong would run the platen off the paper in the
+    middle of the one motion being measured.
+    """
+    from erika import pipeline
+    from erika.pipeline import REWIND_BAND_ROWS, REWIND_LADDER_ROW
+
+    out = os.path.join(tmp_path, "rewind.etp")
+    assert pipeline.main(["rewind", "-o", out, "--lines", "40",
+                          "--repeat", "1", "--no-ladder-check"]) == 0
+    job = etp.load(out)
+    deepest = 2 + REWIND_LADDER_ROW + 40 + 1
+    assert job.rows == deepest, (
+        f"header claims {job.rows} lines but the excursion reaches {deepest}"
+    )
+    assert job.rows > 2 + REWIND_BAND_ROWS, "the marks alone are much shorter"
+
+
+def test_the_rewind_sheet_refuses_what_will_not_fit(tmp_path):
+    """Better to say so than to wind the paper out of the platen mid-trial."""
+    from erika import pipeline
+
+    out = os.path.join(tmp_path, "rewind.etp")
+    assert pipeline.main(["rewind", "-o", out, "--lines", "200"]) == 2
+    assert not os.path.exists(out)
+
+
+@pytest.mark.parametrize("bad", [["--half-range", "99"], ["--lines", "0"],
+                                 ["--repeat", "0"], ["--ladder-step", "0"]])
+def test_the_rewind_sheet_refuses_a_ladder_it_cannot_type(tmp_path, bad):
+    """Too wide for the carriage, or too deep to walk down without reversing.
+
+    --lines 0 is the one that looks reasonable and is not: a band with no rewind
+    would have to climb back up to its rule, and the climb is the thing under
+    test. That is why the ladder check is a separate band with its own geometry.
+    """
+    from erika import pipeline
+
+    out = os.path.join(tmp_path, "rewind.etp")
+    assert pipeline.main(["rewind", "-o", out, *bad]) == 2
+    assert not os.path.exists(out)
+
+
+
+
+# ---------------------------------------------------------------------------
+# where the paper sits
+# ---------------------------------------------------------------------------
+
+
+def test_the_paper_geometry_agrees_with_what_the_two_sheets_measured():
+    """The arithmetic and the paper have to give the same answer.
+
+    Three independent things meet here. `DEFAULT_TOP_MARGIN_MM` is a ruler held
+    against a sheet pushed home; `REWIND_TAIL_MM` is where `pipeline rewind` fell
+    off its ladder; `FEED_TAIL_MM` is where `pipeline feed` ran out of grip. Put
+    together they say an A4 sheet is rewindable to line 50 and printable to line
+    59 -- and the sheets that were typed read line 50 clean, line 51 out by four
+    platen steps, and forward feed true to about 12 mm from the bottom edge. If a
+    later measurement moves any of the three, this is the check that they still
+    describe one machine.
+    """
+    assert ec.deepest_rewindable_line() == 50
+    assert ec.deepest_printable_line() == 59
+    # The last rewind line measured good, and the first that was not.
+    assert ec.paper_under_line_mm(50) > ec.REWIND_TAIL_MM
+    assert ec.paper_under_line_mm(51) < ec.REWIND_TAIL_MM
+
+
+def test_a_sheet_can_be_fed_forward_far_past_where_it_can_be_wound_back():
+    """The finding the two sheets exist to separate, and it is not a small gap.
+
+    Going forward the platen needs friction and nothing else; winding back has to
+    draw the trailing edge into the nip again, and once it is past the guides
+    there is nothing to draw it against. So an ordinary print may use nine more
+    lines than one that has to be wound back -- which is to say than a picture
+    typed with more than one type wheel.
+    """
+    assert ec.FEED_TAIL_MM < ec.REWIND_TAIL_MM
+    assert ec.deepest_rewindable_line() < ec.deepest_printable_line()
+    assert ec.deepest_printable_line() - ec.deepest_rewindable_line() == 9
+
+
+def test_a_line_can_land_on_the_sheet_after_the_rollers_have_let_go():
+    """`lines_on_paper` is where ink stops falling on paper; the other two are
+    where it stops falling where it was asked to. The gap is the dangerous
+    region -- the machine types there quite happily, the plan verifies, and
+    nothing says the paper was not being held."""
+    assert ec.deepest_printable_line() < ec.lines_on_paper()
+
+
+@pytest.mark.parametrize("deepest", [ec.deepest_printable_line,
+                                     ec.deepest_rewindable_line])
+def test_the_paper_figures_move_with_the_loading_and_the_tails_do_not(deepest):
+    """Why the sheets quote millimetres under the line and not just a line number.
+
+    Load the sheet higher and every line number gains; feed a longer sheet and
+    they gain again. What does not move is how much paper has to be left
+    underneath, because that is where the feed rollers are -- so it is the figure
+    that carries from one machine or paper to another.
+    """
+    tail = ec.paper_under_line_mm(deepest())
+    higher = deepest(top_margin_mm=10)
+    longer = deepest(paper_height_mm=420)  # A3
+    assert higher > deepest() and longer > deepest()
+    for line, margin, height in ((higher, 10, 297), (longer, 32, 420)):
+        under = ec.paper_under_line_mm(line, margin, height)
+        assert abs(under - tail) < ec.LINE_HEIGHT_MM
+
+
+def test_the_paper_row_default_is_derived_and_not_chosen():
+    """It was 60 with a comment claiming 20 mm spare at each end, and the top
+    margin turned out to be 32 -- so the number was a guess, wrong at both ends,
+    and three sheets were laid out against it."""
+    from erika.pipeline import DEFAULT_PAPER_ROWS
+
+    assert DEFAULT_PAPER_ROWS == ec.lines_on_paper()
+    # Past both limits the paper has, on purpose: these sheets are for finding
+    # where things stop being right, and stopping short of it would hide it.
+    assert DEFAULT_PAPER_ROWS > ec.deepest_printable_line()
+    assert DEFAULT_PAPER_ROWS > ec.deepest_rewindable_line()
+    assert ec.paper_under_line_mm(DEFAULT_PAPER_ROWS) >= 0
+
+
+@pytest.mark.parametrize("sheet", ["rewind", "feed"])
+def test_both_paper_sheets_say_where_their_depths_fall_on_the_sheet(capsys, sheet):
+    """A line number is only a depth once you know where the paper starts."""
+    from erika import pipeline
+
+    with tempfile.TemporaryDirectory() as tmp:
+        assert pipeline.main([sheet, "-o", os.path.join(tmp, "s.etp")]) == 0
+    advice = capsys.readouterr().out
+    assert f"{ec.DEFAULT_TOP_MARGIN_MM:.0f} mm" in advice
+    assert "paper" in advice and "under it" in advice
+    assert f"{ec.REWIND_TAIL_MM:.0f} mm" in advice
+    assert f"{ec.FEED_TAIL_MM:.0f} mm" in advice
+
+
+# ---------------------------------------------------------------------------
+# feed: how far down the sheet the paper still feeds true
+# ---------------------------------------------------------------------------
+
+
+def _feed_marks(tmp_path, *extra: str):
+    """Type the forward-feed sheet; return {line: {bar columns}} and the job.
+
+    A set per line rather than one column, because the last line carries two: its
+    own sweep mark and a mark in the ruler column.
+    """
+    from erika import pipeline
+
+    out = os.path.join(tmp_path, "feed.etp")
+    assert pipeline.main(["feed", "-o", out, *extra]) == 0
+    job = etp.load(out)
+    machine = emulate.type_job(job, max_columns=ec.MAX_COLUMNS[job.pitch])
+    assert machine.overruns == 0, "the feed sheet ran the carriage off the end"
+    bar = ec.glyph_for_char(pipeline.FEED_BAR_CHAR).code
+    marks: dict[int, set[int]] = {}
+    for imp in machine.impressions:
+        if imp.code == bar:
+            # A bar is FEED_BAR_CELLS wide; its leftmost cell is its position,
+            # and the cells after it are the same mark.
+            marks.setdefault(imp.y // 2, set()).add(imp.x // 2)
+    for line, cols in marks.items():
+        marks[line] = {c for c in cols if c - 1 not in cols}
+    return marks, job
+
+
+def test_the_feed_sheet_never_winds_the_paper_back(tmp_path):
+    """The whole of what makes it a different measurement from `rewind`.
+
+    That sheet asks what a reversal costs and cannot separate it from what the
+    paper does at depth. This one removes the reversal, so anything wrong with it
+    is the forward feed -- which is the motion every print is made of. One
+    backwards step anywhere would put the two questions back together.
+    """
+    _, job = _feed_marks(tmp_path)
+    back = [etp.OPCODE_NAMES[op] for _, op, _ in etp.iter_ops(job.body)
+            if op in (etp.OP_UP, etp.OP_UP_FINE, etp.OP_MICRO_UP)]
+    assert back == [], f"the feed sheet reverses the platen: {back}"
+
+
+def test_the_topmost_mark_on_the_feed_sheet_is_line_zero(tmp_path):
+    """Because whoever reads the sheet will use it as the datum whatever we say.
+
+    The advice quotes distances down from the first mark, so the first mark has
+    to be the line the advice calls first. It was line 1 for a while, with line 0
+    given over to the title -- which made every figure in the advice a line out
+    from what anybody would actually measure, and there is nothing on paper to
+    say so. The title shares line 0 instead.
+    """
+    from erika.pipeline import FEED_MARGIN_COLS
+
+    marks, job = _feed_marks(tmp_path)
+    assert min(marks) == 0, "nothing is typed on line 0"
+    assert FEED_MARGIN_COLS in marks[0], "line 0's mark is not in the ruler column"
+    assert sorted(marks) == list(range(job.rows)), "one mark per line, line 0 up"
+
+
+@pytest.mark.parametrize("pitch", [10, 12])
+@pytest.mark.parametrize("sweeps", ["3", "6", "10"])
+def test_the_feed_sheets_marks_lie_on_straight_sweeps(tmp_path, pitch, sweeps):
+    """The reading is 'is this line straight', so on a perfect machine it is.
+
+    Straightness here is a property of the *columns*, since the emulator feeds a
+    true line every time: mark n of a sweep stands a fixed number of columns right
+    of mark n-1, and every sweep starts again at the margin. A sweep whose step
+    wandered would read as a feed fault on paper that was really a fault in the
+    sheet.
+    """
+    from erika.pipeline import FEED_MARGIN_COLS, feed_layout
+
+    marks, job = _feed_marks(tmp_path, "-p", str(pitch), "--sweeps", sweeps)
+    per_sweep, step, width = feed_layout(job.rows, int(sweeps), pitch)
+    for line, cols in marks.items():
+        want = FEED_MARGIN_COLS + (line % per_sweep) * step
+        assert want in cols, f"line {line} has no mark at column {want}: {cols}"
+    assert max(max(cols) for cols in marks.values()) + 1 < width
+    assert width <= ec.MAX_COLUMNS[pitch]
+
+
+def test_the_feed_sheets_ruler_column_reaches_the_last_line(tmp_path):
+    """The second reading, and the fix for a third that could not be taken.
+
+    The advice used to quote the distance from the topmost mark to the bottommost
+    one. Those are in different columns -- 122 mm apart at the default layout --
+    so a rule laid between them measures the diagonal and reads 274 mm where the
+    vertical distance is 246. The ruler column is the answer: every mark in it is
+    in one column, so every measurement down it is vertical, and it now reaches
+    the last line rather than stopping a sweep short of the bottom.
+    """
+    from erika.pipeline import FEED_MARGIN_COLS, feed_layout
+
+    marks, job = _feed_marks(tmp_path)
+    per_sweep, _, _ = feed_layout(job.rows, 6, job.pitch)
+    ruler = sorted(line for line, cols in marks.items()
+                   if FEED_MARGIN_COLS in cols)
+    assert ruler == sorted(set(range(0, job.rows, per_sweep)) | {job.rows - 1})
+    assert ruler[-1] == job.rows - 1, "the ruler stops short of the bottom"
+    # Every gap but the last is a whole sweep; the last is what is left over.
+    gaps = [b - a for a, b in zip(ruler, ruler[1:])]
+    assert set(gaps[:-1]) == {per_sweep} and 0 < gaps[-1] <= per_sweep
+
+
+def test_every_feed_ruler_mark_is_named_on_the_sheet(tmp_path):
+    """A gap out of step is worth nothing if the lines it lies between are not
+    named -- and a ruler line need not fall on the every-fifth-line rule."""
+    from erika import pipeline
+    from erika.pipeline import FEED_MARGIN_COLS, FEED_LABEL_EVERY
+
+    out = os.path.join(tmp_path, "feed.etp")
+    assert pipeline.main(["feed", "-o", out]) == 0
+    job = etp.load(out)
+    rows = _typed_rows(job)
+    marks, _ = _feed_marks(tmp_path)
+    ruler = [line for line, cols in marks.items() if FEED_MARGIN_COLS in cols]
+    for line in ruler:
+        assert rows[line].lstrip().startswith(str(line)), rows[line]
+    assert any(line % FEED_LABEL_EVERY for line in ruler)
+
+
+def test_the_feed_sheet_counts_lines_the_way_the_rewind_sheet_does(tmp_path):
+    """Both count from the first thing typed, so a depth from one sheet is a line
+    number on the other. Two sheets measuring the same paper in two units would
+    make the comparison they exist for an arithmetic exercise."""
+    marks, job = _feed_marks(tmp_path, "--rows", "30")
+    assert job.rows == 30
+    assert min(marks) == 0 and max(marks) == 29
+
+
+@pytest.mark.parametrize("bad", [["--rows", "4", "--sweeps", "9"],
+                                 ["--sweeps", "0"],
+                                 ["--rows", "1"]])
+def test_the_feed_sheet_refuses_a_layout_that_would_measure_nothing(tmp_path, bad):
+    """Two marks are a straight line whatever the platen did, so a sweep of two
+    is not a reading -- it is a sheet that always passes."""
+    from erika import pipeline
+
+    out = os.path.join(tmp_path, "feed.etp")
+    assert pipeline.main(["feed", "-o", out, *bad]) == 2
     assert not os.path.exists(out)
 
 
@@ -1550,14 +2143,14 @@ def test_the_whole_usable_range_fits_one_sheet_at_a_coarse_enough_step(tmp_path)
     0x00..0xFF is a sweep of 0x00..MAX_FORCE with a note saying what it dropped.
     That is still more than one sheet of paper.
     """
-    from erika.pipeline import DEFAULT_AREA_ROWS
+    from erika.pipeline import DEFAULT_PAPER_ROWS
 
     _, fine = _probe_forces(tmp_path, "fine.etp", "--from", "0x00", "--to", "0xFF")
     _, coarse = _probe_forces(tmp_path, "coarse.etp",
                               "--from", "0x00", "--to", "0xFF", "--step", "16")
 
-    assert fine.rows > DEFAULT_AREA_ROWS  # more than one sheet of paper
-    assert coarse.rows <= DEFAULT_AREA_ROWS  # one
+    assert fine.rows > DEFAULT_PAPER_ROWS  # more than one sheet of paper
+    assert coarse.rows <= DEFAULT_PAPER_ROWS  # one
 
 
 def test_a_step_is_a_stride_so_it_cannot_be_zero_or_negative(tmp_path):

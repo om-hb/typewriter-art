@@ -308,6 +308,10 @@ erika.pipeline forces     sweep the strike-force command to see what it takes,
                           and --from-scan to read the sheet back as a curve
                           (--from/--to/--step to widen it and keep it to a sheet)
 erika.pipeline codes      probe the control codes the pipeline does not use yet
+erika.pipeline rewind     measure what a reverse paper feed costs in registration
+                          (--lines, --repeat, --ladder-step, --mechanism)
+erika.pipeline feed       how far down the sheet the paper still feeds true
+                          (--rows, --sweeps)
 
 erika.send <file.etp>     upload over USB serial   (--port, --print, --watch)
 erika.send --diagnose     test the link step by step
@@ -315,6 +319,167 @@ erika.send -c STATUS      talk to the device without uploading
 erika.send --list-ports   show the serial ports
 erika.etp <file.etp>      disassemble a print job
 ```
+
+## Winding the paper back: `rewind`
+
+Everything the planner emits feeds the paper forward, and `build_plan` sorts the
+strikes to keep it that way because reversing the feed introduces backlash. That
+rule is what stands between this pipeline and a print typed with more than one
+type wheel: a wheel is changed by hand, so each wheel wants a complete pass over
+the whole sheet, and the second pass can only begin by winding the paper back to
+the top. Whether that is worth building turns on one number — how far off the
+paper lands when it comes back.
+
+```bash
+python -m erika.pipeline rewind
+python -m erika.send results/rewind.etp --port /dev/cu.usbmodem1101 --print
+```
+
+The sheet is a vernier, so it is read by eye and not by scanner. Each band is
+typed in two passes with the rewind between them:
+
+| pass | what it types |
+|---|---|
+| 1 | a staircase of `_` bars, one 1/240" platen step lower each block |
+| — | down `--lines` lines and back up again: the reversal under test |
+| 2 | one level rule of `_` bars, half the staircase's span below the row the staircase started on |
+
+Under each block is the number it would mean, centred on that block's staircase
+bar — a number under its own bar needs no counting along fifteen near-identical
+ones four cells apart.
+
+Centred *exactly*, which the cell grid cannot do: a bar is two cells wide and a
+lone digit is one, so on whole columns a label with no minus sign in front of it
+can only sit under half its bar. Every label from zero up is a lone digit, so the
+positive half of the row read as nudged sideways against the negative half, by
+1.27 mm at pitch 10 — enough, next to a null, to make you read the block next
+door. So the label row is placed in half-steps rather than columns, using the
+same half-step every layer scheme in this pipeline is built on. The band also
+carries one spare column at its left, for the minus of the most negative block to
+hang into.
+
+On a machine that returns exactly, the rule crosses the staircase at the middle
+block. Where it actually crosses is the error, and every block carries the number
+it would mean. Positive is the paper coming back short, which is the only
+direction backlash can err in.
+
+Everything else on the sheet feeds forward. That is not tidiness: a second
+reversal anywhere would be indistinguishable on paper from the answer, so
+`_feed_down` refuses a negative move rather than obliging it, and a test asserts
+that the job contains exactly one `UP` per band.
+
+### Reading it
+
+- **`0` in every band.** The platen returns exactly, and printing with more than
+  one wheel is a question of planning rather than of mechanism.
+- **The same positive number at 10, 20 and 40 lines.** Backlash: a fixed slop
+  that a second pass can simply wind past by that much.
+- **A number that grows with the distance.** Slip, and it cannot be corrected —
+  only measured again for every distance.
+- **Two runs of the same distance reading differently.** The answer that ends the
+  idea. An error that is not repeatable cannot be planned around at all.
+- **One band off and the rest at 0.** Not the platen. Backlash misses on every band
+  alike and slip misses more as the distance grows; neither can miss once. The
+  bands are stacked down the page and each excursion starts from its own band, so
+  no two reach the same depth — and the likeliest cause is the sheet's bottom edge
+  leaving the feed rollers at the bottom of that one excursion. Which band went
+  deepest is printed with the advice and typed on the band itself, as `TO ROW n`.
+  That is a fact about the paper and how it was fed: `area` measures how far down
+  the platen still holds yours, a print inside that can be wound back, and one
+  that runs past it cannot.
+- **No block lines up anywhere.** The error is past the ladder's reach.
+  `--ladder-step 2` doubles the range and halves the resolution; run it coarse
+  first and come back.
+
+For scale: one step is 1/240", a half-cell layer offset is 20 of them, and a
+whole line is 40. An error of 20 puts the second wheel's ink exactly where the
+first wheel's half-line layer already went.
+
+The first band has no rewind in it. It types the same staircase and then a rule a
+whole line below, so the gap closes by exactly one step per block — a straight
+wedge if the ladder is even, a kink where it is not. It has to be a separate band
+with its own geometry: a trial with a zero-line rewind would still have to climb
+back up to its rule, and the climb is the thing under test.
+
+What the sheet does not measure is the carriage. Its return to the left margin is
+exercised by every row of every print already; the platen coming back up a whole
+image is the motion nothing in this pipeline has ever made.
+
+## Feeding forward: `feed`
+
+The other half of `rewind`, and the half that touches every print. That sheet can
+find the platen exact and still fail near the bottom of the paper — because a
+sheet whose bottom edge has left the feed rollers is not being placed by anything.
+But a sheet that has lost its rollers can still be dragged roughly along in one
+direction, so whether a plain forward-feeding print goes wrong at the same depth
+is a separate question, and the larger one: every print feeds down to its last
+line, so if it does, the bottom of a tall print lands wherever the paper went —
+with the plan verified against the mockup, the CRC passing, and nothing saying so.
+
+```bash
+python -m erika.pipeline feed
+python -m erika.send results/feed.etp --port /dev/cu.usbmodem1101 --print
+```
+
+Nothing on it ever winds back — a test asserts the job contains no reversing
+opcode at all, because one would put the two questions back together. One bar per
+line, its column stepping across the page, so a run of lines lays its marks along
+a straight line. A line placed short or long lies off that line, and because the
+run is shallow it shows nearly its whole error rather than half of it: a mark
+misplaced by `e` lies `e·dx/hypot(dx, dy)` off the line, which is why `--sweeps`
+exists. More sweeps, fewer lines in each, further across for every line down.
+
+Three readings come out of the one pattern:
+
+| | what it catches |
+|---|---|
+| each sweep is straight | a line the platen placed short or long — a kink names it, and the margin numbers every fifth line say which |
+| the ruler column is evenly spaced | the first mark of every sweep stands in the left margin column, a known number of lines apart. A feed that shortens *gradually* bends no sweep at all and closes these up |
+| line 0 to the last line, down that column | the absolute check, for a steel rule. The other two compare the sheet with itself, so a feed wrong by the same fraction throughout would pass both |
+
+**Every measurement runs down the ruler column**, and that is not incidental. The
+topmost and bottommost *sweep* marks are in different columns — 122 mm apart at
+the default layout — so a rule laid between them reads the diagonal: 274 mm where
+the vertical distance is 246. The ruler column has a mark on line 0, on the first
+line of every sweep, and on the last line of the sheet, so no reading it asks for
+is diagonal and none stops short of the bottom.
+
+**Line 0 is the topmost mark**, and it shares its line with the title rather than
+the title having a line of its own. Whoever reads the sheet takes the topmost mark
+as the datum, because it is the only thing on the sheet that could be one — so an
+advice note calling some other line "the first line" is a note nobody can act on,
+and every figure in it is a line out from what anybody would actually measure.
+
+Feed the paper as it was fed for `rewind`, or the two do not compare: the depth at
+issue belongs to the sheet and its loading, not to the machine. Both sheets count
+lines below the first thing typed, so a depth read off one is a line number on the
+other.
+
+**What it decided, the first time it was typed.** Forward feed ran true to about
+12 mm from the bottom edge of the sheet, which is roughly where the rollers let go
+altogether. Winding back had stopped working with 49 mm still under the print
+line. So the two are not the same limit and are not close: a sheet whose trailing
+edge is nearly out can still be *pushed* along and cannot be *pulled* back —
+forward the platen needs friction and nothing else, while winding back has to draw
+the trailing edge into the nip again, and past the guides there is nothing to draw
+it against.
+
+Both numbers now live in `erika_codes` under **"Where the paper sits"**, with the
+loading they were measured against:
+
+| | |
+|---|---|
+| `DEFAULT_TOP_MARGIN_MM` | 32 mm to the first line, sheet clamped and pushed home |
+| `FEED_TAIL_MM` | 12 mm of sheet must remain below the print line to keep feeding forward |
+| `REWIND_TAIL_MM` | 50 mm must remain to be able to wind back |
+| `deepest_printable_line()` | line 59 on A4 — the ceiling on an ordinary print |
+| `deepest_rewindable_line()` | line 50 — the ceiling on a print that must be wound back, i.e. on more than one type wheel |
+
+The millimetres are what carry: the rollers are where they are, so another paper
+length or another loading moves the line numbers and not the tails. The line
+numbers are those tails worked out for A4 pushed home. `DEFAULT_PAPER_ROWS` is now
+derived from the same geometry — it used to be 60 with a comment claiming roughly
+20 mm spare at each end, which was a guess, and wrong at both ends.
 
 ## Strike force
 

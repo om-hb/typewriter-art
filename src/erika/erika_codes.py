@@ -418,6 +418,125 @@ def cell_aspect(pitch: int) -> float:
 
 
 # --------------------------------------------------------------------------
+# Where the paper sits
+# --------------------------------------------------------------------------
+# Everything above is the machine's own geometry and holds whatever is loaded.
+# What follows is the paper's, and it means nothing without a way of loading the
+# paper -- so the loading is written down here beside the numbers rather than
+# left as the thing everyone assumed.
+
+#: The sheet this machine is fed.
+PAPER_HEIGHT_MM = 297  # A4
+PAPER_WIDTH_MM = 210
+
+
+#: How far below the top edge of the sheet the first line is typed, with the
+#: paper clamped and pushed home against the black cover over the platen.
+#:
+#: Measured on the machine. Typing higher is perfectly possible -- this is where
+#: a sheet comes to rest when it is simply pushed home, not a limit the machine
+#: imposes -- but it is the loading every calibration sheet in `erika.pipeline`
+#: was measured with, and the one to reproduce. Those sheets all count depth from
+#: the first line they type, so a different top margin slides every reading they
+#: give up or down the paper without changing a line number.
+DEFAULT_TOP_MARGIN_MM = 32
+
+#: How much sheet has to remain below the print line for the platen to keep
+#: feeding it *forward*, and to be able to wind it *back*. They are not the same
+#: number and they are not close, which is the whole finding.
+#:
+#: Measured on one machine, one A4 sheet, pushed home:
+#:
+#: - `pipeline rewind` wound back exactly -- under one platen step -- with 53 mm
+#:   of paper still below the print line, fell off the ladder's whole 0.74 mm
+#:   reach with 49 mm below it, and was out by 50 mm by the time 20 mm was left.
+#: - `pipeline feed` fed forward true all the way to 12 mm from the bottom edge,
+#:   which is about where the rollers let go of the sheet altogether. All three
+#:   of its readings passed and they fail in different ways, which is why there
+#:   are three: a straightedge lay flat along every sweep (no line placed short
+#:   or long anywhere), the ruler column measured 42.2-42.3 mm against 42.33
+#:   nominal at every gap including the lowest (no feed shortening gradually,
+#:   which bends no sweep and so would pass the first reading), and the last mark
+#:   landed where it should (no error of a constant fraction, which would pass
+#:   both of the others).
+#:
+#:   Measured to line 59 and no further, which is where the sheet stopped. So
+#:   FEED_TAIL_MM is the edge of what was checked rather than an extrapolation
+#:   past it -- print lower than this and nobody has looked.
+#:
+#: So a sheet whose trailing edge is nearly out can still be *pushed* along, and
+#: cannot be *pulled* back: going forward the platen needs friction and nothing
+#: else, while winding back has to draw the trailing edge into the nip again, and
+#: once it is past the guides there is nothing to draw it against.
+#:
+#: **These are the figures that carry, and the line numbers are not.** The
+#: rollers are where they are, so another paper length or another loading changes
+#: which line is the last good one but not how much paper has to be underneath
+#: it. One machine and one sheet, though: the two sheets above are how to
+#: re-answer both for another.
+FEED_TAIL_MM = 12
+REWIND_TAIL_MM = 50
+
+
+def lines_on_paper(top_margin_mm: float = DEFAULT_TOP_MARGIN_MM,
+                   paper_height_mm: float = PAPER_HEIGHT_MM) -> int:
+    """The last line whose ink would land on the sheet, counting the first as 0.
+
+    A ceiling and not an answer: it takes no account of the sheet having to be
+    held to be typed on, so it is always past `deepest_printable_line`. It is
+    what the calibration sheets lay themselves out against, on purpose -- they
+    exist to find where things stop coming out right, and a default that stopped
+    short of the trouble would hide it.
+    """
+    return int((paper_height_mm - top_margin_mm) / LINE_HEIGHT_MM)
+
+
+def deepest_printable_line(top_margin_mm: float = DEFAULT_TOP_MARGIN_MM,
+                           paper_height_mm: float = PAPER_HEIGHT_MM,
+                           tail_mm: float = FEED_TAIL_MM) -> int:
+    """The last line an ordinary print can use, counting the first as 0.
+
+    Forward feed only, which is every print this pipeline has ever made. On A4
+    pushed home that is line 59 of the 62 that would fit -- so the paper running
+    out and the platen letting go happen within three lines of each other, and
+    the old assumption of 60 was right about this by luck rather than by
+    measurement.
+    """
+    return int((paper_height_mm - top_margin_mm - tail_mm) / LINE_HEIGHT_MM)
+
+
+def deepest_rewindable_line(top_margin_mm: float = DEFAULT_TOP_MARGIN_MM,
+                            paper_height_mm: float = PAPER_HEIGHT_MM,
+                            tail_mm: float = REWIND_TAIL_MM) -> int:
+    """The last line a print can use *if the paper has to be wound back*.
+
+    Which is to say: the ceiling on a picture typed with more than one type
+    wheel, since each wheel wants a pass over the whole sheet and the second can
+    only start by winding to the top. On A4 pushed home it is line 50 against the
+    59 an ordinary print may use -- nine lines, 38 mm, that a single-wheel print
+    can have and a multi-wheel one cannot.
+    """
+    return int((paper_height_mm - top_margin_mm - tail_mm) / LINE_HEIGHT_MM)
+
+
+def line_on_paper_mm(line: int,
+                     top_margin_mm: float = DEFAULT_TOP_MARGIN_MM) -> float:
+    """How far down the sheet a line lands, from the paper's top edge."""
+    return top_margin_mm + line * LINE_HEIGHT_MM
+
+
+def paper_under_line_mm(line: int,
+                        top_margin_mm: float = DEFAULT_TOP_MARGIN_MM,
+                        paper_height_mm: float = PAPER_HEIGHT_MM) -> float:
+    """How much sheet is left below a line.
+
+    The figure to compare against FEED_TAIL_MM and REWIND_TAIL_MM, and the one
+    that means the same thing on another paper size or another loading.
+    """
+    return paper_height_mm - line_on_paper_mm(line, top_margin_mm)
+
+
+# --------------------------------------------------------------------------
 # Glyphs
 # --------------------------------------------------------------------------
 

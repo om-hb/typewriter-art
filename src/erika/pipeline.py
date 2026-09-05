@@ -18,6 +18,8 @@ Subcommands:
     sheet      an .etp that types the charset, for scanning back in
     forces     sweep the strike-force command, to find what this machine takes
     codes      put the control codes the pipeline does not use yet on paper
+    rewind     measure what a reverse paper feed costs in registration
+    feed       how far down the sheet the paper still feeds true
 """
 
 from __future__ import annotations
@@ -83,10 +85,94 @@ CORNER_ARM = 2
 CORNER_EDGE_CHAR = "_"
 CORNER_SIDE_CHAR = "!"
 
-#: Lines the `area` sheet marks out by default. 60 lines at Zeilenschaltung 1 is
-#: 254 mm -- an A4 sheet with roughly 20 mm spare at each end. Unlike the width
-#: this is not a machine limit, just a useful default; see cmd_area.
-DEFAULT_AREA_ROWS = 60
+#: Lines of paper the three paper sheets -- `area`, `rewind`, `feed` -- assume by
+#: default. Derived rather than chosen: every line that lands on an A4 sheet
+#: loaded the way erika_codes' "Where the paper sits" describes.
+#:
+#: It used to be 60, with a comment claiming roughly 20 mm spare at each end. The
+#: top margin turned out to be 32 mm measured, which left 11 mm under the last
+#: line rather than 20 -- so the number was a guess and the guess was wrong at
+#: both ends. Now it is arithmetic over two measurements.
+#:
+#: Deliberately past both limits the paper has: `deepest_printable_line` is three
+#: lines shorter and `deepest_rewindable_line` twelve. All three sheets exist to
+#: show where things stop coming out right, and a default that stopped short of
+#: the trouble would hide it.
+DEFAULT_PAPER_ROWS = ec.lines_on_paper()
+
+
+#: The `rewind` vernier. One block of the ladder is two cells of staircase and
+#: two of rule, side by side with no gap: the eye judges whether a broken line
+#: is straight far better than it judges the distance between two separated
+#: marks, and that judgement is the entire measurement. '_' sits on the
+#: baseline, so a pair of them reads as a rule rather than as two characters --
+#: the same reason `area` draws its edges with it.
+REWIND_BLOCK_COLS = 4
+REWIND_BAR_CHAR = "_"
+REWIND_BAR_CELLS = 2
+
+#: One spare column at the left of every band, and it is there for the labels.
+#:
+#: A block's number belongs under that block's staircase bar -- the bar is what
+#: the number counts steps of, and a number that sits anywhere else has to be
+#: matched to its bar by eye along a row of fifteen near-identical ones. So the
+#: labels are right-aligned to end under the staircase bar's last cell, which
+#: puts every digit in the same column whatever its sign. The minus then hangs a
+#: cell to the left of the bar, and under the leftmost block -- the most negative
+#: one -- that cell is off the paper unless the whole band is moved over. This is
+#: that cell. It costs one column of the carriage's reach and nothing else.
+REWIND_LEFT_INSET = 1
+
+#: Half the ladder, in 1/240" platen steps. Seven either side spans +-0.74 mm
+#: and 60 of the 65 columns the carriage reaches at pitch 10. It has to stay
+#: under half a line: every band walks its staircase down and then has to reach
+#: the next whole row without ever feeding backwards.
+REWIND_HALF_RANGE = 7
+
+#: Rows one band occupies: a header, the ladder, a clear line, the labels, and
+#: a blank before the next band.
+REWIND_BAND_ROWS = 5
+REWIND_LADDER_ROW = 1
+REWIND_LABEL_ROW = 3
+
+#: Rewind distances the sheet tries, in whole lines, and how many times each.
+#: Typed longest first so that the deepest excursion happens while the band is
+#: still near the top of the paper -- the sheet is as tall as its first trial
+#: reaches, not as tall as the sum of them.
+#:
+#: Three distances rather than one because the two failure modes look different:
+#: backlash is a fixed slop and reads the same at every distance, while slip
+#: accumulates and grows with it. Only the first can be corrected by winding
+#: back further than asked.
+REWIND_DISTANCES = (40, 20, 10)
+REWIND_REPEATS = 2
+
+
+#: The `feed` sheet. One bar per line, its column stepping across the page, so
+#: the marks of a run of lines lie on a straight line -- and the eye judges a
+#: straight line far better than it judges a distance, which is the same reason
+#: the rewind sheet is a vernier.
+#:
+#: The stepping is what buys the sensitivity. A mark misplaced downward by `e`
+#: lies off the line by `e * dx / hypot(dx, dy)`, so the shallower the run the
+#: closer that gets to `e` itself: at one column per line only half the error
+#: shows, and at six columns per line nearly all of it. That is what `--sweeps`
+#: sets -- more sweeps, fewer lines in each, further across for every line down.
+FEED_BAR_CHAR = "_"
+FEED_BAR_CELLS = 2
+
+#: Columns kept clear at the left for the line numbers, which is also the column
+#: the first mark of every sweep stands in: those marks are the sheet's other
+#: reading, a row of them one sweep apart for a steel rule to be laid against.
+FEED_MARGIN_COLS = 4
+
+#: A line number this often, so a kink can be named rather than counted to.
+FEED_LABEL_EVERY = 5
+
+#: How many times the pattern crosses the page. Six over sixty lines puts ten
+#: marks in each sweep -- long enough to sight along, shallow enough that a
+#: misplaced line shows almost its whole error.
+FEED_SWEEPS = 6
 
 
 @contextlib.contextmanager
@@ -685,6 +771,607 @@ def cmd_area(args) -> int:
     print("    brackets ran off the sheet or the platen lost its grip, lower")
     print("    --rows; that number caps how tall a print can be on this paper.")
     return 0
+
+
+def _feed_down(enc: etp.Encoder, steps: int) -> None:
+    """Feed the paper down by a count of 1/240" platen steps.
+
+    Forward only, and it says so rather than obliging: on this sheet a backwards
+    feed *is* the measurement, so one that slipped in by accident somewhere else
+    would be indistinguishable from the answer.
+
+    A whole number of lines goes out as NEWLINE for the reason planner.encode
+    gives -- the detented line-feed mechanism is more repeatable than a stack of
+    half-line keystrokes -- which matters more here than anywhere else, because
+    repeatability is the quantity being put on the paper.
+    """
+    if steps < 0:
+        raise PlanError(
+            f"the rewind sheet tried to feed the paper back {-steps} platen "
+            "steps outside a trial. Every motion on this sheet is downward "
+            "except the one reversal each band exists to measure"
+        )
+    per_line = 2 * ec.PLATEN_STEPS_PER_HALF_LINE
+    if steps and steps % per_line == 0:
+        enc.newline(steps // per_line)
+        return
+    enc.down(steps // ec.PLATEN_STEPS_PER_HALF_LINE)
+    enc.down_fine(steps % ec.PLATEN_STEPS_PER_HALF_LINE)
+
+
+def _rewind_staircase(enc: etp.Encoder, half_range: int, step: int) -> int:
+    """Type the reference: one bar per block, each `step` platen steps lower.
+
+    Returns how far the paper moved, in platen steps. Blocks run left to right
+    and the steps run downward, so neither mechanism reverses inside the pass --
+    which is the point. A staircase that had to reverse to draw itself would be
+    measuring the same backlash it is there to detect.
+    """
+    enc.carriage_return()
+    col = 0
+    for j in range(2 * half_range + 1):
+        if j:
+            enc.down_fine(step)
+        target = REWIND_LEFT_INSET + j * REWIND_BLOCK_COLS
+        enc.right(2 * (target - col))
+        type_text(enc, REWIND_BAR_CHAR * REWIND_BAR_CELLS)
+        col = target + REWIND_BAR_CELLS
+    return 2 * half_range * step
+
+
+def _rewind_rule(enc: etp.Encoder, half_range: int) -> None:
+    """Type the probe: one bar per block, all of them at the same height."""
+    type_row(enc, [(REWIND_LEFT_INSET + j * REWIND_BLOCK_COLS + REWIND_BAR_CELLS,
+                    REWIND_BAR_CHAR * REWIND_BAR_CELLS)
+                   for j in range(2 * half_range + 1)])
+
+
+def _rewind_labels(enc: etp.Encoder, half_range: int, step: int) -> None:
+    """Under each block, the error in platen steps if the null lands there.
+
+    Centred on that block's staircase bar, and centred *exactly* -- which the
+    cell grid cannot do. A bar is two cells wide and a one-character label is one
+    cell, so on whole columns a lone digit sits under the left half of its bar or
+    the right half, never the middle, while a label with a minus sign in front of
+    it covers the bar exactly. Every label from zero up is a lone digit, so the
+    row read as though the positive half had been nudged sideways against the
+    negative half -- on the one row of this sheet whose whole job is to say
+    which block you are looking at.
+
+    The machine has a half-step, and it is the same half-step the entire layer
+    scheme is built on, so this row is placed in half-steps rather than columns.
+    A two-character label lands on the cell grid exactly where it always did; a
+    lone digit lands half a cell left of that, centred; a three-character one
+    half a cell further left again, into REWIND_LEFT_INSET.
+    """
+    enc.carriage_return()
+    x = 0  # half-steps right of the left margin, which is what the head moves in
+    for j in range(2 * half_range + 1):
+        text = str((j - half_range) * step)
+        bar = REWIND_LEFT_INSET + j * REWIND_BLOCK_COLS
+        # The bar's ink runs from 2*bar to 2*bar + 2*REWIND_BAR_CELLS half-steps,
+        # so its middle is REWIND_BAR_CELLS along. The label is len(text) cells
+        # wide, so it starts half its own width before that.
+        start = 2 * bar + REWIND_BAR_CELLS - len(text)
+        enc.right(start - x)
+        type_text(enc, text)
+        x = start + 2 * len(text)
+
+
+def _rewind_band(enc: etp.Encoder, *, y: int, top: int, lines: int,
+                 half_range: int, step: int, mechanism: str, header: str) -> int:
+    """Type one vernier band; return where the paper stands afterwards.
+
+    ``y`` and ``top`` are platen steps below where the sheet began. The whole of
+    the arithmetic is this: the staircase puts a bar at ``top + j`` in block j,
+    the rewind is meant to bring the paper back to ``top``, and the rule is then
+    typed half the staircase's span lower. So the rule lands at
+    ``top + half_range * step + e`` for whatever ``e`` the rewind got wrong, and
+    it meets block j exactly when ``(j - half_range) * step == e``. The number
+    under the block is that value, so the sheet is read rather than measured.
+    """
+    per_line = 2 * ec.PLATEN_STEPS_PER_HALF_LINE
+    _feed_down(enc, top - y)
+    type_row(enc, [(0, header)])
+
+    ladder = top + REWIND_LADDER_ROW * per_line
+    _feed_down(enc, ladder - top)
+    y = ladder + _rewind_staircase(enc, half_range, step)
+
+    # Down the sheet and back up again: the one reversal the band is about, and
+    # the only motion anywhere on the sheet that is not forward. The excursion
+    # is a whole number of lines below where the staircase *started* so that the
+    # return can be one too -- a rewind that also had to undo the staircase's
+    # platen steps would be two mechanisms answering as one.
+    _feed_down(enc, ladder + lines * per_line - y)
+    if mechanism == "fine":
+        enc.up_fine(lines * per_line)
+    else:
+        enc.up(2 * lines)
+    y = ladder  # where the machine now believes the paper is
+
+    _feed_down(enc, half_range * step)
+    _rewind_rule(enc, half_range)
+    y = ladder + half_range * step
+
+    labels = top + REWIND_LABEL_ROW * per_line
+    _feed_down(enc, labels - y)
+    _rewind_labels(enc, half_range, step)
+    return labels
+
+
+def _ladder_check_band(enc: etp.Encoder, *, y: int, top: int,
+                       half_range: int, step: int) -> int:
+    """A band with no reversal in it: what the ladder itself is worth.
+
+    Every reading on this sheet is in units of one ``down_fine`` step, so a
+    ladder whose steps are uneven -- or whose steps the machine quietly drops --
+    would move every null on the sheet without looking like a fault. This band
+    types the same staircase and then a rule one whole line below the row it
+    started on, so the gap between the two closes by exactly one ladder step per
+    block: a straight wedge if the ladder is even, and a visible kink where it
+    is not.
+
+    It cannot be folded into a trial, tempting as a zero-line rewind sounds. The
+    staircase ends below where it began, and the only way back up to the rule's
+    row is a reversal -- so a band with no rewind in it has to be a band with
+    different geometry.
+    """
+    per_line = 2 * ec.PLATEN_STEPS_PER_HALF_LINE
+    _feed_down(enc, top - y)
+    type_row(enc, [(0, f"LADDER CHECK  NO REWIND  GAP CLOSES {step} PER BLOCK")])
+
+    ladder = top + REWIND_LADDER_ROW * per_line
+    _feed_down(enc, ladder - top)
+    y = ladder + _rewind_staircase(enc, half_range, step)
+
+    _feed_down(enc, ladder + per_line - y)
+    _rewind_rule(enc, half_range)
+    y = ladder + per_line
+
+    labels = top + REWIND_LABEL_ROW * per_line
+    _feed_down(enc, labels - y)
+    _rewind_labels(enc, half_range, step)
+    return labels
+
+
+def _parse_rewind_lines(text: str | None) -> tuple[int, ...]:
+    """``--lines 40,20,10`` -> (40, 20, 10), longest first."""
+    if text is None:
+        return REWIND_DISTANCES
+    try:
+        values = tuple(int(part, 0) for part in text.split(",") if part.strip())
+    except ValueError as exc:
+        raise PlanError(f"--lines wants whole numbers of lines: {text!r}") from exc
+    if not values:
+        raise PlanError("--lines named no distances")
+    if any(v < 1 for v in values):
+        raise PlanError(
+            "a rewind of less than one line has nothing to measure -- the "
+            "staircase and the rule would sit inside the same line feed"
+        )
+    # Longest first so the deepest excursion happens while the band is still
+    # near the top of the paper. The sheet is as tall as its first trial
+    # reaches, not as tall as the sum of them.
+    return tuple(sorted(set(values), reverse=True))
+
+
+def cmd_rewind(args) -> int:
+    """Measure whether the platen comes back to where it was after a rewind.
+
+    The planner sorts every strike so the paper only ever feeds forward, because
+    reversing the feed introduces backlash that shows up as banding. That rule
+    is also what stands between this pipeline and a print typed with more than
+    one type wheel: a wheel is changed by hand, so each wheel wants a complete
+    pass over the whole sheet, and the second pass can only begin by winding the
+    paper back to the top. Whether that is worth building turns on one number
+    nobody here has measured -- how far off the paper lands when it comes back --
+    and this sheet is how to measure it.
+
+    The reading is a vernier, so no scanner is involved. Each band is typed in
+    two passes with the rewind between them:
+
+        pass 1   a staircase of bars, one 1/240" platen step lower each block
+        ...      down `--lines` lines and back up: the reversal under test
+        pass 2   a single level rule, half the staircase's span below the row
+                 the staircase started on
+
+    On a machine that returns exactly, the rule crosses the staircase at the
+    middle block. Where it actually crosses is the error, and every block is
+    labelled with what it would mean in platen steps -- positive when the paper
+    came back short, which is the only direction backlash can err in.
+
+    What the sheet does not measure is the carriage. Its return to the left
+    margin is exercised by every row of every print already, and a wheel change
+    does not ask anything new of it; the platen coming back up a whole image is
+    a motion nothing in this pipeline has ever made.
+    """
+    per_line = 2 * ec.PLATEN_STEPS_PER_HALF_LINE
+    limit = ec.MAX_COLUMNS[args.pitch]
+    half, step = args.half_range, args.ladder_step
+    if half < 1:
+        raise PlanError("--half-range needs at least one block either side")
+    if step < 1:
+        raise PlanError("--ladder-step is a count of platen steps, so at least one")
+    width = REWIND_LEFT_INSET + (2 * half + 1) * REWIND_BLOCK_COLS
+    if width > limit:
+        raise PlanError(
+            f"a ladder of {2 * half + 1} blocks is {width} columns wide, past "
+            f"the carriage's {limit} at pitch {args.pitch}. Lower --half-range "
+            f"to {((limit - REWIND_LEFT_INSET) // REWIND_BLOCK_COLS - 1) // 2} "
+            "or less"
+            + (", or switch to pitch 12." if args.pitch == 10 else ".")
+        )
+    if args.repeat < 1:
+        raise PlanError("--repeat needs at least one run of each distance")
+
+    distances = _parse_rewind_lines(args.lines)
+    mech = "FINE 1/240" if args.mechanism == "fine" else "HALF-LINE"
+
+    # How deep the staircase walks, which is what every layout rule below is
+    # about: it walks down, and the only way back is the reversal under test.
+    # Also what keeps a label inside its block: the widest is "-" and two digits,
+    # and a block is four columns. See _rewind_labels.
+    depth = 2 * half * step
+    room = (REWIND_LABEL_ROW - REWIND_LADDER_ROW) * per_line
+    if depth >= room:
+        raise PlanError(
+            f"the ladder walks {depth} platen steps down, into the labels "
+            f"{room} below it. Lower --ladder-step or --half-range so that "
+            f"2 * half_range * step stays under {room}"
+        )
+    if depth > min(distances) * per_line:
+        raise PlanError(
+            f"the ladder walks {depth} platen steps down but the shortest "
+            f"rewind is {min(distances)} line(s) = {min(distances) * per_line}. "
+            "The excursion has to start below where the staircase ended, so a "
+            "ladder deeper than the shortest distance would need a backwards "
+            "feed to reach it -- drop the short distances from --lines, or "
+            "lower --ladder-step"
+        )
+    if not args.no_ladder_check and depth >= per_line:
+        raise PlanError(
+            f"the ladder walks {depth} platen steps down and the ladder-check "
+            f"band puts its rule one line ({per_line}) below the staircase's "
+            "first rung, which the staircase has already passed. Lower "
+            "--ladder-step, or pass --no-ladder-check and check the ladder on "
+            "a separate sheet"
+        )
+
+    # Lay the sheet out before encoding any of it, so a sheet that would not fit
+    # the paper is refused rather than typed off the bottom of it.
+    row = 2  # under the caption, with a blank line between
+    bands: list[tuple[int, int, int]] = []  # (top row, lines, run)
+    if not args.no_ladder_check:
+        bands.append((row, 0, 0))
+        row += REWIND_BAND_ROWS
+    for lines in distances:
+        for run in range(1, args.repeat + 1):
+            bands.append((row, lines, run))
+            row += REWIND_BAND_ROWS
+    typed_rows = row - 1  # the trailing blank of the last band is not typed on
+
+    def reach(top: int, lines: int) -> int:
+        """The row a band winds down to before it comes back.
+
+        Bands are stacked down the page and each excursion starts from its own
+        band, so *no two of them reach the same depth* -- the last trial of the
+        longest distance goes furthest, and by more than the difference between
+        the distances. That is invisible on the paper unless it is written
+        there, and it is what tells a band that failed because the platen missed
+        from one that failed because the sheet stopped being held.
+        """
+        return top + REWIND_LADDER_ROW + lines
+
+    deepest = max(reach(top, lines) for top, lines, _ in bands) + 1
+    needed = max(typed_rows, deepest)
+    if needed > args.rows:
+        raise PlanError(
+            f"the sheet needs {needed} lines but --rows is {args.rows}. The "
+            f"bands themselves take {typed_rows}; the rest is how far the "
+            f"{max(distances)}-line excursion reaches below its own band. Drop a "
+            "distance from --lines, lower --repeat, or raise --rows if the "
+            "paper is longer than `area` says"
+        )
+
+    enc = etp.Encoder()
+    type_row(enc, [(0, f"REWIND REGISTRATION  PITCH {args.pitch}  "
+                       f"STEP {step}/240 IN  {mech}")])
+    y = 0
+    for top, lines, run in bands:
+        top_steps = top * per_line
+        if lines == 0:
+            y = _ladder_check_band(enc, y=y, top=top_steps, half_range=half,
+                                   step=step)
+        else:
+            y = _rewind_band(
+                enc, y=y, top=top_steps, lines=lines, half_range=half, step=step,
+                mechanism=args.mechanism,
+                header=f"REWIND {lines} LINES  RUN {run}  {mech}  "
+                       f"TO ROW {reach(top, lines)}",
+            )
+
+    enc.newline(2)  # roll the sheet clear of the platen, as planner.encode does
+    enc.end()
+
+    job = etp.Job(body=enc.body(), cols=width, rows=needed,
+                  strikes=enc.strikes, pitch=args.pitch, home_each_row=True)
+    out = args.out if os.path.isabs(args.out) else os.path.join(SRC_DIR, args.out)
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    size = etp.save(out, job)
+    trials = [b for b in bands if b[1]]
+    print(f"rewind-registration job -> {out} ({size} bytes, {job.strikes} strikes)")
+    print(f"  {len(trials)} trials at {', '.join(str(d) for d in distances)} lines"
+          f", {args.repeat} run(s) each, reversed by "
+          + ("0xA6 platen steps" if args.mechanism == "fine"
+             else "half-line keystrokes"))
+    print(f"  ladder +-{half * step} platen steps in {step}-step blocks = "
+          f"+-{half * step / ec.PLATEN_STEPS_PER_INCH * 25.4:.2f} mm, "
+          f"{width} columns, {needed} lines of paper")
+    print("\nLoad a sheet as you would for a print and type this:")
+    print(f"  python -m erika.send {os.path.relpath(out, SRC_DIR)} --print")
+    print("\nDo not touch the paper release or the platen knob while it runs --")
+    print("the sheet measures the machine's own return, and a hand on the knob")
+    print("is a different experiment.")
+    print("\nHow to read it:")
+    print("  Each band is a descending staircase of bars with a level rule cutting")
+    print("  across it. Find the block where the staircase bar and the rule beside")
+    print("  it form one straight line, and read the number underneath.")
+    print("    0        the platen came back exactly. Multi-wheel printing is a")
+    print("             matter of planning, not of mechanism.")
+    print("    positive the rewind fell short by that many 1/240 inch steps.")
+    print("             The same reading at every distance is backlash, and a")
+    print("             second pass can simply wind back that much further.")
+    print("             A reading that grows with the distance is slip, and it")
+    print("             cannot be corrected -- only measured again per distance.")
+    print("    negative the paper overshot, which backlash cannot cause. Check")
+    print("             the ladder-check band before believing it.")
+    print("    nothing  no block lines up: the error is past the ladder's reach.")
+    print(f"             Run it again with --ladder-step {step * 2}: double the")
+    print("             range, half the resolution.")
+    print("  Runs of the same distance that read differently are the answer that")
+    print("  ends the idea: an error that is not repeatable cannot be planned")
+    print("  around. Scatter of one step is workable; a whole cell is not.")
+    print("\n  One band off and the rest at 0 is a different finding, and the")
+    print("  paper is the first suspect rather than the platen. The bands are")
+    print("  stacked down the page, so no two excursions reach the same depth --")
+    print("  each is labelled on the paper with the row it winds down to. Read")
+    print(f"  against a sheet pushed home ({ec.DEFAULT_TOP_MARGIN_MM:.0f} mm to the "
+          f"first line on {ec.PAPER_HEIGHT_MM:.0f} mm paper):")
+    trials = [(top, lines, run) for top, lines, run in bands if lines]
+    floor = max(reach(top, lines) for top, lines, _ in trials)
+    for top, lines, run in trials:
+        at = reach(top, lines)
+        print(f"    {lines:>3} lines run {run}  to line {at:>3}"
+              f"  {ec.line_on_paper_mm(at):>4.0f} mm down,"
+              f"{ec.paper_under_line_mm(at):>4.0f} mm under it"
+              + ("   <- deepest" if at == floor else ""))
+    print("  The last figure is the one that carries between sheets: the feed")
+    print("  rollers are where they are, so a different paper length or a")
+    print("  different loading moves the line numbers and not it. On this")
+    print(f"  machine winding back stops working with about "
+          f"{ec.REWIND_TAIL_MM:.0f} mm still under the")
+    print(f"  print line -- while feeding *forward* goes on to about "
+          f"{ec.FEED_TAIL_MM:.0f} mm, so a")
+    print("  sheet nearly out can still be pushed along and not pulled back.")
+    print("  Backlash misses on every band alike and slip misses more as the")
+    print("  distance grows. A single band missing is neither, and the likeliest")
+    print("  cause is the sheet's bottom edge leaving the feed rollers at the")
+    print("  bottom of that one excursion -- which is a fact about your paper and")
+    print("  how it was fed, not about the machine. `area` measures how far down")
+    print("  the platen still holds it; a print that stays inside that can be")
+    print("  wound back, and one that runs past it cannot.")
+    print("\n  For scale: one step is 1/240 in. A layer offset of half a cell is "
+          f"{ec.PLATEN_STEPS_PER_HALF_LINE} steps,")
+    print(f"  and a whole line is {per_line}. An error of {ec.PLATEN_STEPS_PER_HALF_LINE}"
+          " puts the second wheel's ink exactly where")
+    print("  the first wheel's half-line layer already went.")
+    print("\n  The ladder-check band has no rewind in it. Its gap must close by one")
+    print("  step per block in a straight wedge; a kink there means the ladder is")
+    print("  uneven and every other reading on the sheet is shifted with it.")
+    return 0
+
+
+
+def _feed_title_len(rows: int, sweeps: int, pitch: int) -> int:
+    """How wide the `feed` sheet's own caption is, in cells."""
+    return len(f"FORWARD FEED  PITCH {pitch}  {rows} LINES  {sweeps} SWEEPS")
+
+
+def feed_layout(rows: int, sweeps: int, pitch: int) -> tuple[int, int, int]:
+    """How the `feed` sheet lays out: (marks per sweep, columns per line, width).
+
+    Every line from 0 to ``rows - 1`` carries a mark, line 0 included -- it shares
+    its line with the title rather than giving the title a line of its own.
+
+    That is not tidiness. Whoever reads this sheet takes the topmost mark as the
+    datum and measures down from it, because it is the only thing on the sheet
+    that could be one; an advice note calling some other line "the first line"
+    is a note nobody can act on. So the topmost mark *is* line 0, and the count
+    is still lines below the first thing typed -- the same count the rewind
+    sheet's depths use, so a reading from one can be held against the other.
+    """
+    marks = rows
+    if marks < 2:
+        raise PlanError(
+            f"--rows {rows} leaves {max(marks, 0)} line(s) to mark. A feed is a "
+            "distance between two of them, so there is nothing to measure"
+        )
+    if sweeps < 1:
+        raise PlanError("--sweeps needs at least one pass across the page")
+    per_sweep = -(-marks // sweeps)  # ceil, so the last sweep is the short one
+    if per_sweep < 2:
+        raise PlanError(
+            f"{sweeps} sweeps over {marks} marked lines is fewer than two marks "
+            "in some of them, and two marks are a straight line whatever the "
+            "feed did. Lower --sweeps"
+        )
+    span = ec.MAX_COLUMNS[pitch] - FEED_MARGIN_COLS - FEED_BAR_CELLS
+    step = span // (per_sweep - 1)
+    if step < 1:
+        raise PlanError(
+            f"{per_sweep} marks in a sweep will not fit across {span} columns at "
+            f"pitch {pitch} with one column each. Raise --sweeps so that fewer "
+            "lines share a pass"
+        )
+    # Wide enough for the marks or for the title beside the first of them,
+    # whichever reaches further: at two sweeps the marks barely leave the margin
+    # and the title is the widest thing on the sheet.
+    width = max(
+        FEED_MARGIN_COLS + (per_sweep - 1) * step + FEED_BAR_CELLS,
+        FEED_MARGIN_COLS + FEED_BAR_CELLS + 2 + _feed_title_len(rows, sweeps, pitch),
+    )
+    return per_sweep, step, width
+
+
+def cmd_feed(args) -> int:
+    """Does the paper still feed true this far down the sheet?
+
+    The companion to `rewind`, and the more consequential of the two. That sheet
+    measured a reversal and found the platen exact -- but only while the paper
+    was still held: past a depth that belongs to the sheet and how it was fed,
+    its readings fell off the ladder entirely. A sheet that has lost its rollers
+    can still be dragged roughly along in one direction, though, so whether a
+    plain forward-feeding print is affected at the same depth is a separate
+    question. It is also the larger one. Every print feeds down to its last line,
+    so if the answer is no, the bottom of a tall print has been landing wherever
+    the paper happened to go -- with the plan verified, the CRC passing, and
+    nothing anywhere saying so.
+
+    Nothing on this sheet ever feeds backwards. There is no vernier and no
+    second pass: one bar per line, its column stepping across the page, so each
+    run of lines lays its marks along a straight line. Three readings come out of
+    the one pattern:
+
+      - **Each sweep is straight.** A line the platen placed short or long lies
+        off it, and a bend or a kink names the line it started at. Good for
+        something like a third of a millimetre by eye, better with a straightedge.
+      - **The leftmost marks are evenly spaced.** One per sweep, a known number
+        of lines apart. A feed that shortens gradually never kinks anything but
+        does close these up, and a gap out of step with the rest is that.
+      - **The first mark to the last is a known distance.** Printed with the
+        advice, for a steel rule: the absolute check the other two cannot make,
+        since both compare the sheet against itself.
+
+    Feed the paper the way it was fed for the rewind sheet or the two do not
+    compare -- the depth at issue belongs to the sheet and its loading rather
+    than to the machine.
+    """
+    per_sweep, step, width = feed_layout(args.rows, args.sweeps, args.pitch)
+
+    bar = FEED_BAR_CHAR * FEED_BAR_CELLS
+    title = f"FORWARD FEED  PITCH {args.pitch}  {args.rows} LINES  {args.sweeps} SWEEPS"
+    assert len(title) == _feed_title_len(args.rows, args.sweeps, args.pitch)
+    #: Lines whose mark stands in the margin column, which is the sheet's ruler:
+    #: every sweep's first line, and the last line of all if it is not one
+    #: already. That last one is there because the bottom of the paper is what
+    #: the sheet is about, and a ruler that stopped one sweep short of it would
+    #: leave the interesting part to be measured diagonally.
+    ruler = set(range(0, args.rows, per_sweep)) | {args.rows - 1}
+
+    enc = etp.Encoder()
+    for line in range(args.rows):
+        if line:
+            enc.newline(1)  # the detented mechanism; the only motion on the sheet
+        marks: list[tuple[int, str]] = []
+        # Every fifth line, so a kink can be named rather than counted to -- and
+        # every line on the ruler whether or not it falls on five, because those
+        # are the marks the second reading measures between.
+        if line % FEED_LABEL_EVERY == 0 or line in ruler:
+            text = str(line)
+            # Right-aligned to end one clear column short of the marks, for the
+            # reason rewind's labels are: a digit in a different column from line
+            # to line has to be read twice.
+            marks.append((FEED_MARGIN_COLS - 1 - len(text), text))
+        col = FEED_MARGIN_COLS + (line % per_sweep) * step
+        if line in ruler and col != FEED_MARGIN_COLS:
+            # The last line, carrying a ruler mark as well as its own.
+            marks.append((FEED_MARGIN_COLS, bar))
+        marks.append((col, bar))
+        if line == 0:
+            marks.append((col + FEED_BAR_CELLS + 2, title))
+        type_row(enc, marks)
+
+    enc.newline(2)  # roll the sheet clear of the platen, as planner.encode does
+    enc.end()
+
+    job = etp.Job(body=enc.body(), cols=width, rows=args.rows,
+                  strikes=enc.strikes, pitch=args.pitch, home_each_row=True)
+    out = args.out if os.path.isabs(args.out) else os.path.join(SRC_DIR, args.out)
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    size = etp.save(out, job)
+
+    last = args.rows - 1
+    ruler = sorted(set(range(0, args.rows, per_sweep)) | {last})
+    print(f"forward-feed job -> {out} ({size} bytes, {job.strikes} strikes)")
+    print(f"  {args.rows} marked lines in {args.sweeps} sweeps of up to "
+          f"{per_sweep}, {step} column(s) across per line down")
+    print(f"  {width} columns, {args.rows} lines of paper "
+          f"({args.rows * ec.LINE_HEIGHT_MM:.0f} mm)")
+    print("\nLoad a sheet the way you fed it for the rewind sheet -- the depth at")
+    print("issue belongs to the paper and its loading, not to the machine -- and")
+    print("type this:")
+    print(f"  python -m erika.send {os.path.relpath(out, SRC_DIR)} --print")
+    print("\nNothing on this sheet feeds the paper backwards. It is the other half")
+    print("of what `rewind` asks: that sheet found the platen exact while the")
+    print("paper was held, and this one asks whether a print that only ever feeds")
+    print("forward is placed truly at the same depths.")
+    print("\nHow to read it:")
+    print("  1. Each sweep should be one straight line of marks. A bend or a kink")
+    print("     is a line the platen placed short or long, and the line number in")
+    print(f"     the margin -- every {FEED_LABEL_EVERY} lines -- names where.")
+    print("     Sight along it, or lay a straightedge on it.")
+    print("  2. The left column is the sheet's ruler: the first mark of every")
+    print("     sweep stands in it, and so does one on the very last line. Every")
+    print("     measurement below runs straight down that one column, so none of")
+    print("     them is diagonal. Line 0 is the topmost mark and the datum.")
+    print(f"     Paper figures assume a sheet pushed home: "
+          f"{ec.DEFAULT_TOP_MARGIN_MM:.0f} mm above line 0,")
+    print(f"     {ec.PAPER_HEIGHT_MM:.0f} mm of paper.")
+    print("       line   from line 0   from the one above   paper under it")
+    # The first ruler mark past where winding back stopped working, and only the
+    # first: every mark below it is past it too, and a column of arrows says
+    # less than one.
+    crossing = next((at for at in ruler if at > ec.deepest_rewindable_line()), None)
+    for i, at in enumerate(ruler):
+        gap = (f"{(at - ruler[i - 1]) * ec.LINE_HEIGHT_MM:>8.1f} mm" if i
+               else f"{'-':>11}")
+        print(f"       {at:>4}   {at * ec.LINE_HEIGHT_MM:>8.1f} mm   {gap}"
+              f"   {ec.paper_under_line_mm(at):>9.0f} mm"
+              + ("   <- rewind gave up by here" if at == crossing else ""))
+    print("     A feed that shortens gradually bends no sweep at all and closes")
+    print("     these gaps up, so this is the reading that catches it. The last")
+    print("     gap is the short one -- the bottom sweep has fewer lines in it.")
+    print(f"  3. Line 0 to line {last}, down that same column, is "
+          f"{last * ec.LINE_HEIGHT_MM:.1f} mm. It is the")
+    print("     absolute check: the first two readings compare the sheet with")
+    print("     itself, so a feed wrong by the same fraction throughout would")
+    print("     pass them both, and a steel rule on this one would not.")
+    print("     Do not measure between the topmost and bottommost *sweep* marks:")
+    print("     they are in different columns, so a rule laid between them reads")
+    print("     the diagonal and is tens of millimetres long.")
+    print("\nWhat it decides:")
+    print("  If every sweep is straight to where the rollers let go, the depth")
+    print("  `rewind` found limits winding back and nothing else, and an ordinary")
+    print("  print may use the paper down to the grip. That is how it came out")
+    print("  the first time it was typed, which is why the two tails below differ.")
+    print("  If instead the sweeps go wrong where `rewind` did, that depth is the")
+    print("  ceiling on the height of *any* print on this paper -- and nothing in")
+    print("  the pipeline would know: a taller plan verifies against the mockup,")
+    print("  uploads, and types its last lines onto paper the platen is no longer")
+    print("  placing.")
+    print("\n  Measured once already, on A4 pushed home:")
+    print(f"    line {ec.deepest_printable_line():>2}  the rollers let go, about "
+          f"{ec.FEED_TAIL_MM} mm of sheet left. The ceiling")
+    print("          on an ordinary print.")
+    print(f"    line {ec.deepest_rewindable_line():>2}  winding back stops "
+          f"working, about {ec.REWIND_TAIL_MM} mm left. The ceiling")
+    print("          on a print that has to be wound back -- more than one wheel.")
+    print("  The millimetres are what carry to another paper length or loading;")
+    print("  the line numbers are those figures on this one. See erika_codes\'")
+    print('  "Where the paper sits".')
+    return 0
+
 
 
 def cmd_sheet(args) -> int:
@@ -1665,16 +2352,76 @@ def build_parser() -> argparse.ArgumentParser:
     ar = sub.add_parser("area", help="mark the four corners of the printable area")
     ar.add_argument("--out", "-o", default="results/print_area.etp")
     ar.add_argument("--pitch", "-p", type=int, default=10, choices=(10, 12))
-    ar.add_argument("--rows", type=int, default=DEFAULT_AREA_ROWS,
+    ar.add_argument("--rows", type=int, default=DEFAULT_PAPER_ROWS,
                     help=f"lines to mark out; the machine has no vertical limit, "
-                         f"only the paper does (default {DEFAULT_AREA_ROWS}, "
-                         f"= {DEFAULT_AREA_ROWS * ec.LINE_HEIGHT_MM:.0f} mm)")
+                         f"only the paper does (default {DEFAULT_PAPER_ROWS}, "
+                         f"every line that lands on A4 below a "
+                         f"{ec.DEFAULT_TOP_MARGIN_MM:.0f} mm top margin). The "
+                         f"rollers let go around line "
+                         f"{ec.deepest_printable_line()}, and a sheet that has "
+                         f"to be wound back is done at line "
+                         f"{ec.deepest_rewindable_line()} -- see `feed` and "
+                         "`rewind`")
     ar.add_argument("--columns", type=int, default=None,
                     help="width to mark out; default is the carriage limit "
                          f"({ec.MAX_COLUMNS[10]} at pitch 10, "
                          f"{ec.MAX_COLUMNS[12]} at pitch 12). Set it to an -r "
                          "value to see where that print would land")
     ar.set_defaults(func=cmd_area)
+
+    rw = sub.add_parser("rewind", help="measure what a reverse paper feed costs "
+                                       "in registration")
+    rw.add_argument("--out", "-o", default="results/rewind.etp")
+    rw.add_argument("--pitch", "-p", type=int, default=10, choices=(10, 12))
+    rw.add_argument("--lines", default=None,
+                    help="rewind distances to try, in whole lines, comma "
+                         "separated (default "
+                         f"{','.join(str(d) for d in REWIND_DISTANCES)}). Several "
+                         "because backlash reads the same at every distance and "
+                         "slip grows with it")
+    rw.add_argument("--repeat", type=int, default=REWIND_REPEATS,
+                    help=f"runs of each distance (default {REWIND_REPEATS}). An "
+                         "error that is not repeatable cannot be planned around, "
+                         "so one run of each answers nothing")
+    rw.add_argument("--half-range", type=int, default=REWIND_HALF_RANGE,
+                    help=f"blocks of ladder either side of zero (default "
+                         f"{REWIND_HALF_RANGE}). The carriage caps it: "
+                         f"{((ec.MAX_COLUMNS[10] - REWIND_LEFT_INSET) // REWIND_BLOCK_COLS - 1) // 2} "
+                         "at pitch 10")
+    rw.add_argument("--ladder-step", type=int, default=1,
+                    help="platen steps per block (default 1 = 1/240 in, a "
+                         f"reach of +-{REWIND_HALF_RANGE / ec.PLATEN_STEPS_PER_INCH * 25.4:.2f}"
+                         " mm). The carriage caps how many blocks there are, so "
+                         "this is the only way to reach further: --ladder-step "
+                         "2 doubles the range and halves the resolution. Run it "
+                         "coarse first if nothing nulls")
+    rw.add_argument("--mechanism", default="half-line", choices=("half-line", "fine"),
+                    help="what winds the paper back: half-line keystrokes, or "
+                         "the platen's own 1/240 inch steps via 0xA6. They are "
+                         "different mechanisms and need not have the same "
+                         "backlash")
+    rw.add_argument("--rows", type=int, default=DEFAULT_PAPER_ROWS,
+                    help=f"lines of paper available (default {DEFAULT_PAPER_ROWS}; "
+                         "`area` is what measures this for your paper)")
+    rw.add_argument("--no-ladder-check", action="store_true",
+                    help="skip the band that checks the ladder's own step size")
+    rw.set_defaults(func=cmd_rewind)
+
+    fd = sub.add_parser("feed", help="how far down the sheet the paper still "
+                                     "feeds true")
+    fd.add_argument("--out", "-o", default="results/feed.etp")
+    fd.add_argument("--pitch", "-p", type=int, default=10, choices=(10, 12))
+    fd.add_argument("--rows", type=int, default=DEFAULT_PAPER_ROWS,
+                    help=f"lines of paper to mark, top to bottom (default "
+                         f"{DEFAULT_PAPER_ROWS}). Ask for more than you believe "
+                         "fits: where it stops coming out right is the answer")
+    fd.add_argument("--sweeps", type=int, default=FEED_SWEEPS,
+                    help=f"times the pattern crosses the page (default "
+                         f"{FEED_SWEEPS}). More sweeps put fewer lines in each, "
+                         "which sends the marks further across for every line "
+                         "down -- a shallower run shows more of a misplaced "
+                         "line, and a shorter one is harder to sight along")
+    fd.set_defaults(func=cmd_feed)
 
     sh = sub.add_parser("sheet", help="type the charset, for scanning back in")
     sh.add_argument("--out", "-o", default="results/charset_sheet.etp")
