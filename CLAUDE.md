@@ -187,6 +187,10 @@ nothing downstream can fail on a misplaced grid now:
   the underscore and the accents stop marking two forces down, and refusing that
   would refuse every multi-force charset worth having. The margin is wide — the
   weakest cell at the hardest force carried 49 and 86 times the paper's own ink.
+  When it does fire, read it as a question about the *grid* before believing it
+  about the sheet: a single blank `'_'` is what a mis-phased row cut looks like,
+  and that is what it meant on three of the five wheels scanned in September
+  2026 — see the row grid, below.
 
 **The obsolete threshold note.** `WHITE_THRESHOLD` is 0.999, and it is a font's
 answer: a tile is blank if its mean brightness is within a tenth of a percent of
@@ -203,7 +207,7 @@ because each produced a *plausible* charset rather than an error:
 | the vertical extent | any ink at all, so three pixels of dust put the grid a quarter too tall and three rows too high | a line must carry `INK_LINE_FLOOR` of the heaviest line's ink |
 | a column of the sheet | any column with ink on two rows, so one overhanging glyph welded twenty columns into four | a column must carry `COLUMN_INK_FLOOR` of the heaviest column |
 | the registration marks | assumed to be the outermost ink runs, so one speck outside the right-hand mark hid both | the best-fitting *pair*, by width, isolation and the cell width they imply |
-| the row grid | the ink extent divided by the row count, which is short by an ascender and a descender — 1.4% on the first sheet, compounding to a quarter of a cell by row 21 | each row cut at its own mark, and the cut placed where it severs the least glyph |
+| the row grid | the ink extent divided by the row count, which is short by an ascender and a descender — 1.4% on the first sheet, compounding to a quarter of a cell by row 21 | each row cut at its own mark, and the cut placed where it severs the least glyph, among the phases that leave every glyph in its own cell |
 
 Each threshold sits in the middle of a plateau measured on both sheets, with an
 order of magnitude between what it must keep and what it must ignore.
@@ -226,15 +230,46 @@ zone below, so centring on the marks puts the cut a few percent of a row too
 high. Nothing shows it except the glyph it ruins — the underscore is a bar typed
 against the floor of the cell, so a few percent is *half of it*, and the half
 that goes missing reappears at the top of the tile below, which on this sheet is
-a `D` wearing a bar it never printed. `_row_phase` nudges the cut to where it
-severs the least ink, scored as the per-column minimum of the ink above and
-below the line — a glyph that merely *ends* at the boundary leaves ink on one
-side, and only one the boundary passes through leaves it on both. That
-distinction is the whole of it: score ink lying *near* the cut instead and the
-best answer becomes shoving the underscore wholly into the cell below, which is
-the same error carried to completion. On these sheets the nudge is +6px and +9px
-of a 100px row, and it takes the underscore from 41.5 units of ink to 93.0 and
-the `D` below it from 43.5 to 0.7.
+a `D` wearing a bar it never printed. `_row_phase` nudges the cut, and it
+takes **two** scores to place it, because either alone picks the wrong one.
+
+`_cut_risk` is the first: ink the boundary passes *through*, scored as the
+per-column minimum of the ink above and below the line — a glyph that merely
+*ends* at the boundary leaves ink on one side, and only one the boundary passes
+through leaves it on both. Score ink lying *near* the cut instead and the best
+answer becomes shoving the underscore wholly into the cell below.
+
+That distinction was believed to be the whole of it, and is not. A cut that
+strands the underscore severs *nothing*, so it does not merely survive the score
+— it wins it. Four more wheels scanned in September 2026 showed how often: on
+three of the five sheets the least-severing phase was the stranding one, by
+margins of 5 against 3 and 10 against 3, and the build came back refusing a sheet
+whose underscore was plainly on the paper. The two phases differ by 3 to 6px of a
+100px row and both look clean; only the underscore can tell them apart.
+
+`_stranded_glyph` is the second score and the one that can: the faintest tile of
+the hardest force block, which a stranding phase drops to bare paper. It is broad
+where cut risk is sharp — a plateau some 12% of a row wide satisfies it — so it
+cannot place the cut, only say where it must not go. **Stranding picks the
+plateau; cut risk places the cut inside it.** `PHASE_INK_TOLERANCE` keeps the
+choice off the plateau's very edge, where a pixel of scanner noise puts it back
+outside.
+
+Only the hardest block, for the reason `check_scan_hardest_block` checks only
+that one: a lighter force legitimately marks nothing, and scoring its tiles makes
+every phase look equally bad, which falls straight back to cut risk alone. That
+is `_row_phase`'s `block` argument, and it is why `_sheet_from_scan` now takes
+one.
+
+When no phase keeps every glyph in its cell the plateau is the whole search and
+this is cut risk alone again, deliberately: a sheet where a key really did not
+strike is `check_scan_hardest_block`'s to refuse, not the phase search's to chase.
+
+On the six single-force sheets scanned so far the nudge is +5 to +9px of a 100px
+row. What it is worth is two tiles and almost nothing else: on
+`letter_gothik_10` it takes the underscore from 0.0006 of ink to 0.0409 and the
+`D` twenty cells on from 0.2239 to 0.1669, while 100 of the 103 glyphs move by
+under 3%.
 
 And when
 the marks are not found, the fallback now crops to the ink — it used to resize

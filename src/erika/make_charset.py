@@ -550,7 +550,8 @@ def make_charset(
     layout = None
     if scan:
         sheet, cols, rows = _sheet_from_scan(
-            scan, len(entries), sheet_cols, cell_w, cell_h, deskew_scan
+            scan, len(entries), sheet_cols, cell_w, cell_h, deskew_scan,
+            block=len(glyphs),
         )
         spills = [0.0] * len(entries)
         font_used = f"scan:{os.path.basename(scan)}"
@@ -892,6 +893,32 @@ def _mark_rows(im, left_c, right_c, cell, rows):
 #: wide enough to be wrong by one.
 PHASE_SEARCH = 0.2
 
+#: How much of the best phase's faintest tile a phase may give up and still be
+#: considered. Every key marks its own tile over a broad plateau of offsets --
+#: some twelve percent of a row on the five wheels measured here -- and within
+#: that plateau ``_cut_risk`` is the better judge. This only rules out the
+#: offsets outside it, and the tolerance is what keeps the choice off the very
+#: edge, where a pixel of scanner noise puts it back outside.
+PHASE_INK_TOLERANCE = 0.9
+
+
+def _row_grid(im, tops, pitch, cols, cell_w, cell_h, offset):
+    """The sheet resliced with every row boundary moved by ``offset``, as ink.
+
+    None when the offset runs a band off the image. Shared by the two things a
+    phase is scored on so that the search resamples the sheet once per offset
+    rather than twice.
+    """
+    stack = []
+    for top in tops:
+        y0 = max(0, int(round(top + offset)))
+        y1 = min(im.shape[0], int(round(top + offset + pitch)))
+        if y1 - y0 < 2:
+            return None
+        stack.append(cv2.resize(im[y0:y1], (cols * cell_w, cell_h),
+                                interpolation=cv2.INTER_AREA))
+    return 1.0 - _normalise(np.vstack(stack))
+
 
 def _cut_risk(im, tops, pitch, cols, cell_w, cell_h, n_tiles, offset):
     """How much ink a boundary at ``offset`` cuts *through*.
@@ -906,16 +933,13 @@ def _cut_risk(im, tops, pitch, cols, cell_w, cell_h, n_tiles, offset):
     column. One that merely ends there leaves ink on one side. So the score is
     the per-column minimum of the ink above and below, which is zero for
     everything but a glyph the boundary passes through.
+
+    What it cannot see is the shove itself, which is why it is not the whole of
+    the answer -- see ``_stranded_glyph``.
     """
-    stack = []
-    for top in tops:
-        y0 = max(0, int(round(top + offset)))
-        y1 = min(im.shape[0], int(round(top + offset + pitch)))
-        if y1 - y0 < 2:
-            return None
-        stack.append(cv2.resize(im[y0:y1], (cols * cell_w, cell_h),
-                                interpolation=cv2.INTER_AREA))
-    ink = 1.0 - _normalise(np.vstack(stack))
+    ink = _row_grid(im, tops, pitch, cols, cell_w, cell_h, offset)
+    if ink is None:
+        return None
     risk = 0.0
     for boundary in range(1, len(tops)):
         above = ink[boundary * cell_h - 1]
@@ -924,20 +948,63 @@ def _cut_risk(im, tops, pitch, cols, cell_w, cell_h, n_tiles, offset):
     return risk
 
 
-def _row_phase(im, tops, pitch, cols, cell_w, cell_h, n_tiles):
+def _stranded_glyph(im, tops, pitch, cols, cell_w, cell_h, block, offset):
+    """Ink in the faintest tile of the hardest force block, at this ``offset``.
+
+    The blind spot in ``_cut_risk``, measured. A cut that leaves a glyph wholly
+    on the wrong side of it severs nothing, so it scores as a clean cut and wins
+    -- which is the error ``_cut_risk``'s own docstring says it is avoiding, and
+    does not. On three of the five wheels scanned here the lowest-severing phase
+    was the one that put the underscore's bar entirely into the tile below,
+    twenty cells on, and the sheet then came back with a blank tile and a 'D'
+    wearing a bar it never printed.
+
+    Stranding is visible from the other end: the tile the glyph *should* be in is
+    empty. Every key on the hardest force block marks the paper -- that is the
+    premise ``check_scan_hardest_block`` refuses a sheet on -- so the faintest of
+    those tiles is a floor under the whole block, and a phase that strands
+    anything drops it to paper. Maximising it balances the underscore at the cell
+    floor against the accents at its ceiling, which is the real constraint: the
+    cell has to hold both.
+
+    Only the hardest block, for the reason ``check_scan_hardest_block`` checks
+    only that one -- a lighter force legitimately leaves no mark, and a tile that
+    is blank however the sheet is cut would make every phase look equally bad.
+    """
+    ink = _row_grid(im, tops, pitch, cols, cell_w, cell_h, offset)
+    if ink is None:
+        return None
+    rows = len(tops)
+    means = ink.reshape(rows, cell_h, cols, cell_w).mean(axis=(1, 3)).reshape(-1)
+    return float(means[: min(block, means.size)].min())
+
+
+def _row_phase(im, tops, pitch, cols, cell_w, cell_h, n_tiles, block=None):
     """Where to cut between one row and the next, to the pixel.
 
     The marks give the pitch exactly and the phase only nearly: a mark's ink runs
     from its cap height to its baseline, which is not centred in its cell -- there
     is an accent zone above and a descender zone below, and they are not the same
-    depth. On these two wheels that left the cut some three or four hundredths of
-    a row too high, which is invisible on every glyph except the one it is not.
+    depth. On the wheels measured here that left the cut three to nine hundredths
+    of a row too high, which is invisible on every glyph except the one it is not.
 
     The type fills the whole line height, so there is no empty line to cut along
-    and the phase cannot be found by looking for a gap: on both sheets every
-    position within the cell has ink somewhere on the page. What can be found is
-    the position that cuts the least *glyph*, which is what ``_cut_risk`` scores
-    and this minimises.
+    and the phase cannot be found by looking for a gap: on every sheet read so
+    far, every position within the cell has ink somewhere on the page. Two things
+    can be measured instead, and neither is sufficient alone:
+
+    - ``_cut_risk``, the position that cuts the least *glyph*. Sharp, but blind
+      to a phase that strands a glyph wholly in the next cell rather than cutting
+      it, which severs nothing and so scores best of all.
+    - ``_stranded_glyph``, whether every key still marks its own tile. Broad --
+      a whole plateau of offsets satisfies it -- so it cannot place the cut, only
+      rule out where it must not go.
+
+    So the stranding test picks the plateau and the cut risk places the cut
+    within it. When no offset keeps every glyph in its cell the plateau is the
+    whole search, and this falls back to cut risk alone: a sheet where a key
+    really did not print is a sheet for ``check_scan_hardest_block`` to refuse,
+    not for the phase search to chase.
     """
     span = int(round(PHASE_SEARCH * pitch))
     # Nearest first, and ties keep the earlier one, so an offset only wins by
@@ -946,15 +1013,24 @@ def _row_phase(im, tops, pitch, cols, cell_w, cell_h, n_tiles):
     # there is to leave the marks' own phase alone rather than to slide to
     # whichever end of the band the loop happened to reach last.
     order = sorted(range(-span, span + 1), key=lambda o: (abs(o), o))
-    best = (None, 0)
+    scored = []
     for offset in order:
         risk = _cut_risk(im, tops, pitch, cols, cell_w, cell_h, n_tiles, offset)
-        if risk is not None and (best[0] is None or risk < best[0]):
-            best = (risk, offset)
-    return best[1]
+        if risk is None:
+            continue
+        faintest = _stranded_glyph(
+            im, tops, pitch, cols, cell_w, cell_h, block or n_tiles, offset
+        )
+        scored.append((offset, risk, faintest))
+    if not scored:
+        return 0
+    keeps = max(f for _, _, f in scored) * PHASE_INK_TOLERANCE
+    plateau = [t for t in scored if t[2] >= keeps] or scored
+    return min(plateau, key=lambda t: t[1])[0]
 
 
-def _sheet_from_scan(scan_path, n_tiles, cols, cell_w, cell_h, deskew_scan=True):
+def _sheet_from_scan(scan_path, n_tiles, cols, cell_w, cell_h, deskew_scan=True,
+                     block=None):
     """Slice a scanned charset sheet into the same cell grid.
 
     The charset sheet (see pipeline.py sheet) types the glyphs in GLYPHS order,
@@ -970,6 +1046,11 @@ def _sheet_from_scan(scan_path, n_tiles, cols, cell_w, cell_h, deskew_scan=True)
     depends on: "even the darkest typewriter characters are less than fully
     black, which yields a greater tonal range when characters are allowed to
     overlap". Scanner exposure needs correcting; ink density is the measurement.
+
+    ``block`` is how many of the ``n_tiles`` were struck at the hardest force --
+    the whole glyph set, once -- and is only the row phase's business: see
+    ``_stranded_glyph`` for why a lighter block cannot be asked where the cut
+    goes. Defaults to all of them, which is right for a single-force sheet.
     """
     im = cv2.imread(scan_path, cv2.IMREAD_GRAYSCALE)
     if im is None:
@@ -1030,10 +1111,13 @@ def _sheet_from_scan(scan_path, n_tiles, cols, cell_w, cell_h, deskew_scan=True)
         im = im[:, x0:x1]
         if band is not None:
             tops, pitch = band
-            nudge = _row_phase(im, tops, pitch, cols, cell_w, cell_h, n_tiles)
+            nudge = _row_phase(
+                im, tops, pitch, cols, cell_w, cell_h, n_tiles, block
+            )
             if nudge:
                 print(f"cut moved {nudge:+d}px within the row "
-                      f"({nudge / pitch * 100:+.1f}% of one) to cut the least glyph")
+                      f"({nudge / pitch * 100:+.1f}% of one) to keep each glyph "
+                      f"in its own cell")
                 tops = tops + nudge
             # Row by row, each resampled from its own measured band. A single
             # resize of the whole block would put every row back on an even

@@ -5207,3 +5207,127 @@ def test_a_glyph_that_ends_at_the_cell_floor_is_not_pushed_out_of_it(tmp_path):
     # Displacing the underscore into the next cell must not look like an
     # improvement on leaving it where it belongs.
     assert _cut_risk(*args, -8) > _cut_risk(*args, 0)
+
+
+def _stranding_sheet(path, rows=5, cols=6, pitch=100, top=30.0, blocks=1):
+    """Rows of type where the *cleanest* cut is the one that strands a glyph.
+
+    ``_phase_sheet`` has a stroke running the height of the cell, so no boundary
+    is free and cut risk alone can place one. Real wheels are not always so
+    obliging: on three of the five scanned here two phases were both very nearly
+    clean, and the marginally cleaner of the two was the one that cut above the
+    underscore rather than below it -- leaving its bar wholly in the tile of the
+    row beneath, which severs nothing at all.
+
+    So this sheet has that shape instead. Column 1 carries an underscore and no
+    body, the way tile 14 of a real charset sheet does; the band of offsets that
+    cuts just above it severs nothing, and puts the bar in the next row's cell
+    with the first row's tile left bare. Column 2's accent runs deep from the
+    ceiling and column 4's tail runs to the floor, so that the phase which does
+    keep the underscore is *not* free -- which is the whole difficulty.
+
+    With ``blocks=2`` the glyph set is repeated at a strike force too light to
+    mark the paper, as a multi-force sheet repeats it. Those tiles are blank
+    however the sheet is cut.
+    """
+    import cv2
+
+    total = rows * blocks
+    im = np.full((int(top + total * pitch + 60), cols * 40), 250, np.uint8)
+    for r in range(total):
+        y = int(top + r * pitch)
+        if r >= rows:
+            continue                                   # a force too light to mark
+        for c in range(cols):
+            x = c * 40 + 6
+            if c == 1:
+                im[y + 92: y + 100, x: x + 30] = 60    # an underscore, and nothing else
+                continue
+            if c == 2:
+                im[y + 1: y + 17, x: x + 20] = 60      # an accent, deep from the ceiling
+            if c == 4:
+                im[y + 1: y + 9, x: x + 20] = 60
+                im[y + 92: y + 100, x + 4: x + 12] = 60  # a tail, down to the floor
+            im[y + 13: y + 87, x: x + 26] = 70
+    cv2.imwrite(str(path), im)
+    return cv2.imread(str(path), cv2.IMREAD_GRAYSCALE), np.array(
+        [top + r * pitch for r in range(total)]
+    )
+
+
+def test_the_cut_is_not_placed_where_it_strands_a_glyph_in_the_next_cell(tmp_path):
+    """The blind spot in scoring a phase by what it severs.
+
+    A cut that leaves a glyph wholly on the wrong side of itself severs nothing,
+    so it scores as a perfectly clean cut and wins -- which is the failure
+    ``_cut_risk``'s docstring says it is avoiding and cannot see. It cost three
+    of the five wheels scanned here: the least-severing phase put the
+    underscore's bar into the tile twenty cells on, and the sheet came back with
+    a blank tile 14 and a 'D' wearing a bar it never printed.
+
+    Stranding is visible from the other end -- the tile the glyph should be in is
+    bare -- which is what ``_stranded_glyph`` measures and what rules the phase
+    out here.
+    """
+    from erika.make_charset import _cut_risk, _row_phase, _stranded_glyph
+
+    im, tops = _stranding_sheet(tmp_path / "strand.png")
+    args = (im, tops, 100, 6, 24, 40)
+
+    stranding = [o for o in range(-20, 21) if _stranded_glyph(*args, 30, o) < 0.01]
+    assert stranding, "the sheet no longer has a phase that strands the underscore"
+    trap = min(stranding, key=lambda o: (_cut_risk(*args, 30, o), abs(o)))
+
+    nudge = _row_phase(im, tops, 100, 6, 24, 40, 30, 30)
+    assert _cut_risk(*args, 30, trap) <= _cut_risk(*args, 30, nudge), (
+        "the sheet no longer poses the trap: the stranding phase already severs "
+        "more than the chosen one, so cut risk alone would have refused it"
+    )
+    assert _stranded_glyph(*args, 30, nudge) > 0.01, (
+        f"the cut moved to {nudge}px, where a key's mark is in another tile"
+    )
+    assert abs(nudge) <= 3, (
+        f"the cut moved {nudge}px from where the marks put it, and the type on "
+        "this sheet sits square in its cells"
+    )
+
+
+def test_a_strike_force_too_light_to_mark_does_not_decide_the_phase(tmp_path):
+    """Only the hardest block can say whether a phase stranded anything.
+
+    A lighter force legitimately leaves no mark -- that is the point of a
+    multi-force charset, and why ``check_scan_hardest_block`` checks only the
+    first block. Score the phase on every tile and those blanks are there at
+    every offset, so no phase looks any better than another and the search falls
+    straight back to the severing score that got this wrong in the first place.
+    """
+    from erika.make_charset import _row_phase
+
+    im, tops = _stranding_sheet(tmp_path / "forces.png", blocks=2)
+    hardest = _row_phase(im, tops, 100, 6, 24, 40, 60, 30)
+    everything = _row_phase(im, tops, 100, 6, 24, 40, 60, 60)
+    assert abs(hardest) <= 3, (
+        f"the cut moved {hardest}px; the lighter block should not have been asked"
+    )
+    assert everything != hardest, (
+        "the lighter block is not blank enough for this test to be testing "
+        "anything -- it should drag the phase back to the stranding one"
+    )
+
+
+def test_a_key_that_never_printed_leaves_the_phase_to_the_severing_score(tmp_path):
+    """A sheet to refuse, not a phase to chase.
+
+    When no offset keeps every glyph in its cell, the sheet is one where a key
+    did not strike, and ``check_scan_hardest_block`` is what says so. The phase
+    search must not read that as licence to wander: it falls back to the cut risk
+    alone, which is where it stood before.
+    """
+    from erika.make_charset import _cut_risk, _row_phase
+
+    im, tops = _stranding_sheet(tmp_path / "missing.png")
+    im[:, 40: 80] = 250  # the underscore column, never struck
+    args = (im, tops, 100, 6, 24, 40)
+    order = sorted(range(-20, 21), key=lambda o: (abs(o), o))
+    cheapest = min(order, key=lambda o: _cut_risk(*args, 30, o))
+    assert _row_phase(im, tops, 100, 6, 24, 40, 30, 30) == cheapest
