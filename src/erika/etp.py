@@ -68,11 +68,26 @@ OP_DOWN_FINE = 0x11  # n      feed paper down n platen steps (1/240")
 OP_UP_FINE = 0x12  # n        feed paper up   n platen steps
 OP_BACKWARD_ON = 0x13  # -   strikes from here move one cell left, then mark
 OP_BACKWARD_OFF = 0x14  # -  and back to marking, then moving one cell right
+OP_PAUSE = 0x15  # n         stop until the operator resumes; n = wheel to fit
 
+#: Opcodes whose next byte is an operand rather than the next opcode.
+#:
+#: **The most dangerous list in this file**, and the reason it is a list at all
+#: is that the firmware keeps its own -- ``needsOperand`` in
+#: ``erika_image.cpp``'s ``fetchNext()``. An opcode added to one and not the
+#: other puts the interpreter one byte out of step for the rest of the job:
+#: every later opcode is read out of an operand and every operand out of an
+#: opcode, with every byte still individually legal and the CRC still passing
+#: over an intact file. Nothing on the device can notice.
+#:
+#: ``tests/test_erika.py::test_firmware_knows_which_opcodes_carry_an_operand``
+#: parses that expression out of the C++ and compares it with this set. It is
+#: the whole of the defence, so adding an opcode here means running that test.
 _HAS_OPERAND = {
     OP_RIGHT, OP_LEFT, OP_DOWN, OP_UP, OP_STRIKE, OP_STRIKE_NA,
     OP_DELAY, OP_MICRO_DOWN, OP_MICRO_UP, OP_NEWLINE, OP_SET_FORCE,
     OP_RAW, OP_RIGHT_FINE, OP_LEFT_FINE, OP_DOWN_FINE, OP_UP_FINE,
+    OP_PAUSE,
 }
 
 OPCODE_NAMES = {
@@ -84,6 +99,7 @@ OPCODE_NAMES = {
     OP_RIGHT_FINE: "RIGHT_FINE", OP_LEFT_FINE: "LEFT_FINE",
     OP_DOWN_FINE: "DOWN_FINE", OP_UP_FINE: "UP_FINE",
     OP_BACKWARD_ON: "BACKWARD_ON", OP_BACKWARD_OFF: "BACKWARD_OFF",
+    OP_PAUSE: "PAUSE",
 }
 
 MAX_OPERAND = 0xFF
@@ -348,6 +364,39 @@ class Encoder:
         the opcode never arrives.
         """
         self._emit(OP_BACKWARD_OFF)
+
+    # -- stopping for a hand -----------------------------------------------
+    def pause(self, wheel: int = 0) -> None:
+        """Stop the machine until the operator resumes it (0x15).
+
+        The one thing in a print job that cannot be a motion: a type wheel is
+        changed by hand. Every other state a job depends on can be *asserted* --
+        the pitch switch is two codes, strike force is one, the printing
+        direction is a mode with an on and an off -- and a wheel can only be
+        stated and then waited for. So this is where a multi-wheel print stops,
+        and ``planner.encode`` follows it with the rewind that puts the paper
+        back at the top for the next pass.
+
+        ``wheel`` is the position in the charset's own ``wheels`` list of the one
+        to fit next, counting from 1, and it is there so the device can say which
+        -- the firmware has no idea what a charset is, let alone what its wheels
+        are called, so a number is the most it can be told. 0 means a pause with
+        nothing particular to say.
+
+        It is not a firmware *feature* so much as an opcode reaching one that
+        already existed: ``ErikaImagePrinter::pause()`` and its resume path are
+        what the ``IMG PAUSE`` serial command has always driven, including the
+        care about a paused job still holding the keyboard. What is new is that
+        the job can ask for it at a point the job chooses, rather than only the
+        operator at a point they choose.
+
+        **Adding it was three edits on the firmware side, not two** -- the
+        opcode enum, the ``fetchNext`` dispatch, and ``needsOperand``. See
+        ``_HAS_OPERAND`` for what missing the third does.
+        """
+        if not 0 <= wheel <= MAX_OPERAND:
+            raise EtpError(f"wheel {wheel} out of range for PAUSE")
+        self._emit(OP_PAUSE, wheel)
 
     # -- probing -----------------------------------------------------------
     def raw(self, byte: int) -> None:
@@ -627,6 +676,14 @@ def disassemble(job: Job, limit: int | None = None) -> str:
             text = f"{text:<9} {label}"
         elif op == OP_SET_FORCE:
             text = f"{text:<9} 0x{operand:02X}"
+        elif op == OP_PAUSE:
+            # The one opcode whose operand is an instruction to a person, so it
+            # is spelled out rather than printed as a number. A listing is read
+            # to find out what a job will do, and "stop here" is the thing in a
+            # multi-wheel job most worth being able to find.
+            text = f"{text:<9} " + (
+                f"fit type wheel {operand}" if operand else "wait for the operator"
+            )
         elif operand is not None:
             text = f"{text:<9} {operand}"
         # The residue is part of the position, so it belongs in the columns --

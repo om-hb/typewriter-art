@@ -666,6 +666,302 @@ def make_charset(
 
 
 # ---------------------------------------------------------------------------
+# Merging charsets: one wheel per source
+# ---------------------------------------------------------------------------
+# A second type wheel is a second alphabet of ink densities and shapes, and the
+# optimizer needs no idea that is what it is looking at -- exactly as it needs no
+# idea that `--forces` repeated one glyph set at four strike forces. That is the
+# structural precedent and it is exact: a multi-force charset *is* the glyph set
+# laid out once per force in one grid, with a `forces` list naming the typing
+# order and a `force` on each glyph saying which block it came from.
+#
+# A wheel is the same axis one level out. The difference is where the repetition
+# happens: a force block is built in one pass over one font or one scan, so
+# `make_charset` can lay all of them out at once, whereas two wheels are two
+# separate measurements of two separate pieces of hardware. They can only be
+# built apart and joined afterwards, which is why this is a subcommand rather
+# than a flag.
+#
+# What a wheel costs that a force does not: a force is two bytes on the wire and
+# a wheel is a hand. See planner.encode, which stops the machine at each wheel
+# boundary and winds the paper back.
+
+
+def _sheet_tiles(charset_dir: str, cell_w: int, cell_h: int, n_tiles: int):
+    """A built charset's glyph sheet, sliced back to the tiles it was laid out as.
+
+    The inverse of ``build_sheet``'s layout and of the grid ``_sheet_from_scan``
+    imposes, and it can be exactly that rather than a guess: both write the tiles
+    contiguously in glyph order at ``slicesX`` per row, and ``config.json``
+    records that number. So tile *k* of the returned list is glyph index *k + 1*,
+    which is the mapping ``_verify_mapping`` exists to protect.
+
+    Deliberately not ``chop_charset``: that one *drops* tiles it judges blank,
+    which is right when reading a sheet and wrong here. A tile dropped in the
+    middle would shift every glyph after it, and the merge would produce a
+    charset that loads, verifies against its own mockup and types the wrong keys.
+    """
+    with open(os.path.join(charset_dir, "config.json"), encoding="utf-8") as f:
+        config = json.load(f)
+    cols, rows = int(config["slicesX"]), int(config["slicesY"])
+    path = os.path.join(charset_dir, config["image_path"])
+    sheet = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if sheet is None:
+        raise ValueError(f"cannot read the glyph sheet {path}")
+    if sheet.shape != (rows * cell_h, cols * cell_w):
+        raise ValueError(
+            f"{path} is {sheet.shape[1]}x{sheet.shape[0]}px, but its config.json "
+            f"says {cols}x{rows} cells of {cell_w}x{cell_h} "
+            f"({cols * cell_w}x{rows * cell_h}px). Rebuild the charset."
+        )
+    if n_tiles > cols * rows:
+        raise ValueError(
+            f"{charset_dir} has {n_tiles} glyphs but its sheet only holds "
+            f"{cols * rows} cells"
+        )
+    sheet = sheet.astype(np.float32) / 255
+    return [
+        sheet[
+            (k // cols) * cell_h : (k // cols + 1) * cell_h,
+            (k % cols) * cell_w : (k % cols + 1) * cell_w,
+        ]
+        for k in range(n_tiles)
+    ], float(config.get("whiteThreshold", WHITE_THRESHOLD))
+
+
+def _merged_forces(sources: list[dict]) -> tuple[list[int], bool]:
+    """The merged typing order of strike forces, and whether to assert them.
+
+    Two questions, answered together because the second is the reason the first
+    is not simply a union.
+
+    ``make_charset`` writes ``forces: []`` and ``force: null`` throughout for a
+    charset built at one force, and ``planner.encode`` reads a null force as *say
+    nothing* -- which is exactly right on its own, because nothing in such a job
+    ever changes the machine's strike force. It stops being right the moment that
+    glyph set is merged with one that does change it: the single-force wheel
+    would inherit whatever force the previous wheel's last block left behind,
+    which is its *lightest*, and a whole pass would come out faint with nothing
+    anywhere to say why.
+
+    So the rule is all or nothing. If any source names forces, every glyph gets
+    an explicit one and a single-force source is pinned at ``FULL_STRIKE_FORCE``
+    -- the hardest, which is what the machine does unasked and what ``encode``
+    already restores when a job ends. If no source names any, the merged charset
+    names none either and its jobs stay byte-identical to what each wheel's own
+    would have been.
+
+    Order is first-seen rather than sorted: each source's list is already hardest
+    first, which is the order a row is typed in, and a force two wheels share
+    should keep the rank the first of them gave it.
+    """
+    assert_forces = any(s["forces"] for s in sources)
+    if not assert_forces:
+        return [], False
+    order: list[int] = []
+    for source in sources:
+        for force in source["forces"] or [ec.FULL_STRIKE_FORCE]:
+            if force not in order:
+                order.append(force)
+    return order, True
+
+
+def merge_charsets(
+    sources: list[str],
+    name: str,
+    base_path: str | None = None,
+    sheet_cols: int | None = None,
+) -> str:
+    """Join several built charsets into one, a wheel per source.
+
+    ``sources`` is the typing order, and it is the whole of what this is told:
+    which wheels, in which sequence, first on the paper first. Which wheel *ought*
+    to go first is not a question with an arithmetic answer -- a wheel is not
+    orderable by ink the way a strike force is -- so it is the caller's, exactly
+    as ``--indent`` takes a number and lets the caller work out what centred comes
+    to.
+
+    Every source must share a cell grid, because the optimizer works one uniform
+    grid: same pitch, same cell in pixels. Mixing *pitches* is a real question and
+    a separate one -- head positions are resolved in absolute motor steps, so a
+    12-pitch glyph can be placed on a 10-pitch grid covering less of its cell --
+    and nothing here has tested whether that is a feature or a mess. It is refused
+    rather than half-supported.
+    """
+    base_path = base_path or SRC_DIR
+    if len(sources) < 2:
+        raise ValueError(
+            f"a merge needs at least two charsets, got {len(sources)}. One wheel "
+            "is what every charset already is."
+        )
+    if len(set(sources)) != len(sources):
+        raise ValueError(
+            f"the same charset appears twice in {sources}. A wheel is a physical "
+            "thing that gets fitted once per print."
+        )
+    if name in sources:
+        raise ValueError(
+            f"the merged charset cannot be called '{name}': that is one of the "
+            "charsets being merged, and writing over a source would destroy the "
+            "measurement it came from."
+        )
+
+    loaded: list[dict] = []
+    for source in sources:
+        folder = os.path.join(base_path, "charsets", source)
+        path = os.path.join(folder, "glyphs.json")
+        if not os.path.isfile(path):
+            raise ValueError(
+                f"charset '{source}' has no glyphs.json, so it carries no "
+                "index -> key mapping and cannot drive the typewriter. Only a "
+                "charset built by `pipeline charset` can be a wheel in a merge."
+            )
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("wheels"):
+            # Flattening would work and would quietly lose the ordering the
+            # nested merge was built with, which is the one thing a merge is
+            # told. Name the wheels instead and let the caller say what it means.
+            raise ValueError(
+                f"charset '{source}' is itself a merge of "
+                f"{', '.join(data['wheels'])}. Merge the wheels themselves, in "
+                "the order you want them typed."
+            )
+        loaded.append({"name": source, "dir": folder, "data": data,
+                       "forces": [int(x) for x in data.get("forces", [])]})
+
+    first = loaded[0]["data"]
+    grid = ("pitch", "cell_width_px", "cell_height_px")
+    for other in loaded[1:]:
+        differing = [k for k in grid if other["data"].get(k) != first.get(k)]
+        if differing:
+            said = ", ".join(
+                f"{k} {first.get(k)} vs {other['data'].get(k)}" for k in differing
+            )
+            raise ValueError(
+                f"charsets '{sources[0]}' and '{other['name']}' do not share a "
+                f"cell grid ({said}). The optimizer works one uniform grid, so "
+                "every wheel in a print has to be measured on the same one. "
+                "Build both at the same pitch -- `pipeline charset --pitch "
+                f"{first.get('pitch')} --from-scan <the other wheel's sheet>`."
+            )
+
+    pitch = int(first["pitch"])
+    cell_w, cell_h = int(first["cell_width_px"]), int(first["cell_height_px"])
+    force_order, assert_forces = _merged_forces(loaded)
+
+    entries: list[tuple[ec.Glyph, int | None]] = []
+    wheels: list[str] = []
+    records: list[dict] = []
+    tiles: list[np.ndarray] = []
+    white_threshold = 0.0
+    for source in loaded:
+        glyphs = source["data"]["glyphs"]
+        got, threshold = _sheet_tiles(source["dir"], cell_w, cell_h, len(glyphs) - 1)
+        white_threshold = max(white_threshold, threshold)
+        tiles.extend(got)
+        wheels.append(source["name"])
+        for glyph in glyphs[1:]:  # index 0 is the blank chop_charset prepends
+            force = glyph.get("force")
+            if assert_forces and force is None:
+                force = ec.FULL_STRIKE_FORCE
+            entries.append(
+                (ec.Glyph(glyph["char"], glyph["code"],
+                          glyph.get("advances", True), glyph.get("name", "")),
+                 force)
+            )
+            records.append({**glyph, "force": force, "wheel": source["name"]})
+
+    cols = sheet_cols or int(
+        json.load(open(os.path.join(loaded[0]["dir"], "config.json"),
+                       encoding="utf-8"))["slicesX"]
+    )
+    rows = (len(entries) + cols - 1) // cols
+    sheet = np.ones((rows * cell_h, cols * cell_w), dtype=np.float32)
+    for k, tile in enumerate(tiles):
+        r, c = divmod(k, cols)
+        sheet[r * cell_h : (r + 1) * cell_h, c * cell_w : (c + 1) * cell_w] = tile
+
+    charset_dir = os.path.join(base_path, "charsets", name)
+    os.makedirs(charset_dir, exist_ok=True)
+    image_name = "sigma.png"
+    cv2.imwrite(os.path.join(charset_dir, image_name), (sheet * 255).astype(np.uint8))
+    cv2.imwrite(
+        os.path.join(charset_dir, "preview.png"),
+        _labelled_preview(sheet, entries, cell_w, cell_h, cols),
+    )
+
+    config = {
+        "charset_name": f"Sigma SM 8200i (pitch {pitch})",
+        "image_path": image_name,
+        "slicesX": cols,
+        "slicesY": rows,
+        "excludeChars": scan_exclusions(cols, rows, len(entries)),
+        "whiteThreshold": white_threshold,
+        "blankSpace": True,
+    }
+    with open(os.path.join(charset_dir, "config.json"), "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=4)
+
+    mapping = {
+        "charset_name": config["charset_name"],
+        "pitch": pitch,
+        "cell_width_px": cell_w,
+        "cell_height_px": cell_h,
+        "cell_width_mm": first["cell_width_mm"],
+        "cell_height_mm": first["cell_height_mm"],
+        "aspect": first["aspect"],
+        "max_columns": first["max_columns"],
+        # Provenance rather than a path, because there is no longer one source to
+        # name. The per-wheel entries below carry each wheel's own.
+        "font": "merge:" + "+".join(wheels),
+        "bleed": first.get("bleed"),
+        "ink": first.get("ink"),
+        "spread": first.get("spread"),
+        "dead_keys": all(s["data"].get("dead_keys") for s in loaded),
+        "forces": force_order,
+        "force_densities": [],
+        # The typing order of the wheels: one complete pass each, in this
+        # sequence, with the paper wound back between them. planner.Charset reads
+        # it exactly as it reads `forces`, and refuses a glyph whose wheel is not
+        # named here.
+        "wheels": wheels,
+        "wheel_sources": {
+            s["name"]: {
+                "font": s["data"].get("font"),
+                "forces": s["forces"],
+                "glyphs": len(s["data"]["glyphs"]) - 1,
+            }
+            for s in loaded
+        },
+        "glyphs": [
+            {"index": 0, **asdict(ec.BLANK), "name": "space",
+             "force": None, "wheel": None},
+            *[{**record, "index": i + 1} for i, record in enumerate(records)],
+        ],
+    }
+    with open(os.path.join(charset_dir, "glyphs.json"), "w", encoding="utf-8") as f:
+        json.dump(mapping, f, indent=2, ensure_ascii=False)
+
+    _verify_mapping(charset_dir, base_path, expected=len(entries) + 1)
+
+    print(f"charset '{name}' -> {charset_dir}")
+    print(f"  {len(wheels)} type wheels, typed in this order:")
+    for source in loaded:
+        forces = source["forces"] or ([ec.FULL_STRIKE_FORCE] if assert_forces else [])
+        print(f"    {source['name']:<20} {len(source['data']['glyphs']) - 1:>4} glyphs"
+              + (f" at force{'s' if len(forces) > 1 else ''} "
+                 f"{', '.join(f'0x{f:02X}' for f in forces)}" if forces else ""))
+    print(f"  {len(entries)} glyphs + blank, sheet {cols}x{rows} cells, "
+          f"cell {cell_w}x{cell_h}px at pitch {pitch}")
+    if assert_forces and any(not s["forces"] for s in loaded):
+        print(f"  single-force wheels pinned at 0x{ec.FULL_STRIKE_FORCE:02X} "
+              "(full strike), so no pass inherits the previous one's force")
+    print("  verified against chop_charset(): index mapping is stable")
+    return charset_dir
+
+
+# ---------------------------------------------------------------------------
 # The scanned sheet's registration marks
 # ---------------------------------------------------------------------------
 # A scan has to be turned back into a cell grid, and the crop is what decides

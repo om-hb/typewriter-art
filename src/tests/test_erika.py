@@ -5331,3 +5331,441 @@ def test_a_key_that_never_printed_leaves_the_phase_to_the_severing_score(tmp_pat
     order = sorted(range(-20, 21), key=lambda o: (abs(o), o))
     cheapest = min(order, key=lambda o: _cut_risk(*args, 30, o))
     assert _row_phase(im, tops, 100, 6, 24, 40, 30, 30) == cheapest
+
+
+# ---------------------------------------------------------------------------
+# More than one type wheel
+# ---------------------------------------------------------------------------
+# A wheel is the same axis as a strike force -- the glyph set repeated, merged
+# into one charset the optimizer knows nothing special about -- and everything
+# below is about the one way it is not. A force is two bytes on the wire. A
+# wheel is a hand, a stop, and the paper wound back to the top, which is the
+# only reversal of the platen any plan this pipeline makes contains.
+
+
+def _wheel_charset(wheels=("courier", "italic"), chars="AB", forces=(None,)):
+    """A small merged charset, laid out the way ``merge_charsets`` lays one out.
+
+    Wheel blocks outermost and force blocks within them, which is the order the
+    file is written in and therefore the order ``wheel_rank`` and ``force_rank``
+    read out of it.
+    """
+    glyphs = [ec.glyph_for_char(c) for c in chars]
+    entries = [(w, f, g) for w in wheels for f in forces for g in glyphs]
+    return Charset(
+        name="test-wheels", pitch=10, cell_w=24, cell_h=40, max_columns=65,
+        codes=[ec.SPACE] + [g.code for _, _, g in entries],
+        advances=[True] + [True for _ in entries],
+        chars=[" "] + [g.char for _, _, g in entries],
+        forces=[None] + [f for _, f, _ in entries],
+        force_order=[f for f in forces if f is not None],
+        wheels=[None] + [w for w, _, _ in entries],
+        wheel_order=list(wheels),
+    )
+
+
+def test_a_charset_without_wheels_never_pauses(tmp_path, charset):
+    """The whole point of the default: existing charsets print as they always did.
+
+    ``wheel_rank`` is 0 for every glyph of a single-wheel charset, so it drops out
+    of the sort key, and ``has_wheels`` is false, so ``encode`` never reaches the
+    pass boundary at all. A charset built before ``charset --merge`` existed has
+    to produce the byte stream it always produced.
+    """
+    path = _write_choices(tmp_path, _random_choices(charset, 4, 6, FOUR_LAYERS, seed=1))
+    job = planner.encode(planner.build_plan(path, charset))
+    assert etp.OP_PAUSE not in [op for _, op, _ in etp.iter_ops(job.body)]
+
+
+def test_each_wheel_types_a_complete_pass_before_the_next(tmp_path):
+    """One pass per wheel, in the charset's own order -- not a wheel per row.
+
+    The sort key puts ``wheel_rank`` ahead of ``y``, and this is what that means
+    on the paper: every strike of the first wheel, top to bottom, then the whole
+    sheet again for the second. Ordering by row first and wheel within it would
+    be a wheel change per line, which is the same picture and a hundred stops.
+    """
+    cs = _wheel_charset()
+    # Both wheels marking both rows, interleaved across the grid.
+    path = _write_choices(tmp_path, {"layer0_0_0": [[1, 3], [4, 2]]})
+    plan = planner.build_plan(path, cs)
+    seen = [cs.wheel_for(s.index) for s in plan.strikes]
+    assert seen == ["courier", "courier", "italic", "italic"], seen
+    # And each pass is itself top to bottom, which is what keeps the platen
+    # feeding forward *within* a pass.
+    rows = [s.y for s in plan.strikes]
+    assert rows == [0, 2, 0, 2], rows
+
+
+def test_the_pass_boundary_stops_the_machine_and_winds_the_paper_back(tmp_path):
+    """The three things a wheel change is, in the order they have to happen.
+
+    Home the carriage so it is out of the way of the hand about to open the
+    machine; stop, naming the wheel to fit; then wind the paper back. The rewind
+    comes after the pause so that an operator who thinks better of it here has a
+    sheet that has not moved, and so the firmware's resume path puts the pitch
+    pins back before the platen turns rather than after.
+    """
+    cs = _wheel_charset()
+    path = _write_choices(tmp_path, {"layer0_0_0": [[1, 3], [2, 4]]})
+    job = planner.encode(planner.build_plan(path, cs))
+    ops = [(op, operand) for _, op, operand in etp.iter_ops(job.body)]
+
+    at = next(i for i, (op, _) in enumerate(ops) if op == etp.OP_PAUSE)
+    assert ops[at - 1][0] == etp.OP_CR, "the carriage is not homed before the stop"
+    assert ops[at][1] == 2, "the pause does not name the wheel to fit next"
+    assert ops[at + 1][0] == etp.OP_UP, "the paper is not wound back after the stop"
+    # One stop per boundary, which is one fewer than the number of wheels.
+    assert sum(1 for op, _ in ops if op == etp.OP_PAUSE) == len(cs.wheel_order) - 1
+
+
+def test_the_rewind_returns_the_paper_to_the_line_the_job_started_on(tmp_path):
+    """Exactly back, and back to the *load* line rather than to the print's first row.
+
+    The offset is part of where a pass starts, so a rewind that stopped at the
+    print's first row would leave the second pass to re-apply an offset that had
+    never been undone -- every strike of it that many lines low. Winding to zero
+    and letting the ordinary feed place the first row again keeps one statement
+    of where a row goes.
+    """
+    cs = _wheel_charset()
+    path = _write_choices(tmp_path, {"layer0_0_0": [[1, 3], [2, 4], [1, 3]]})
+    for offset in (0, 1, 5):
+        job = planner.encode(planner.build_plan(path, cs, offset=offset))
+        down = up = 0
+        for _, op, operand in etp.iter_ops(job.body):
+            if op == etp.OP_NEWLINE or op == etp.OP_DOWN:
+                down += operand * (2 if op == etp.OP_NEWLINE else 1)
+            elif op == etp.OP_UP:
+                up += operand
+            elif op == etp.OP_PAUSE:
+                # Everything fed so far has to come back, to the half-line.
+                assert up == 0, "the paper was wound back before the stop"
+                expected = down
+        assert up == expected, (
+            f"offset {offset}: fed {expected} half-lines and wound back {up}"
+        )
+
+
+def test_the_paper_only_ever_feeds_backwards_at_a_pass_boundary(tmp_path):
+    """The invariant the rewind is allowed to break, and nothing else may.
+
+    ``build_plan`` sorts every strike so the platen feeds forward, because
+    reversing it introduces backlash. A multi-wheel plan reverses exactly once
+    per wheel change and never anywhere else -- a stray reversal would be
+    indistinguishable from the boundary and would band the picture.
+    """
+    cs = _wheel_charset(wheels=("a", "b", "c"))
+    path = _write_choices(tmp_path, {"layer0_0_0": [[1, 3, 5], [2, 4, 6]]})
+    job = planner.encode(planner.build_plan(path, cs))
+    after_pause = False
+    reversals = 0
+    for _, op, _operand in etp.iter_ops(job.body):
+        if op == etp.OP_PAUSE:
+            after_pause = True
+        elif op in (etp.OP_UP, etp.OP_UP_FINE):
+            reversals += 1
+            assert after_pause, "the platen reverses somewhere that is not a boundary"
+            after_pause = False
+    assert reversals == 2, f"three wheels should reverse twice, got {reversals}"
+
+
+def test_a_pass_re_asserts_its_strike_force(tmp_path):
+    """Because a pause is exactly when somebody has the machine open.
+
+    The force survives a pause on a machine left alone, and a machine switched
+    off and on again while paused comes back on its own defaults and reports
+    nothing. Two bytes against a whole pass typed at the wrong force.
+    """
+    cs = _wheel_charset(forces=(0x00, 0x03))
+    #  index 1,2 = courier@0  3,4 = courier@3  5,6 = italic@0  7,8 = italic@3
+    path = _write_choices(tmp_path, {"layer0_0_0": [[1, 3, 5, 7]]})
+    job = planner.encode(planner.build_plan(path, cs))
+    ops = [(op, operand) for _, op, operand in etp.iter_ops(job.body)]
+    at = next(i for i, (op, _) in enumerate(ops) if op == etp.OP_PAUSE)
+    after = [operand for op, operand in ops[at:] if op == etp.OP_SET_FORCE]
+    assert after and after[0] == 0x00, (
+        "the second pass does not state the force it types at"
+    )
+
+
+def test_a_backward_run_never_straddles_a_wheel_change(tmp_path):
+    """A mode entered before somebody opened the machine and left after.
+
+    The paper position alone refuses this for every picture but one: the two
+    passes start at opposite ends of the sheet. A picture *one row tall* has both
+    on the same row, which is exactly the plan the position check would wave
+    through -- so the wheel is checked rather than inferred.
+    """
+    cs = _wheel_charset(chars="ABCDEF")
+    # One row, both wheels, enough adjacent cells each to be worth a backward run.
+    row = [[1, 2, 3, 7, 8, 9]]
+    path = _write_choices(tmp_path, {"layer0_0_0": row})
+    plan = planner.build_plan(path, cs, home_each_row=False)
+    runs = planner._backward_runs(plan.strikes, cs)
+    for start, stop in runs.items():
+        wheels = {cs.wheel_for(s.index) for s in plan.strikes[start:stop]}
+        assert len(wheels) == 1, f"a backward run spans {wheels}"
+
+
+def test_a_stack_is_never_split_across_a_wheel_change(tmp_path):
+    """0xA9 means "the next strike prints where the head stands", and between two
+    wheels the next strike is after a stop, a hand and a rewind."""
+    cs = _wheel_charset()
+    # One cell, struck by both wheels: the only shape that can pose this.
+    path = _write_choices(tmp_path, {"layer0_0_0": [[1]], "layer1_0_0": [[3]]})
+    job = planner.encode(planner.build_plan(path, cs))
+    ops = [op for _, op, _ in etp.iter_ops(job.body)]
+    assert etp.OP_NO_ADVANCE not in ops, (
+        "two wheels striking one cell were typed as a stack, so the second "
+        "would print where the head stood before the paper was wound back"
+    )
+
+
+def test_a_serpentine_never_reverses_two_wheels_into_each_other(tmp_path):
+    """The pass key has to carry the wheel, for the same one-row reason as above.
+
+    A serpentine reverses every other sweep. Two wheels on one row read as one
+    sweep would be ordered into each other -- which on a one-row picture is the
+    whole plan, and would put the pause in the middle of the second wheel's
+    strikes rather than in front of them.
+    """
+    cs = _wheel_charset(chars="ABCD")
+    path = _write_choices(tmp_path, {"layer0_0_0": [[1, 2, 5, 6]]})
+    plan = planner.build_plan(path, cs, home_each_row=False)
+    seen = [cs.wheel_for(s.index) for s in plan.strikes]
+    assert seen == sorted(seen, key=cs.wheel_order.index), (
+        f"the serpentine interleaved the wheels: {seen}"
+    )
+
+
+def test_the_emulator_replays_a_multi_wheel_job_onto_the_right_cells(tmp_path):
+    """The offline check that the rewind lands where the plan says.
+
+    The claim a multi-wheel print rests on is that the platen returns exactly,
+    and `pipeline rewind` measured that on paper. This is the other half: that
+    the *plan* asks it to return to the right place. Every mark of both passes
+    has to come back at the cell the optimizer chose it for.
+
+    With an offset, because that is where the arithmetic can go wrong and not
+    show it. The emulator counts from where the paper started, while a strike's
+    ``y`` is a row in the *picture* -- the offset belongs to ``encode`` and to
+    nothing else, which is the invariant that lets the render be compared with
+    the mockup. So the two differ by exactly the offset, on both passes, and a
+    rewind that stopped at the print's first row instead of the load line would
+    show up here as the second pass alone being right.
+    """
+    cs = _wheel_charset(chars="ABCD")
+    grid = [[1, 0, 2, 3], [0, 4, 0, 1], [5, 6, 0, 7], [0, 8, 5, 0]]
+    path = _write_choices(tmp_path, {"layer0_0_0": grid})
+    plan = planner.build_plan(path, cs, offset=3)
+    job = planner.encode(plan)
+    machine = emulate.type_job(job, max_columns=cs.max_columns)
+    got = emulate.impressions_to_strikes(machine, cs, job)
+    assert sorted((s.y, s.x, s.index) for s in got) == sorted(
+        (s.y + 2 * plan.offset, s.x, s.index) for s in plan.strikes
+    )
+
+
+def test_a_replay_without_the_job_is_refused_rather_than_guessed(tmp_path):
+    """Two wheels send the same key codes; only the job says which was fitted.
+
+    Everything else about a strike is in the byte stream -- the key is the
+    operand, the force is the last one commanded, the position is the sum of the
+    motions. A wheel is bolted on by hand and no code reports one, so recovering
+    it from the bytes would mean resolving every strike to the first wheel and
+    producing a render that looks entirely reasonable and is wrong.
+    """
+    cs = _wheel_charset()
+    path = _write_choices(tmp_path, {"layer0_0_0": [[1, 3]]})
+    job = planner.encode(planner.build_plan(path, cs))
+    machine = emulate.type_job(job, max_columns=cs.max_columns)
+    with pytest.raises(emulate.EmulationError, match="cannot be recovered"):
+        emulate.impressions_to_strikes(machine, cs)
+
+
+def test_the_render_does_not_depend_on_the_order_the_strikes_are_typed_in(tmp_path):
+    """The invariant grouping by wheel must not break, and the reason it does not.
+
+    ``preview.render`` multiplies each strike onto the canvas, and multiplication
+    commutes -- so reordering the strikes cannot change the picture, which is
+    what lets ``build_plan`` sort by wheel and still be compared against the
+    optimizer's mockup. Written down as a test because the day it stops being
+    true, every placed multi-wheel job reports a mismatch while being correct.
+    """
+    cs = _wheel_charset(chars="ABCD")
+    grid = [[1, 5, 2], [6, 3, 7], [4, 8, 1]]
+    path = _write_choices(tmp_path, {"layer0_0_0": grid})
+    plan = planner.build_plan(path, cs)
+    tiles = np.random.default_rng(3).random(
+        (len(cs), cs.cell_h, cs.cell_w)
+    ).astype("float32")
+    tiles[0] = 1.0
+    flat = planner.Plan(
+        sorted(plan.strikes, key=lambda s: (s.y, s.fy, s.x, s.fx)),
+        plan.cols, plan.rows, cs, plan.layer_offsets,
+    )
+    assert np.array_equal(preview.render(plan, tiles), preview.render(flat, tiles))
+
+
+def test_a_glyph_naming_a_wheel_the_file_does_not_is_refused(tmp_path):
+    """The same guard the forces have, and it matters more.
+
+    An unnamed force would be typed at some arbitrary point in the order. An
+    unnamed wheel is a pass the plan does not know it has to stop for, so half
+    the picture would be typed with whatever wheel happened to be fitted.
+    """
+    path = os.path.join(tmp_path, "glyphs.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({
+            "charset_name": "x", "pitch": 10, "cell_width_px": 24,
+            "cell_height_px": 40, "max_columns": 65, "wheels": ["a"],
+            "glyphs": [
+                {"index": 0, "char": " ", "code": ec.SPACE, "advances": True,
+                 "wheel": None},
+                {"index": 1, "char": "A", "code": ec.glyph_for_char("A").code,
+                 "advances": True, "wheel": "b"},
+            ],
+        }, f)
+    with pytest.raises(PlanError, match="does not"):
+        Charset.load(path)
+
+
+# -- building one --------------------------------------------------------------
+
+
+def _build_two_wheels(tmp_path):
+    """Two single-force charsets on one cell grid, as ``--from-scan`` builds them.
+
+    Different seeds, so the two have visibly different ink: a merge that mixed
+    the sheets up is then caught by the pixels rather than only by the
+    bookkeeping that says how many of them there are.
+    """
+    from erika.make_charset import make_charset
+
+    base = str(tmp_path)
+    os.makedirs(os.path.join(base, "charsets"), exist_ok=True)
+    for name, seed in (("wheel-a", 11), ("wheel-b", 29)):
+        scan = os.path.join(base, f"{name}.png")
+        _charset_scan(scan, seed=seed)
+        make_charset(name=name, pitch=10, scan=scan, base_path=base,
+                     sheet_cols=20, deskew_scan=False)
+    return base
+
+
+def test_a_merge_lays_the_wheels_out_end_to_end_and_keeps_every_index(tmp_path):
+    """The data half of a second wheel, and it is ``--forces`` exactly.
+
+    A multi-force charset *is* the glyph set repeated once per force in one grid,
+    with a list naming the typing order. A wheel is the same axis one level out,
+    so the merged file has to come out the same shape: every source's glyphs in
+    order, contiguous, with the first source's indices unchanged -- because a
+    tile dropped or shifted anywhere in the middle re-points every index after
+    it, and the result would verify against its own mockup while typing the
+    wrong keys.
+    """
+    from erika.make_charset import merge_charsets
+
+    base = _build_two_wheels(tmp_path)
+    merge_charsets(["wheel-a", "wheel-b"], "merged", base_path=base)
+
+    a = Charset.load("wheel-a", base)
+    b = Charset.load("wheel-b", base)
+    merged = Charset.load("merged", base)
+
+    assert merged.wheel_order == ["wheel-a", "wheel-b"]
+    assert len(merged) == len(a) + len(b) - 1  # one blank, not two
+    assert merged.codes[: len(a)] == a.codes, "wheel-a's indices moved"
+    assert merged.codes[len(a):] == b.codes[1:], "wheel-b is not laid out after it"
+    assert all(merged.wheel_for(i) == "wheel-a" for i in range(1, len(a)))
+    assert all(merged.wheel_for(i) == "wheel-b" for i in range(len(a), len(merged)))
+
+
+def test_a_merged_sheet_carries_each_wheel_s_own_tiles(tmp_path):
+    """Not merely the right count of them.
+
+    ``chop_charset`` is what the optimizer scores against, so the check that
+    matters is that *its* view of the merged folder is the two sources' tiles
+    end to end. A merge that wrote the right glyphs.json over a sheet sliced on
+    the wrong grid would pass every assertion above and score the picture against
+    somebody else's type.
+    """
+    from erika.make_charset import merge_charsets
+    from utils import prep_charset
+
+    base = _build_two_wheels(tmp_path)
+    merge_charsets(["wheel-a", "wheel-b"], "merged", base_path=base)
+
+    a_tiles, _, _ = prep_charset("wheel-a", base)
+    b_tiles, _, _ = prep_charset("wheel-b", base)
+    merged, _, _ = prep_charset("merged", base)
+
+    assert len(merged) == len(a_tiles) + len(b_tiles) - 1
+    assert np.array_equal(merged[: len(a_tiles)], a_tiles)
+    assert np.array_equal(merged[len(a_tiles):], b_tiles[1:])
+
+
+def test_a_single_force_wheel_merged_with_a_multi_force_one_is_pinned(tmp_path):
+    """Otherwise a whole pass inherits the previous one's *lightest* force.
+
+    ``make_charset`` writes ``force: null`` throughout a single-force charset and
+    ``encode`` reads null as *say nothing*, which is right on its own because
+    nothing in such a job ever changes the force. Merged with a wheel that does
+    change it, the null wheel would be typed at whatever the last block left set
+    -- the faintest of them -- and the pass would come out grey with nothing
+    anywhere to say why.
+    """
+    from erika.make_charset import make_charset, merge_charsets
+
+    base = _build_two_wheels(tmp_path)
+    scan = os.path.join(base, "forced.png")
+    _charset_scan(scan, seed=5)
+    make_charset(name="wheel-f", pitch=10, scan=scan, base_path=base,
+                 sheet_cols=20, deskew_scan=False)
+    # Re-declare wheel-f as a multi-force charset the cheap way: the merge reads
+    # the file, so what it must handle is a file that names forces.
+    path = os.path.join(base, "charsets", "wheel-f", "glyphs.json")
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    data["forces"] = [0x00, 0x2D]
+    for glyph in data["glyphs"][1:]:
+        glyph["force"] = 0x2D
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+    merge_charsets(["wheel-f", "wheel-a"], "mixed", base_path=base)
+    merged = Charset.load("mixed", base)
+    assert merged.force_order[0] == ec.FULL_STRIKE_FORCE
+    assert all(
+        merged.force_for(i) == ec.FULL_STRIKE_FORCE
+        for i in range(len(merged))
+        if merged.wheel_for(i) == "wheel-a"
+    ), "the single-force wheel was left to inherit a force"
+
+
+def test_wheels_built_at_different_pitches_are_refused(tmp_path):
+    """The optimizer works one uniform grid, so the wheels have to share one.
+
+    Mixing pitches is a real question and a separate one -- head positions are
+    resolved in absolute motor steps, so a 12-pitch glyph *can* be placed on a
+    10-pitch grid covering less of its cell -- and whether that is a feature or a
+    mess is untested. Refused rather than half-supported.
+    """
+    from erika.make_charset import make_charset, merge_charsets
+
+    base = _build_two_wheels(tmp_path)
+    scan = os.path.join(base, "twelve.png")
+    _charset_scan(scan, seed=3)
+    make_charset(name="wheel-12", pitch=12, scan=scan, base_path=base,
+                 sheet_cols=20, deskew_scan=False)
+    with pytest.raises(ValueError, match="do not share a cell grid"):
+        merge_charsets(["wheel-a", "wheel-12"], "nope", base_path=base)
+
+
+def test_a_merge_refuses_to_write_over_one_of_its_own_sources(tmp_path):
+    """A charset is a measurement of a piece of hardware, and the merge is not."""
+    from erika.make_charset import merge_charsets
+
+    base = _build_two_wheels(tmp_path)
+    with pytest.raises(ValueError, match="cannot be called"):
+        merge_charsets(["wheel-a", "wheel-b"], "wheel-a", base_path=base)

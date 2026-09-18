@@ -149,6 +149,18 @@ def expand(body: bytes, direct_steps: str = STEPS_OFF, pitch: int = 10) -> list[
             out += _step_chunks(ec.PLATEN_STEPS, steps)
         elif op == etp.OP_DELAY:
             pass  # timing only; nothing reaches the paper
+        elif op == etp.OP_PAUSE:
+            # Nothing reaches the paper here either, and that is the whole of
+            # what this emulator is for -- so a wheel change expands to no bytes
+            # and the marks either side of it land where they would have.
+            #
+            # Which is the useful lie. The two passes are typed with *different
+            # type wheels*, so the second one's glyphs are not the shapes this
+            # charset's tiles show for them; what a replay can still check is
+            # that every mark lands in the cell the plan meant, which is the
+            # thing the rewind puts at risk and the thing no amount of staring
+            # at a byte stream will tell you.
+            pass
         else:
             raise EmulationError(f"expand() has no case for opcode 0x{op:02X}")
     return out
@@ -369,7 +381,35 @@ def type_job(job: etp.Job, max_columns: int = 65,
     )
 
 
-def impressions_to_strikes(machine: Typewriter, charset) -> list:
+def wheels_struck(job: etp.Job, charset) -> list[str | None]:
+    """Which type wheel was fitted for each strike of a job, in order.
+
+    **Asked of the job, because the machine cannot answer it.** Everything else
+    a strike carries is recoverable from the byte stream -- the key is the
+    operand, the force is the last one commanded, the position is the sum of the
+    motions -- but a wheel is fitted by hand and the interface has no code that
+    reports one. The two passes of a multi-wheel job send *the same key codes*;
+    what differs is what is bolted to the carriage, and no byte says.
+
+    So the pauses are the record. ``planner.encode`` emits exactly one per wheel
+    boundary, in the charset's own ``wheels`` order, which makes counting them
+    the same statement as the plan's. Empty wheels for a single-wheel charset,
+    which is what keeps ``impressions_to_strikes`` behaving as it did.
+    """
+    if not charset.has_wheels:
+        return []
+    order = charset.wheel_order
+    out: list[str | None] = []
+    at = 0
+    for _, op, _operand in etp.iter_ops(job.body):
+        if op == etp.OP_PAUSE:
+            at += 1
+        elif op in (etp.OP_STRIKE, etp.OP_STRIKE_NA):
+            out.append(order[at] if at < len(order) else None)
+    return out
+
+
+def impressions_to_strikes(machine: Typewriter, charset, job=None) -> list:
     """Map struck key codes back to charset indices, for re-rendering.
 
     Fails loudly on a code the charset does not contain -- that would mean
@@ -381,24 +421,56 @@ def impressions_to_strikes(machine: Typewriter, charset) -> list:
     keying on the code would recover the first of them for every strike -- which
     would make the render agree with the plan by throwing away the very thing
     the force was for.
+
+    ``job`` adds the type wheel to that key, and is needed for the same reason
+    and one more. A merged charset repeats every key once per wheel, so keying on
+    (code, force) alone recovers the *first* wheel's index for every strike in
+    the picture -- a render that would show the whole thing typed in one face and
+    still agree with the plan about where each mark landed.
+
+    It is an argument rather than something ``machine`` carries because the
+    machine genuinely does not know: see :func:`wheels_struck`. Pass the job that
+    produced these impressions and a multi-wheel replay resolves exactly; leave
+    it out and a multi-wheel charset is refused rather than guessed at, because
+    the wrong answer here looks entirely reasonable.
     """
     from erika.planner import Strike
 
+    if charset.has_wheels and job is None:
+        raise EmulationError(
+            f"charset '{charset.name}' is typed with {len(charset.wheel_order)} "
+            "type wheels, which share their key codes -- so a strike's wheel "
+            "cannot be recovered from the byte stream alone. Pass the job these "
+            "impressions came from: impressions_to_strikes(machine, charset, job)."
+        )
+
     forces = charset.forces or [None] * len(charset.codes)
-    by_key: dict[tuple[int, int | None], int] = {}
+    wheels = charset.wheels or [None] * len(charset.codes)
+    by_key: dict[tuple[int, int | None, str | None], int] = {}
     for index, code in enumerate(charset.codes):
-        by_key.setdefault((code, forces[index]), index)
+        by_key.setdefault((code, forces[index], wheels[index]), index)
+
+    struck = wheels_struck(job, charset) if charset.has_wheels else []
+    if struck and len(struck) != len(machine.impressions):
+        raise EmulationError(
+            f"the job has {len(struck)} strikes but the machine made "
+            f"{len(machine.impressions)} marks -- these impressions did not come "
+            "from this job"
+        )
 
     strikes = []
-    for imp in machine.impressions:
+    for i, imp in enumerate(machine.impressions):
         # A charset with no force of its own is indifferent to what the machine
         # is set to, so fall back to the code alone rather than refusing.
-        key = (imp.code, imp.force if charset.has_forces else None)
+        key = (imp.code,
+               imp.force if charset.has_forces else None,
+               struck[i] if struck else None)
         index = by_key.get(key)
         if index is None:
             raise EmulationError(
                 f"key 0x{imp.code:02X} ({ec.describe_code(imp.code)})"
                 + (f" at force 0x{imp.force:02X}" if key[1] is not None else "")
+                + (f" on type wheel {key[2]}" if key[2] is not None else "")
                 + f" is not in charset '{charset.name}'"
             )
         strikes.append(Strike(imp.y, imp.x, index))

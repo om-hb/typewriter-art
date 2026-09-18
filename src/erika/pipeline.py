@@ -239,9 +239,16 @@ def glyph_check_rows(width: int = GLYPH_CHECK_WIDTH) -> list[str]:
 
 
 def cmd_charset(args) -> int:
-    from erika.make_charset import make_charset, parse_densities, parse_forces
+    from erika.make_charset import (
+        make_charset,
+        merge_charsets,
+        parse_densities,
+        parse_forces,
+    )
 
     try:
+        if args.merge:
+            return _merge_charsets(args, merge_charsets)
         return _build_charset(args, make_charset, parse_forces, parse_densities)
     except ValueError as exc:
         # Same reasoning as run_optimizer's: the builder is a library and is
@@ -267,6 +274,50 @@ def _build_charset(args, make_charset, parse_forces, parse_densities) -> int:
         forces=parse_forces(args.forces),
         force_densities=parse_densities(args.force_density),
     )
+    return 0
+
+
+def _merge_charsets(args, merge_charsets) -> int:
+    """Join built charsets into one, a type wheel per source.
+
+    A separate path through `charset` rather than a subcommand of its own because
+    what it produces is the same thing: a folder under charsets/ carrying a glyph
+    sheet and an index -> key mapping, which everything downstream reads without
+    knowing how it was made. The flags that build a sheet mean nothing here --
+    there is no font, no scan and no ink model, only measurements already taken
+    -- so the ones that were given are refused rather than ignored.
+    """
+    sources = [part.strip() for part in args.merge.split(",") if part.strip()]
+    if not args.name:
+        raise PlanError(
+            "--merge needs --name: the merged charset is a new folder under "
+            "charsets/, and naming it after one of its wheels would write over a "
+            "measurement. Something like "
+            f"--name {'-'.join(sources) if sources else 'wheel-a-wheel-b'}."
+        )
+    # Every flag below describes how to *build* a sheet, and this builds none.
+    # Silently ignoring one would be the quiet kind of wrong this project spends
+    # a test suite on: `--forces 0,45 --merge a,b` reads as a request the result
+    # would not honour.
+    ignored = [
+        flag
+        for flag, value in (("--from-scan", args.from_scan), ("--font", args.font),
+                            ("--forces", args.forces),
+                            ("--force-density", args.force_density))
+        if value
+    ]
+    if ignored:
+        raise PlanError(
+            f"{', '.join(ignored)} describes how to build a glyph sheet, and "
+            "--merge builds none -- it joins sheets that have already been "
+            "measured. Build each wheel first, then merge them."
+        )
+    # `--sheet-cols` means the same thing it always does -- glyphs per line of
+    # the sheet -- and here it is purely a layout choice: the merged sheet is
+    # written by this process and read back through its own config.json, so
+    # nothing depends on the number matching what any source was typed at.
+    merge_charsets(sources, args.name, base_path=SRC_DIR,
+                   sheet_cols=args.sheet_cols)
     return 0
 
 
@@ -2294,6 +2345,21 @@ def build_parser() -> argparse.ArgumentParser:
                         "so a scan a degree off contaminates every tile with its "
                         "neighbour, worst at the corners of the sheet")
     c.add_argument("--from-scan", default=None)
+    # Not a way of building a glyph sheet but a way of joining ones already
+    # built, which is why it sits on `charset` rather than beside it: what comes
+    # out is the same folder under charsets/, and everything downstream reads it
+    # without knowing which path made it.
+    #
+    # The order is the typing order -- one complete pass per wheel, first named
+    # first on the paper, with the machine stopped and the platen wound back
+    # between them. Which wheel *should* go first has no arithmetic answer, so
+    # this takes the sequence rather than a rule for choosing one, exactly as
+    # --indent takes a number rather than a --centre.
+    c.add_argument("--merge", default=None, metavar="A,B[,C]",
+                   help="join these built charsets into one, a type wheel per "
+                        "source, in this typing order. Needs --name. Every "
+                        "source must share a cell grid, so they must be built "
+                        "at the same pitch; see `erika/README.md`")
     # The grid the sheet was typed at, which is what identifies a tile when the
     # scan is sliced back up. It has to be given here because `sheet` takes it
     # too and the two are one number: a sheet typed at anything but the default

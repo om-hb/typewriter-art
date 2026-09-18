@@ -298,6 +298,8 @@ see it again, reflash before suspecting the machine.
 
 ```
 erika.pipeline charset    build the Sigma charset (--pitch, --font, --from-scan)
+                          --merge a,b joins built charsets into one, a type
+                          wheel per source, in that typing order (--name)
 erika.pipeline print      photo -> optimize -> .etp   (-t, -r, -n, -l, -g, --align)
                           --indent/--offset put it elsewhere on the sheet
 erika.pipeline plan       re-plan an existing choices.json without re-optimizing
@@ -443,6 +445,88 @@ mismatch while being perfectly correct.
 There is no `--centre`. The pipeline takes a number; working out what centred
 comes to is the caller's, which for `erika-studio` is a mode that answers itself
 again whenever the print's size moves under it.
+
+## More than one type wheel: `charset --merge`
+
+A second type wheel is a second alphabet of ink densities and shapes, and the
+size of a charset is one of the two things that decide tonal range — the other
+being strike force. The optimizer needs no idea that is what it is looking at:
+give it a bigger charset and it uses one.
+
+So this is `--forces` one level out, and deliberately the same shape. A
+multi-force charset *is* the glyph set laid out once per force in one grid, with
+a `forces` list naming the typing order and a `force` on each glyph. A merged
+charset is the glyph set laid out once per wheel, with a `wheels` list and a
+`wheel` on each glyph. What differs is only that two wheels are two separate
+measurements of two separate pieces of hardware, so they are built apart and
+joined afterwards rather than in one pass.
+
+```bash
+# each wheel measured on its own, at the same pitch
+python -m erika.pipeline charset --from-scan courier_10.png --name courier-10 --dead-keys
+python -m erika.pipeline charset --from-scan italic_10.png  --name italic-10  --dead-keys
+
+# then joined, in the order they go on the paper
+python -m erika.pipeline charset --merge courier-10,italic-10 --name courier-italic-10
+
+python -m erika.pipeline print -c courier-italic-10 -t images/mwdog_crop.png -r 48
+```
+
+Every wheel must share a cell grid, so they must be built at the same pitch —
+the optimizer works one uniform grid. Mixing pitches is a real question and a
+separate one, and it is refused rather than half-supported: head positions are
+resolved in absolute motor steps, so a 12-pitch glyph *can* be placed on a
+10-pitch grid covering less of its cell, and whether that is a feature or a mess
+is untested.
+
+The order is the typing order, and it is what the merge is told rather than
+something it works out. A wheel is not orderable by ink the way a strike force
+is, so there is no arithmetic answer — the same reason there is no `--centre`.
+
+### What it costs on the paper
+
+One pass per wheel, and the paper wound back to the load line between them. That
+is the only reversal of the platen in any plan this pipeline makes, and it is
+what `rewind` was built to measure. `planner.encode` emits, at each boundary:
+
+```
+CR                    home the carriage, so it is out of the operator's way
+PAUSE n               stop; n is the wheel to fit, counting from 1
+UP  <all of it>       wind back to the line the sheet was loaded at
+```
+
+`PAUSE` is the only opcode in the format that asks for a *person*. Everything
+else a job depends on can be asserted — the pitch switch is two codes, strike
+force is one, printing direction is a mode with an on and an off — but a wheel is
+fitted by hand and the interface has no code that reports which is on. So a job
+can do no more than stop and say which it expects, and the firmware prints that
+number in its status line.
+
+Two consequences worth knowing:
+
+- **A merged charset's glyph count multiplies, and so does the optimizer's work.**
+  It scores every candidate per pixel, so two wheels at four forces is some 800
+  glyphs against 100. Time a run before promising one.
+- **A single-force wheel merged with a multi-force one is pinned at full strike.**
+  `make_charset` writes `force: null` throughout a single-force charset and
+  `encode` reads null as *say nothing*, which is right on its own because nothing
+  in such a job changes the force. Merged with a wheel that does, the null wheel
+  would inherit whatever the last block left set — the faintest of them — so the
+  merge gives it `FULL_STRIKE_FORCE` explicitly.
+
+### How far down the sheet it can go
+
+Winding back needs far more paper under the print line than feeding forward does:
+50 mm against 12, both measured. On A4 loaded against the machine's paper mark
+that is line 51 against line 60 — **nine lines, and they are the whole price of a
+second wheel.** The gap holds wherever the sheet is clamped, because both tails
+are measured from the bottom edge; loading higher moves both ceilings up together.
+
+Nothing refuses a print for being too tall, for the same reason nothing refuses
+`--offset`: what a print runs off is paper, and how much paper is under the print
+line depends on how the operator loaded the sheet. `deepest_rewindable_line()` is
+the figure, `summarize` states it beside the print's own depth, and
+`erika-studio`'s estimate is what warns with it.
 
 ## Feeding forward: `feed`
 

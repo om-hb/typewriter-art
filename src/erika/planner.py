@@ -76,10 +76,31 @@ class Charset:
     #: first, as make_charset writes them). This is the order a row is typed in,
     #: so it decides which pass goes on the paper first.
     force_order: list[int] = field(default_factory=list)
+    #: Type wheel per index, or None for a charset built from one wheel -- which
+    #: is every charset built before `charset --merge` existed, and then nothing
+    #: in the plan mentions a wheel at all.
+    wheels: list[str | None] = field(default_factory=list)
+    #: The distinct wheels, in the order the charset lays them out. Exactly
+    #: parallel to ``force_order``, and read the same way: the order the passes
+    #: go on the paper. The difference is what a change between two of them
+    #: costs -- a force is two bytes on the wire and a wheel is a hand, so
+    #: ``encode`` stops the machine and winds the paper back at every boundary
+    #: between these rather than emitting one opcode.
+    wheel_order: list[str] = field(default_factory=list)
 
     @property
     def has_forces(self) -> bool:
         return any(f is not None for f in self.forces)
+
+    @property
+    def has_wheels(self) -> bool:
+        """More than one type wheel, so the print takes more than one pass.
+
+        More than *one*, not merely present: a merge of a single charset is not
+        something ``merge_charsets`` will build, but a charset naming one wheel
+        would otherwise make every plan pay for a pass boundary that never comes.
+        """
+        return len(self.wheel_order) > 1
 
     def force_for(self, index: int) -> int | None:
         """The force this index is typed at, or None if the charset has none."""
@@ -91,6 +112,22 @@ class Charset:
         if force is None:
             return 0
         return self.force_order.index(force)
+
+    def wheel_for(self, index: int) -> str | None:
+        """The wheel this index is typed on, or None if the charset has one."""
+        return self.wheels[index] if index < len(self.wheels) else None
+
+    def wheel_rank(self, index: int) -> int:
+        """Where index's wheel comes in the typing order.
+
+        Zero for a charset with no wheels, which is what keeps it out of the sort
+        key's way: every strike ranks the same and the ordering is the one every
+        single-wheel plan has always had.
+        """
+        wheel = self.wheels[index] if index < len(self.wheels) else None
+        if wheel is None:
+            return 0
+        return self.wheel_order.index(wheel)
 
     @classmethod
     def load(cls, charset: str, base_path: str | None = None) -> "Charset":
@@ -121,6 +158,32 @@ class Charset:
                 "force missing from it has no place in the plan -- rebuild the "
                 "charset."
             )
+        wheels = [g.get("wheel") for g in glyphs]
+        wheel_order = data.get("wheels") or []
+        # The same check as the forces' above, and it matters more: an unnamed
+        # force would merely be typed in an arbitrary place in the order, while
+        # an unnamed wheel is a pass the plan does not know it has to stop for --
+        # the machine would type half the picture with the wrong wheel fitted.
+        astray = {w for w in wheels if w is not None} - set(wheel_order)
+        if astray:
+            raise PlanError(
+                f"{path}: glyphs name type wheel(s) {sorted(astray)} that the "
+                "file's own 'wheels' list does not. That list is the order the "
+                "passes are typed in, so a wheel missing from it is a wheel "
+                "nothing would stop to have fitted -- rebuild the charset with "
+                "`pipeline charset --merge`."
+            )
+        # A charset naming wheels where some glyph has none would leave those
+        # glyphs in whichever pass sorted first, typed on whatever wheel happened
+        # to be in the machine. There is no sensible default for "which wheel is
+        # this key on", so it is a refusal rather than a guess.
+        if wheel_order and any(w is None for w in wheels[1:]):
+            orphans = sum(1 for w in wheels[1:] if w is None)
+            raise PlanError(
+                f"{path}: names {len(wheel_order)} type wheels but {orphans} "
+                "glyph(s) say which wheel they are on. Every glyph but the blank "
+                "has to belong to a pass -- rebuild the charset."
+            )
         return cls(
             name=data["charset_name"],
             pitch=data["pitch"],
@@ -132,6 +195,8 @@ class Charset:
             chars=[g["char"] for g in glyphs],
             forces=forces,
             force_order=list(order),
+            wheels=wheels,
+            wheel_order=list(wheel_order),
         )
 
     def __len__(self) -> int:
@@ -385,8 +450,29 @@ def build_plan(
             + (", or switch to pitch 12." if charset.pitch == 10 else ".")
         )
 
-    # Sort by paper position first so the platen only ever feeds forward:
-    # reversing the feed introduces backlash that shows up as banding.
+    # Sort by type wheel first, then by paper position. The wheel is new and the
+    # comment that was here is the one that had to change.
+    #
+    # It used to read "sort by paper position first so the platen only ever feeds
+    # forward", and that was the whole of the ordering: reversing the feed
+    # introduces backlash, so every plan this pipeline had ever made went down
+    # the sheet once and stopped. A wheel is changed by hand, so each one wants a
+    # complete pass over the paper, and the second pass can only begin by winding
+    # back to the top -- which made the whole idea turn on a number nobody had
+    # measured.
+    #
+    # `pipeline rewind` measured it. The platen returns exactly, under one platen
+    # step, and the distance wound back turns out not to matter at all; what
+    # decides it is how far down the *sheet* the print went, because a rewind has
+    # to draw the trailing edge back into the nip and past the guides there is
+    # nothing to draw it against. So the rule inside a pass is unchanged -- the
+    # platen only ever feeds forward -- and the one reversal in a plan is the one
+    # between passes, in `encode`, where `deepest_rewindable_line` is what says
+    # whether the paper will come back. See erika_codes' "Where the paper sits".
+    #
+    # `wheel_rank` is 0 for every charset that names no wheels, which is every
+    # charset built before `charset --merge` existed, so this leaves their
+    # ordering exactly as it was.
     #
     # With strike force in play there is a second decision inside each line: type
     # it force by force, or in one sweep switching force as often as the picture
@@ -402,35 +488,45 @@ def build_plan(
     # paper must still only ever feed forward, and within a line the carriage
     # must still only sweep one way.
     if group_by_force and charset.has_forces:
-        strikes.sort(key=lambda s: (s.y, s.fy, charset.force_rank(s.index),
-                                    s.x, s.fx))
+        strikes.sort(key=lambda s: (charset.wheel_rank(s.index), s.y, s.fy,
+                                    charset.force_rank(s.index), s.x, s.fx))
     else:
-        strikes.sort(key=lambda s: (s.y, s.fy, s.x, s.fx))
+        strikes.sort(key=lambda s: (charset.wheel_rank(s.index), s.y, s.fy,
+                                    s.x, s.fx))
 
     if boustrophedon and not home_each_row:
-        strikes = _serpentine(strikes)
+        strikes = _serpentine(strikes, charset)
     return Plan(strikes, cols, rows, charset, offsets, home_each_row, indent,
                 offset)
 
 
-def _pass_key(s: Strike) -> tuple[int, int]:
+def _pass_key(s: Strike, cs: Charset) -> tuple[int, int, int]:
     """What makes two strikes part of the same carriage sweep.
 
     The paper position, and that is (y, fy) rather than y alone: a layer offset
     by a quarter of a line is a *different* sweep from the one above it, and
     grouping the two together would let the serpentine reverse them into each
     other and feed the platen backwards to reach the second.
+
+    And the type wheel, for the same reason one step further out. Two wheels
+    typing the same row of the picture are two sweeps with a wheel change and a
+    rewind between them, and a serpentine that read them as one sweep would order
+    them into each other -- which on a picture one row tall is the whole plan.
+    Zero for every charset that names no wheels, so nothing about a single-wheel
+    serpentine changes.
     """
-    return (s.y, s.fy)
+    return (cs.wheel_rank(s.index), s.y, s.fy)
 
 
-def _serpentine(strikes: list[Strike]) -> list[Strike]:
+def _serpentine(strikes: list[Strike], cs: Charset) -> list[Strike]:
     """Reverse every other pass so the carriage sweeps back and forth."""
     out: list[Strike] = []
     start = 0
     flip = False
     for i in range(1, len(strikes) + 1):
-        if i == len(strikes) or _pass_key(strikes[i]) != _pass_key(strikes[start]):
+        if i == len(strikes) or _pass_key(strikes[i], cs) != _pass_key(
+            strikes[start], cs
+        ):
             row = strikes[start:i]
             out.extend(reversed(row) if flip else row)
             flip = not flip
@@ -476,6 +572,14 @@ def _continues_backwards(a: Strike, b: Strike, cs: Charset) -> bool:
     A force change is refused for a plainer reason: it is two bytes on the wire,
     which is the whole saving for two cells, and it would sit inside a mode that
     the machine has only been seen to hold across characters.
+
+    A *wheel* change is refused because it is not bytes at all. Between two
+    wheels the machine stops, somebody opens it, and the paper winds back to the
+    top -- a run straddling that would be a mode entered before the interruption
+    and left after it. The paper position check would catch almost every case on
+    its own, since the passes start at opposite ends of the sheet, and "almost"
+    is not the standard here: a picture one row tall has both passes on the same
+    row, and that is exactly the plan this would get wrong.
     """
     return (
         (b.y, b.fy) == (a.y, a.fy)
@@ -484,6 +588,7 @@ def _continues_backwards(a: Strike, b: Strike, cs: Charset) -> bool:
         and cs.advances[a.index]
         and cs.advances[b.index]
         and cs.force_for(a.index) == cs.force_for(b.index)
+        and cs.wheel_for(a.index) == cs.wheel_for(b.index)
     )
 
 
@@ -607,6 +712,11 @@ def encode(
     # asserts one, so its job is byte-identical to what it was before strike
     # force existed -- which is what makes this safe to leave switched on.
     force: int | None = None
+    # And the same for the type wheel, with one difference that is the whole of
+    # what makes a wheel different from a force: this is never *asserted*. The
+    # machine has no code that says which wheel is fitted and none that fits one,
+    # so all a job can do is stop and say which it expects. See etp.Encoder.pause.
+    wheel: str | None = None
 
     strikes = plan.strikes
     # The stretches to type right to left, as {first index: one past the last}.
@@ -633,20 +743,80 @@ def encode(
         # in play a stack can be split across force groups, and then these are
         # two ordinary strikes with a carriage sweep between them, which is what
         # the backspace path is still there for.
+        # A wheel change splits a stack for the same reason a force change does,
+        # and harder: what separates the two strikes is a pause, somebody's hand
+        # and a rewind. Only a picture one row tall can put two passes on the
+        # same row, which is exactly why the check is here rather than left to
+        # the paper position.
         stacked = (
             no_advance
             and i + 1 < len(strikes)
             and (strikes[i + 1].y, strikes[i + 1].fy) == (s.y, s.fy)
             and (strikes[i + 1].x, strikes[i + 1].fx) == (s.x, s.fx)
+            and cs.wheel_for(strikes[i + 1].index) == cs.wheel_for(s.index)
             and cs.advances[s.index]
         )
+        want_wheel = cs.wheel_for(s.index)
+        if cs.has_wheels and want_wheel != wheel:
+            if wheel is not None:
+                # A pass boundary: the one place in any plan this pipeline makes
+                # where the paper goes backwards.
+                #
+                # Home the carriage, stop, then wind back -- in that order, and
+                # each part of it is deliberate.
+                #
+                # The carriage comes home first because the next thing that
+                # happens is that somebody opens the machine, and a carriage
+                # parked over the middle of the sheet is in their way. It also
+                # makes the new pass start from a known place whether or not this
+                # plan returns the carriage every row, which the serpentine
+                # otherwise would not.
+                #
+                # The rewind comes *after* the pause rather than before it so
+                # that an operator who thinks better of it here has a sheet that
+                # has not moved, and so that the firmware's resume path -- which
+                # re-queues the pitch pins, because a pause is exactly when
+                # somebody has been at the slide switches -- puts them back
+                # before the paper moves rather than after.
+                enc.carriage_return()
+                x = x_fine = 0
+                enc.pause(cs.wheel_order.index(want_wheel) + 1)
+
+                # Back to where the sheet was loaded, not to the first row of the
+                # new pass: `y` is measured from the load line and carries the
+                # offset, so winding it to zero returns the paper to exactly the
+                # position the job started from and lets the ordinary feed below
+                # place the new pass's first row the same way it placed the old
+                # one's. One statement of where a row goes rather than two.
+                back = y * ec.PLATEN_STEPS_PER_HALF_LINE + y_fine
+                dy, dy_fine = _one_mechanism(back, ec.PLATEN_STEPS_PER_HALF_LINE)
+                enc.vertical(-dy)
+                enc.vertical_fine(-dy_fine)
+                y = y_fine = 0
+                prev_y = None
+
+                # Re-assert the strike force in the new pass rather than trusting
+                # what the last one left set. The machine keeps it across a
+                # pause, but a pause is precisely when somebody has the machine
+                # open -- and one switched off and on again while paused comes
+                # back on its own defaults with nothing reported. Two bytes
+                # against a whole pass typed at the wrong force.
+                force = None
+            wheel = want_wheel
+
         if (s.y, s.fy) != prev_y:
             # In the platen's own steps, so that a residue which shrinks between
             # rows still comes out as one forward feed rather than a whole
             # half-line forward and a fraction back.
             delta = (((s.y + origin_y) * ec.PLATEN_STEPS_PER_HALF_LINE + s.fy)
                      - (y * ec.PLATEN_STEPS_PER_HALF_LINE + y_fine))
-            if delta < 0:  # build_plan sorts by (y, fy), so this cannot happen
+            if delta < 0:
+                # Inside a pass this cannot happen -- build_plan sorts by
+                # (y, fy) -- and between passes the rewind above has already put
+                # the paper back at the load line, so it cannot happen there
+                # either. What is left is a plan whose strikes were reordered by
+                # something other than build_plan, which is the case this has
+                # always been guarding and the reason it is not an assert.
                 raise PlanError(f"plan feeds the paper backwards to row {s.y}")
             dy, dy_fine = _one_mechanism(delta, ec.PLATEN_STEPS_PER_HALF_LINE)
             if plan.home_each_row:
@@ -785,6 +955,27 @@ def summarize(plan: Plan, job: etp.Job, ops_per_second: float = 10.0) -> str:
             f"({', '.join(f'0x{f:02X}' for f in cs.force_order)}), "
             f"{force_changes} changes"
         ]
+    # The line worth reading before a sheet goes in, so it says the thing that
+    # has to happen rather than the thing that was configured: how many times
+    # somebody has to stand at the machine, in what order, and how far the paper
+    # comes back each time. `deepest_rewindable_line` is what decides whether it
+    # comes back at all, and that depends on the loading -- so the depth is
+    # stated and the judgement is left to the estimate, which knows the paper.
+    wheel_line = []
+    if cs.has_wheels:
+        passes = sum(1 for _, op, _ in etp.iter_ops(job.body)
+                     if op == etp.OP_PAUSE)
+        deepest = plan.offset + int(plan.height_cells) - 1
+        wheel_line = [
+            f"  type wheels  {len(cs.wheel_order)} passes, typed in this order: "
+            f"{' then '.join(cs.wheel_order)}",
+            f"               {passes} stop{'' if passes == 1 else 's'} to change "
+            f"the wheel, each winding the paper back to the line it started on",
+            f"               the print reaches line {deepest + 1}; the platen "
+            f"winds back from line "
+            f"{ec.deepest_rewindable_line() + 1} on A4 loaded at the paper mark, "
+            f"{ec.deepest_rewindable_line(top_margin_mm=0) + 1} clamped to the top",
+        ]
     return "\n".join(
         [
             f"  charset      {cs.name}",
@@ -801,6 +992,7 @@ def summarize(plan: Plan, job: etp.Job, ops_per_second: float = 10.0) -> str:
                f"columns {plan.indent + 1} to "
                f"{plan.indent + int(plan.width_cells)}"] if plan.indent else []),
             f"  job size     {etp.HEADER_SIZE + len(job.body)} bytes",
+            *wheel_line,
             *force_line,
             f"  mechanics    {mech_ops} head operations, "
             f"~{seconds / 60:.0f} min at {ops_per_second:g}/s",
